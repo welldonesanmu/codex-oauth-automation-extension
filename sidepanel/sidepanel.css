@@ -23,6 +23,11 @@ header h1 {
   font-weight: 600;
 }
 
+.header-btns {
+  display: flex;
+  gap: 6px;
+}
+
 #btn-reset {
   padding: 4px 10px;
   font-size: 12px;
@@ -33,6 +38,49 @@ header h1 {
   cursor: pointer;
 }
 #btn-reset:hover { background: #c82333; }
+
+.btn-auto {
+  padding: 4px 10px;
+  font-size: 12px;
+  background: #28a745;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.btn-auto:hover { background: #218838; }
+.btn-auto:disabled { background: #6c757d; cursor: not-allowed; }
+
+.auto-continue-bar {
+  margin-top: 8px;
+  padding: 8px;
+  background: #fff3cd;
+  border: 1px solid #ffc107;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.auto-hint {
+  font-size: 11px;
+  color: #856404;
+  flex: 1;
+}
+
+.btn-continue {
+  padding: 4px 12px;
+  font-size: 12px;
+  background: #007bff;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.btn-continue:hover { background: #0069d9; }
 
 /* Data Section */
 #data-section {
@@ -141,6 +189,34 @@ header h1 {
 }
 
 .log-info { color: #d4d4d4; }
-.log-ok { color: #4ec9b0; }
+.log-ok { color: #4ec9b0; font-weight: bold; }
 .log-warn { color: #dcdcaa; }
-.log-error { color: #f44747; }
+.log-error { color: #f44747; font-weight: bold; }
+
+.log-step-tag {
+  display: inline-block;
+  background: #3a3d41;
+  color: #569cd6;
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-right: 4px;
+  font-weight: bold;
+  font-size: 10px;
+}
+
+.log-step-tag.step-1 { color: #4fc1ff; }
+.log-step-tag.step-2 { color: #c586c0; }
+.log-step-tag.step-3 { color: #dcdcaa; }
+.log-step-tag.step-4 { color: #ce9178; }
+.log-step-tag.step-5 { color: #b5cea8; }
+.log-step-tag.step-6 { color: #4fc1ff; }
+.log-step-tag.step-7 { color: #ce9178; }
+.log-step-tag.step-8 { color: #c586c0; }
+.log-step-tag.step-9 { color: #b5cea8; }
+
+.log-time { color: #6a9955; }
+.log-level { font-weight: bold; }
+.log-level-info { color: #569cd6; }
+.log-level-ok { color: #4ec9b0; }
+.log-level-warn { color: #dcdcaa; }
+.log-level-error { color: #f44747; }

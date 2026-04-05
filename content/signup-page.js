@@ -23,10 +23,13 @@ async function handleCommand(message) {
         case 2: return await step2_clickRegister();
         case 3: return await step3_fillEmailPassword(message.payload);
         case 5: return await step5_fillNameBirthday(message.payload);
+        case 6: return await step6_login(message.payload);
+        case 8: return await step8_clickContinue();
         default: throw new Error(`signup-page.js does not handle step ${message.step}`);
       }
     case 'FILL_CODE':
-      return await step4_fillVerificationCode(message.payload);
+      // Step 4 = signup code, Step 7 = login code (same handler)
+      return await fillVerificationCode(message.step, message.payload);
   }
 }
 
@@ -57,12 +60,9 @@ async function step2_clickRegister() {
     }
   }
 
+  reportComplete(2);
   simulateClick(registerBtn);
   log('Step 2: Clicked Register button');
-
-  // Wait for page transition
-  await sleep(2000);
-  reportComplete(2);
 }
 
 // ============================================================
@@ -114,7 +114,11 @@ async function step3_fillEmailPassword(payload) {
   fillInput(passwordInput, 'mimashisha0.0');
   log('Step 3: Password filled');
 
-  // Submit the form
+  // Report complete BEFORE submit, because submit causes page navigation
+  // which kills the content script connection
+  reportComplete(3, { email });
+
+  // Submit the form (page will navigate away after this)
   await sleep(500);
   const submitBtn = document.querySelector('button[type="submit"]')
     || await waitForElementByText('button', /continue|sign\s*up|submit|注册|创建|create/i, 5000).catch(() => null);
@@ -123,20 +127,17 @@ async function step3_fillEmailPassword(payload) {
     simulateClick(submitBtn);
     log('Step 3: Form submitted');
   }
-
-  await sleep(2000);
-  reportComplete(3, { email });
 }
 
 // ============================================================
-// Step 4 (receiving end): Fill Verification Code
+// Fill Verification Code (used by step 4 and step 7)
 // ============================================================
 
-async function step4_fillVerificationCode(payload) {
+async function fillVerificationCode(step, payload) {
   const { code } = payload;
   if (!code) throw new Error('No verification code provided.');
 
-  log(`Step 4: Filling verification code: ${code}`);
+  log(`Step ${step}: Filling verification code: ${code}`);
 
   // Find code input — could be a single input or multiple separate inputs
   let codeInput = null;
@@ -149,20 +150,23 @@ async function step4_fillVerificationCode(payload) {
     // Check for multiple single-digit inputs (common pattern)
     const singleInputs = document.querySelectorAll('input[maxlength="1"]');
     if (singleInputs.length >= 6) {
-      log('Step 4: Found single-digit code inputs, filling individually...');
+      log(`Step ${step}: Found single-digit code inputs, filling individually...`);
       for (let i = 0; i < 6 && i < singleInputs.length; i++) {
         fillInput(singleInputs[i], code[i]);
         await sleep(100);
       }
       await sleep(1000);
-      reportComplete(4);
+      reportComplete(step);
       return;
     }
     throw new Error('Could not find verification code input. URL: ' + location.href);
   }
 
   fillInput(codeInput, code);
-  log('Step 4: Code filled');
+  log(`Step ${step}: Code filled`);
+
+  // Report complete BEFORE submit (page may navigate away)
+  reportComplete(step);
 
   // Submit
   await sleep(500);
@@ -171,12 +175,100 @@ async function step4_fillVerificationCode(payload) {
 
   if (submitBtn) {
     simulateClick(submitBtn);
-    log('Step 4: Verification submitted');
+    log(`Step ${step}: Verification submitted`);
+  }
+}
+
+// ============================================================
+// Step 6: Login with registered account (on OAuth auth page)
+// ============================================================
+
+async function step6_login(payload) {
+  const { email, password } = payload;
+  if (!email) throw new Error('No email provided for login.');
+
+  log(`Step 6: Logging in with ${email}...`);
+
+  // Wait for email input on the auth page
+  let emailInput = null;
+  try {
+    emailInput = await waitForElement(
+      'input[type="email"], input[name="email"], input[name="username"], input[id*="email"], input[placeholder*="email" i], input[placeholder*="Email"]',
+      15000
+    );
+  } catch {
+    throw new Error('Could not find email input on login page. URL: ' + location.href);
   }
 
-  // Wait for page transition
+  fillInput(emailInput, email);
+  log('Step 6: Email filled');
+
+  // Submit email
+  await sleep(500);
+  const submitBtn1 = document.querySelector('button[type="submit"]')
+    || await waitForElementByText('button', /continue|next|submit|继续|下一步/i, 5000).catch(() => null);
+  if (submitBtn1) {
+    simulateClick(submitBtn1);
+    log('Step 6: Submitted email');
+  }
+
   await sleep(2000);
-  reportComplete(4);
+
+  // Check for password field
+  const passwordInput = document.querySelector('input[type="password"]');
+  if (passwordInput) {
+    log('Step 6: Password field found, filling password...');
+    fillInput(passwordInput, password);
+
+    await sleep(500);
+    const submitBtn2 = document.querySelector('button[type="submit"]')
+      || await waitForElementByText('button', /continue|log\s*in|submit|sign\s*in|登录|继续/i, 5000).catch(() => null);
+    // Report complete BEFORE submit in case page navigates
+    reportComplete(6, { needsOTP: true });
+
+    if (submitBtn2) {
+      simulateClick(submitBtn2);
+      log('Step 6: Submitted password, may need verification code (step 7)');
+    }
+    return;
+  }
+
+  // No password field — OTP flow
+  log('Step 6: No password field. OTP flow or auto-redirect.');
+  reportComplete(6, { needsOTP: true });
+}
+
+// ============================================================
+// Step 8: Click "继续" on OAuth consent page
+// ============================================================
+// After login + verification, page shows:
+// "使用 ChatGPT 登录到 Codex" with a "继续" submit button.
+// Clicking it triggers redirect to localhost URL.
+
+async function step8_clickContinue() {
+  log('Step 8: Looking for OAuth consent "继续" button...');
+
+  // Wait for the consent page to be ready
+  // Look for the submit button with text "继续" or data-dd-action-name="Continue"
+  let continueBtn = null;
+  try {
+    continueBtn = await waitForElement(
+      'button[type="submit"][data-dd-action-name="Continue"], button[type="submit"]._primary_3rdp0_107',
+      10000
+    );
+  } catch {
+    try {
+      continueBtn = await waitForElementByText('button', /继续|Continue/, 5000);
+    } catch {
+      throw new Error('Could not find "继续" button on OAuth consent page. URL: ' + location.href);
+    }
+  }
+
+  log('Step 8: Found "继续" button, clicking...');
+  simulateClick(continueBtn);
+  log('Step 8: Clicked "继续", redirecting to localhost... (background will capture URL)');
+
+  // Don't reportComplete — background handles it via webNavigation listener
 }
 
 // ============================================================
@@ -187,80 +279,104 @@ async function step5_fillNameBirthday(payload) {
   const { firstName, lastName, year, month, day } = payload;
   if (!firstName || !lastName) throw new Error('No name data provided.');
 
-  log(`Step 5: Filling name: ${firstName} ${lastName}, Birthday: ${year}-${month}-${day}`);
+  const fullName = `${firstName} ${lastName}`;
+  log(`Step 5: Filling name: ${fullName}, Birthday: ${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`);
 
-  // --- First name ---
-  let firstNameInput = null;
+  // Actual DOM structure:
+  // - Full name: <input name="name" placeholder="全名" type="text">
+  // - Birthday: React Aria DateField with 3 spinbutton divs (year/month/day)
+  //   + <input type="hidden" name="birthday" value="2026-04-05">
+
+  // --- Full Name (single field, not first+last) ---
+  let nameInput = null;
   try {
-    firstNameInput = await waitForElement(
-      'input[name="firstName"], input[name="first_name"], input[name="fname"], input[placeholder*="first" i], input[placeholder*="First"], input[id*="first" i]',
+    nameInput = await waitForElement(
+      'input[name="name"], input[placeholder*="全名"], input[autocomplete="name"]',
       10000
     );
   } catch {
-    throw new Error('Could not find first name input. URL: ' + location.href);
+    throw new Error('Could not find name input. URL: ' + location.href);
   }
-  fillInput(firstNameInput, firstName);
-  log(`Step 5: First name filled: ${firstName}`);
+  fillInput(nameInput, fullName);
+  log(`Step 5: Name filled: ${fullName}`);
 
-  // --- Last name ---
-  let lastNameInput = null;
-  try {
-    lastNameInput = await waitForElement(
-      'input[name="lastName"], input[name="last_name"], input[name="lname"], input[placeholder*="last" i], input[placeholder*="Last"], input[id*="last" i]',
-      5000
-    );
-  } catch {
-    throw new Error('Could not find last name input. URL: ' + location.href);
-  }
-  fillInput(lastNameInput, lastName);
-  log(`Step 5: Last name filled: ${lastName}`);
+  // --- Birthday (React Aria DateField with spinbutton segments) ---
+  // The date field has three contenteditable divs with role="spinbutton"
+  // and data-type="year", data-type="month", data-type="day"
+  // There's also a hidden input[name="birthday"] that stores the actual value
 
-  // --- Birthday ---
-  const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const yearSpinner = document.querySelector('[role="spinbutton"][data-type="year"]');
+  const monthSpinner = document.querySelector('[role="spinbutton"][data-type="month"]');
+  const daySpinner = document.querySelector('[role="spinbutton"][data-type="day"]');
 
-  // Try single date input first
-  const dateInput = document.querySelector('input[type="date"], input[name="birthday"], input[name="dob"], input[name="birthdate"]');
-  if (dateInput) {
-    fillInput(dateInput, dateStr);
-    log(`Step 5: Birthday filled (single input): ${dateStr}`);
+  if (yearSpinner && monthSpinner && daySpinner) {
+    log('Step 5: Found React Aria DateField spinbuttons');
+
+    // Helper to set a spinbutton value via focus + keyboard input
+    async function setSpinButton(el, value) {
+      el.focus();
+      await sleep(100);
+
+      // Select all existing text
+      document.execCommand('selectAll', false, null);
+      await sleep(50);
+
+      // Type the new value digit by digit
+      const valueStr = String(value);
+      for (const char of valueStr) {
+        el.dispatchEvent(new KeyboardEvent('keydown', { key: char, code: `Digit${char}`, bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keypress', { key: char, code: `Digit${char}`, bubbles: true }));
+        // Also use InputEvent for React Aria
+        el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: char, bubbles: true }));
+        el.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: char, bubbles: true }));
+        await sleep(50);
+      }
+
+      el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Tab', code: 'Tab', bubbles: true }));
+      el.blur();
+      await sleep(100);
+    }
+
+    await setSpinButton(yearSpinner, year);
+    log(`Step 5: Year set: ${year}`);
+
+    await setSpinButton(monthSpinner, String(month).padStart(2, '0'));
+    log(`Step 5: Month set: ${month}`);
+
+    await setSpinButton(daySpinner, String(day).padStart(2, '0'));
+    log(`Step 5: Day set: ${day}`);
+
+    // Also update the hidden input directly as a safety measure
+    const hiddenBirthday = document.querySelector('input[type="hidden"][name="birthday"]');
+    if (hiddenBirthday) {
+      const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      hiddenBirthday.value = dateStr;
+      hiddenBirthday.dispatchEvent(new Event('change', { bubbles: true }));
+      log(`Step 5: Hidden birthday input set: ${dateStr}`);
+    }
   } else {
-    // Try separate fields (month/day/year selects or inputs)
-    log('Step 5: Looking for separate birthday fields...');
-
-    const monthEl = document.querySelector('select[name*="month" i], input[name*="month" i], input[placeholder*="month" i], select[id*="month" i]');
-    const dayEl = document.querySelector('select[name*="day" i], input[name*="day" i], input[placeholder*="day" i], select[id*="day" i]');
-    const yearEl = document.querySelector('select[name*="year" i], input[name*="year" i], input[placeholder*="year" i], select[id*="year" i]');
-
-    if (monthEl) {
-      if (monthEl.tagName === 'SELECT') fillSelect(monthEl, String(month));
-      else fillInput(monthEl, String(month).padStart(2, '0'));
-    }
-    if (dayEl) {
-      if (dayEl.tagName === 'SELECT') fillSelect(dayEl, String(day));
-      else fillInput(dayEl, String(day).padStart(2, '0'));
-    }
-    if (yearEl) {
-      if (yearEl.tagName === 'SELECT') fillSelect(yearEl, String(year));
-      else fillInput(yearEl, String(year));
-    }
-
-    if (!monthEl && !dayEl && !yearEl) {
-      log('Step 5: WARNING - Could not find any birthday fields. May need to adjust selectors.', 'warn');
+    // Fallback: try setting hidden input directly
+    const hiddenBirthday = document.querySelector('input[name="birthday"]');
+    if (hiddenBirthday) {
+      const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      hiddenBirthday.value = dateStr;
+      hiddenBirthday.dispatchEvent(new Event('change', { bubbles: true }));
+      log(`Step 5: Birthday set via hidden input: ${dateStr}`);
     } else {
-      log(`Step 5: Birthday filled (separate fields): ${year}-${month}-${day}`);
+      log('Step 5: WARNING - Could not find birthday fields. May need to adjust selectors.', 'warn');
     }
   }
 
-  // Submit / Complete
+  // Click "完成帐户创建" button
   await sleep(500);
   const completeBtn = document.querySelector('button[type="submit"]')
-    || await waitForElementByText('button', /complete|continue|finish|done|create|agree|完成|创建|同意/i, 5000).catch(() => null);
+    || await waitForElementByText('button', /完成|create|continue|finish|done|agree/i, 5000).catch(() => null);
+
+  // Report complete BEFORE submit (page navigates to add-phone after this)
+  reportComplete(5);
 
   if (completeBtn) {
     simulateClick(completeBtn);
-    log('Step 5: Profile form submitted');
+    log('Step 5: Clicked "完成帐户创建"');
   }
-
-  await sleep(2000);
-  reportComplete(5);
 }

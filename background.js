@@ -200,14 +200,15 @@ async function handleMessage(message, sender) {
     case 'STEP_COMPLETE': {
       await setStepStatus(message.step, 'completed');
       await addLog(`Step ${message.step} completed`, 'ok');
-      // Store step-specific data
       await handleStepData(message.step, message.payload);
+      notifyStepComplete(message.step, message.payload);
       return { ok: true };
     }
 
     case 'STEP_ERROR': {
       await setStepStatus(message.step, 'failed');
       await addLog(`Step ${message.step} failed: ${message.error}`, 'error');
+      notifyStepError(message.step, message.error);
       return { ok: true };
     }
 
@@ -228,6 +229,19 @@ async function handleMessage(message, sender) {
         await setState({ email: message.payload.email });
       }
       await executeStep(step);
+      return { ok: true };
+    }
+
+    case 'AUTO_RUN': {
+      autoRun();  // fire-and-forget, runs in background
+      return { ok: true };
+    }
+
+    case 'RESUME_AUTO_RUN': {
+      if (message.payload.email) {
+        await setState({ email: message.payload.email });
+      }
+      resumeAutoRun();  // fire-and-forget
       return { ok: true };
     }
 
@@ -278,6 +292,37 @@ async function handleStepData(step, payload) {
 }
 
 // ============================================================
+// Step Completion Waiting
+// ============================================================
+
+// Map of step -> { resolve, reject } for waiting on step completion
+const stepWaiters = new Map();
+
+function waitForStepComplete(step, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      stepWaiters.delete(step);
+      reject(new Error(`Step ${step} timed out after ${timeoutMs / 1000}s`));
+    }, timeoutMs);
+
+    stepWaiters.set(step, {
+      resolve: (data) => { clearTimeout(timer); stepWaiters.delete(step); resolve(data); },
+      reject: (err) => { clearTimeout(timer); stepWaiters.delete(step); reject(err); },
+    });
+  });
+}
+
+function notifyStepComplete(step, payload) {
+  const waiter = stepWaiters.get(step);
+  if (waiter) waiter.resolve(payload);
+}
+
+function notifyStepError(step, error) {
+  const waiter = stepWaiters.get(step);
+  if (waiter) waiter.reject(new Error(error));
+}
+
+// ============================================================
 // Step Execution
 // ============================================================
 
@@ -313,11 +358,104 @@ async function executeStep(step) {
   }
 }
 
+/**
+ * Execute a step and wait for it to complete before returning.
+ * @param {number} step
+ * @param {number} delayAfter - ms to wait after completion (for page transitions)
+ */
+async function executeStepAndWait(step, delayAfter = 2000) {
+  const promise = waitForStepComplete(step, 120000);
+  await executeStep(step);
+  await promise;
+  // Extra delay for page transitions / DOM updates
+  if (delayAfter > 0) {
+    await new Promise(r => setTimeout(r, delayAfter));
+  }
+}
+
+// ============================================================
+// Auto Run Flow
+// ============================================================
+
+let autoRunActive = false;
+
+async function autoRun() {
+  if (autoRunActive) {
+    await addLog('Auto run already in progress', 'warn');
+    return;
+  }
+
+  autoRunActive = true;
+  await setState({ autoRunning: true });
+  chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'running' } }).catch(() => {});
+
+  try {
+    // Phase 1: Steps 1-2 (get OAuth link, open signup)
+    await addLog('=== Auto Run Phase 1: Get OAuth link & open signup ===', 'info');
+    await executeStepAndWait(1, 2000);
+    await executeStepAndWait(2, 2000);
+
+    // Pause: ask user to generate DuckDuckGo email
+    await addLog('=== Auto Run PAUSED: Please paste DuckDuckGo email and click "Continue Auto" ===', 'warn');
+    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'waiting_email' } }).catch(() => {});
+
+    // Wait here — resumed by RESUME_AUTO_RUN message from side panel
+
+  } catch (err) {
+    await addLog(`Auto run failed at Phase 1: ${err.message}`, 'error');
+    autoRunActive = false;
+    await setState({ autoRunning: false });
+    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'stopped' } }).catch(() => {});
+  }
+}
+
+async function resumeAutoRun() {
+  try {
+    const state = await getState();
+    if (!state.email) {
+      await addLog('Cannot resume: no email address. Paste email in Side Panel first.', 'error');
+      return;
+    }
+
+    // Phase 2: Steps 3-9 (fill form, get codes, login, OAuth, verify)
+    await addLog('=== Auto Run Phase 2: Register, verify, login, complete OAuth ===', 'info');
+
+    await executeStepAndWait(3, 3000);  // Fill email/password → page navigates to code input
+    await executeStepAndWait(4, 2000);  // Get signup code from QQ Mail → fill in
+    await executeStepAndWait(5, 3000);  // Fill name/birthday → page navigates to add-phone
+    await executeStepAndWait(6, 3000);  // Login via OAuth URL → fill email/password
+    await executeStepAndWait(7, 2000);  // Get login code from QQ Mail → fill in
+    await executeStepAndWait(8, 2000);  // Click "继续" → localhost redirect captured
+    await executeStepAndWait(9, 1000);  // VPS verify → wait for "认证成功！"
+
+    await addLog('=== Auto Run COMPLETE! All 9 steps finished successfully ===', 'ok');
+    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'complete' } }).catch(() => {});
+
+  } catch (err) {
+    await addLog(`Auto run failed: ${err.message}`, 'error');
+    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'stopped' } }).catch(() => {});
+  } finally {
+    autoRunActive = false;
+    await setState({ autoRunning: false });
+  }
+}
+
 // ============================================================
 // Step 1: Get OAuth Link (via vps-panel.js)
 // ============================================================
 
 async function executeStep1(state) {
+  // Ensure VPS panel tab is open
+  const alive = await isTabAlive('vps-panel');
+  if (!alive) {
+    await addLog('Step 1: Opening VPS panel...');
+    await chrome.tabs.create({ url: 'http://154.26.182.181:8317/management.html#/oauth', active: true });
+  } else {
+    const tabId = await getTabId('vps-panel');
+    if (tabId) await chrome.tabs.update(tabId, { active: true });
+  }
+
+  // Send command — will queue if content script not ready yet, flush on READY signal
   await sendToContentScript('vps-panel', {
     type: 'EXECUTE_STEP',
     step: 1,
@@ -439,20 +577,29 @@ async function executeStep5(state) {
 // ============================================================
 
 async function executeStep6(state) {
-  const alive = await isTabAlive('chatgpt');
-  if (!alive) {
-    await addLog('Step 6: Opening ChatGPT...');
-    await chrome.tabs.create({ url: 'https://chatgpt.com/', active: true });
-  } else {
-    const tabId = await getTabId('chatgpt');
-    if (tabId) await chrome.tabs.update(tabId, { active: true });
+  if (!state.oauthUrl) {
+    throw new Error('No OAuth URL. Complete step 1 first.');
+  }
+  if (!state.email) {
+    throw new Error('No email. Complete step 3 first.');
   }
 
-  await sendToContentScript('chatgpt', {
+  // Open the OAuth URL again in a new tab to start the login flow
+  // Close the old signup tab first (it's on add-phone page, not needed)
+  const oldSignupTabId = await getTabId('signup-page');
+  if (oldSignupTabId) {
+    try { await chrome.tabs.remove(oldSignupTabId); } catch {}
+  }
+
+  await addLog(`Step 6: Opening OAuth URL for login: ${state.oauthUrl.slice(0, 60)}...`);
+  await chrome.tabs.create({ url: state.oauthUrl, active: true });
+
+  // signup-page.js will inject (same auth.openai.com domain) and handle login
+  await sendToContentScript('signup-page', {
     type: 'EXECUTE_STEP',
     step: 6,
     source: 'background',
-    payload: {},
+    payload: { email: state.email, password: state.password || 'mimashisha0.0' },
   });
 }
 
@@ -490,18 +637,18 @@ async function executeStep7(state) {
   if (result && result.code) {
     await addLog(`Step 7: Got login verification code: ${result.code}`);
 
-    // Switch to ChatGPT tab and fill code
-    const chatgptTabId = await getTabId('chatgpt');
-    if (chatgptTabId) {
-      await chrome.tabs.update(chatgptTabId, { active: true });
-      await sendToContentScript('chatgpt', {
+    // Switch to signup/auth tab and fill code
+    const signupTabId = await getTabId('signup-page');
+    if (signupTabId) {
+      await chrome.tabs.update(signupTabId, { active: true });
+      await sendToContentScript('signup-page', {
         type: 'FILL_CODE',
         step: 7,
         source: 'background',
         payload: { code: result.code },
       });
     } else {
-      throw new Error('ChatGPT tab was closed. Cannot fill verification code.');
+      throw new Error('Auth page tab was closed. Cannot fill verification code.');
     }
   }
 }
@@ -541,7 +688,7 @@ async function executeStep8(state) {
         setState({ localhostUrl: details.url }).then(() => {
           addLog(`Step 8: Captured localhost URL: ${details.url}`, 'ok');
           setStepStatus(8, 'completed');
-          // Broadcast to side panel
+          notifyStepComplete(8, { localhostUrl: details.url });
           chrome.runtime.sendMessage({
             type: 'DATA_UPDATED',
             payload: { localhostUrl: details.url },
@@ -553,20 +700,40 @@ async function executeStep8(state) {
 
     chrome.webNavigation.onBeforeNavigate.addListener(webNavListener);
 
-    // Tell chatgpt.js to navigate to OAuth URL
-    sendToContentScript('chatgpt', {
-      type: 'EXECUTE_STEP',
-      step: 8,
-      source: 'background',
-      payload: {},
-    }).catch(err => {
-      clearTimeout(timeout);
-      if (webNavListener) {
-        chrome.webNavigation.onBeforeNavigate.removeListener(webNavListener);
-        webNavListener = null;
+    // After step 7, the auth page shows a consent screen ("使用 ChatGPT 登录到 Codex")
+    // with a "继续" button. We need to click it, which triggers the localhost redirect.
+    (async () => {
+      try {
+        const signupTabId = await getTabId('signup-page');
+        if (signupTabId) {
+          await chrome.tabs.update(signupTabId, { active: true });
+          await addLog('Step 8: Switching to auth page, clicking "继续" to complete OAuth...');
+          await sendToContentScript('signup-page', {
+            type: 'EXECUTE_STEP',
+            step: 8,
+            source: 'background',
+            payload: {},
+          });
+        } else {
+          // Auth tab was closed, reopen OAuth URL
+          await chrome.tabs.create({ url: state.oauthUrl, active: true });
+          await addLog('Step 8: Auth tab closed, reopening OAuth URL...');
+          await sendToContentScript('signup-page', {
+            type: 'EXECUTE_STEP',
+            step: 8,
+            source: 'background',
+            payload: {},
+          });
+        }
+      } catch (err) {
+        clearTimeout(timeout);
+        if (webNavListener) {
+          chrome.webNavigation.onBeforeNavigate.removeListener(webNavListener);
+          webNavListener = null;
+        }
+        reject(err);
       }
-      reject(err);
-    });
+    })();
   });
 }
 

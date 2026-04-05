@@ -9,7 +9,10 @@
 <body>
   <header>
     <h1>Multi-Page Automation</h1>
-    <button id="btn-reset" title="Reset all steps">Reset</button>
+    <div class="header-btns">
+      <button id="btn-auto-run" class="btn-auto" title="Run all steps automatically">Auto Run</button>
+      <button id="btn-reset" title="Reset all steps">Reset</button>
+    </div>
   </header>
 
   <section id="data-section">
@@ -28,6 +31,10 @@
     <div class="data-row">
       <label>Status:</label>
       <span id="display-status" class="data-value">Waiting</span>
+    </div>
+    <div id="auto-continue-bar" class="auto-continue-bar" style="display:none;">
+      <span class="auto-hint">Paste DuckDuckGo email above, then:</span>
+      <button id="btn-auto-continue" class="btn-continue">Continue Auto</button>
     </div>
   </section>
 

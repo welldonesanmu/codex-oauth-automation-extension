@@ -1,5 +1,27 @@
 // content/vps-panel.js — Content script for VPS panel (steps 1, 9)
 // Injected on: http://154.26.182.181:8317/*
+//
+// Actual DOM structure (after login click):
+// <div class="card">
+//   <div class="card-header">
+//     <span class="OAuthPage-module__cardTitle___yFaP0">Codex OAuth</span>
+//     <button class="btn btn-primary"><span>登录</span></button>
+//   </div>
+//   <div class="OAuthPage-module__cardContent___1sXLA">
+//     <div class="OAuthPage-module__authUrlBox___Iu1d4">
+//       <div class="OAuthPage-module__authUrlLabel___mYFJB">授权链接:</div>
+//       <div class="OAuthPage-module__authUrlValue___axvUJ">https://auth.openai.com/...</div>
+//       <div class="OAuthPage-module__authUrlActions___venPj">
+//         <button class="btn btn-secondary btn-sm"><span>复制链接</span></button>
+//         <button class="btn btn-secondary btn-sm"><span>打开链接</span></button>
+//       </div>
+//     </div>
+//     <div class="OAuthPage-module__callbackSection___8kA31">
+//       <input class="input" placeholder="http://localhost:1455/auth/callback?code=...&state=...">
+//       <button class="btn btn-secondary btn-sm"><span>提交回调 URL</span></button>
+//     </div>
+//   </div>
+// </div>
 
 console.log('[MultiPage:vps-panel] Content script loaded on', location.href);
 
@@ -30,178 +52,119 @@ async function handleStep(step, payload) {
 // ============================================================
 
 async function step1_getOAuthLink() {
-  log('Step 1: Checking VPS panel state...');
+  log('Step 1: Waiting for VPS panel to load (auto-login may take a moment)...');
 
-  // --- Selector strategy ---
-  // The VPS panel is at management.html#/oauth
-  // We need to: 1) find OAuth login section, 2) click Codex login, 3) read auth URL
-  // TODO: These selectors MUST be adjusted after inspecting the actual VPS panel DOM
-  // The selectors below are best-guess placeholders.
-
-  // Try to find OAuth login button by text content
-  log('Step 1: Looking for OAuth login button...');
-  let oauthBtn = null;
+  // The page may start at #/login and auto-redirect to #/oauth.
+  // Wait for the Codex OAuth card to appear (up to 30s for auto-login + redirect).
+  let loginBtn = null;
   try {
-    oauthBtn = await waitForElementByText(
-      'button, a, [role="button"], .el-button, div[class*="btn"]',
-      /oauth|OAuth/i,
-      10000
-    );
+    // Wait for any card-header containing "Codex" to appear
+    const header = await waitForElementByText('.card-header', /codex/i, 30000);
+    loginBtn = header.querySelector('button.btn.btn-primary, button.btn');
+    log('Step 1: Found Codex OAuth card');
   } catch {
-    // Fallback: try common UI framework selectors
-    try {
-      oauthBtn = await waitForElement('.oauth-login-btn, [data-action="oauth-login"]', 5000);
-    } catch {
-      throw new Error(
-        'Could not find OAuth login button. ' +
-        'Please inspect the VPS panel page in DevTools and update the selector in vps-panel.js. ' +
-        'URL: ' + location.href
-      );
-    }
-  }
-
-  simulateClick(oauthBtn);
-  log('Step 1: Clicked OAuth login, waiting for Codex login option...');
-  await sleep(1500);
-
-  // Wait for Codex login option to appear
-  let codexBtn = null;
-  try {
-    codexBtn = await waitForElementByText(
-      'button, a, [role="button"], .el-button, div[class*="btn"], span',
-      /codex/i,
-      10000
-    );
-  } catch {
-    try {
-      codexBtn = await waitForElement('[data-action="codex-login"], .codex-login-btn', 5000);
-    } catch {
-      throw new Error(
-        'Could not find Codex login button after clicking OAuth. ' +
-        'Check the VPS panel DOM in DevTools. URL: ' + location.href
-      );
-    }
-  }
-
-  simulateClick(codexBtn);
-  log('Step 1: Clicked Codex login, waiting for auth URL...');
-  await sleep(2000);
-
-  // Extract the auth URL — could be in various elements
-  let oauthUrl = null;
-
-  // Strategy 1: Look for an input/textarea with a URL value
-  const inputs = document.querySelectorAll('input[readonly], input[type="text"], textarea, code, pre');
-  for (const el of inputs) {
-    const val = (el.value || el.textContent || '').trim();
-    if (val.startsWith('http') && val.length > 30) {
-      oauthUrl = val;
-      log(`Step 1: Found URL in <${el.tagName}>: ${val.slice(0, 80)}...`);
-      break;
-    }
-  }
-
-  // Strategy 2: Look for any element containing a long URL
-  if (!oauthUrl) {
-    const allElements = document.querySelectorAll('span, p, div, a, code, pre');
-    for (const el of allElements) {
-      const text = (el.textContent || '').trim();
-      // Match a URL that looks like an OAuth authorization URL
-      const urlMatch = text.match(/(https?:\/\/[^\s<>"']{30,})/);
-      if (urlMatch) {
-        oauthUrl = urlMatch[1];
-        log(`Step 1: Found URL in text: ${oauthUrl.slice(0, 80)}...`);
-        break;
-      }
-    }
-  }
-
-  // Strategy 3: Check clipboard (if the page auto-copies)
-  if (!oauthUrl) {
-    try {
-      oauthUrl = await navigator.clipboard.readText();
-      if (oauthUrl && oauthUrl.startsWith('http') && oauthUrl.length > 30) {
-        log(`Step 1: Found URL in clipboard: ${oauthUrl.slice(0, 80)}...`);
-      } else {
-        oauthUrl = null;
-      }
-    } catch {
-      // Clipboard access may be denied
-    }
-  }
-
-  if (!oauthUrl) {
     throw new Error(
-      'Could not find auth URL. The URL may be displayed in a format we cannot detect. ' +
-      'Please check the VPS panel page and copy the URL manually, or update the extraction logic in vps-panel.js. ' +
-      'URL: ' + location.href
+      'Codex OAuth card did not appear after 30s. Page may still be loading or not logged in. ' +
+      'Current URL: ' + location.href
     );
+  }
+
+  if (!loginBtn) {
+    throw new Error('Found Codex OAuth card but no login button inside it. URL: ' + location.href);
+  }
+
+  // Check if button is disabled (already clicked / loading)
+  if (loginBtn.disabled) {
+    log('Step 1: Login button is disabled (already loading), waiting for auth URL...');
+  } else {
+    simulateClick(loginBtn);
+    log('Step 1: Clicked login button, waiting for auth URL...');
+  }
+
+  // Wait for the auth URL to appear in the specific div
+  let authUrlEl = null;
+  try {
+    authUrlEl = await waitForElement('[class*="authUrlValue"]', 15000);
+  } catch {
+    throw new Error(
+      'Auth URL did not appear after clicking login. ' +
+      'Check if VPS panel is logged in and Codex service is running. URL: ' + location.href
+    );
+  }
+
+  const oauthUrl = (authUrlEl.textContent || '').trim();
+  if (!oauthUrl || !oauthUrl.startsWith('http')) {
+    throw new Error(`Invalid OAuth URL found: "${oauthUrl.slice(0, 50)}". Expected URL starting with http.`);
   }
 
   log(`Step 1: OAuth URL obtained: ${oauthUrl.slice(0, 80)}...`, 'ok');
-  reportComplete(1, { oauthUrl: oauthUrl.trim() });
+  reportComplete(1, { oauthUrl });
 }
 
 // ============================================================
-// Step 9: VPS Verify
+// Step 9: VPS Verify — paste localhost URL and submit
 // ============================================================
 
 async function step9_vpsVerify() {
   log('Step 9: Getting localhost URL from storage...');
 
-  // Get localhostUrl from storage (via Background)
   const state = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
   const localhostUrl = state.localhostUrl;
   if (!localhostUrl) {
     throw new Error('No localhost URL found. Complete step 8 first.');
   }
 
-  log(`Step 9: Looking for URL input field on VPS panel...`);
+  log('Step 9: Looking for callback URL input...');
 
-  // Try to find URL input field
+  // Find the callback URL input
+  // Actual DOM: <input class="input" placeholder="http://localhost:1455/auth/callback?code=...&state=...">
   let urlInput = null;
   try {
-    urlInput = await waitForElement(
-      'input[placeholder*="localhost"], input[placeholder*="callback"], input[placeholder*="URL"], input[placeholder*="url"], input[name*="callback"], input[name*="url"]',
-      10000
-    );
+    urlInput = await waitForElement('[class*="callbackSection"] input.input', 10000);
   } catch {
-    // Fallback: find any text input that's visible and empty
-    const inputs = document.querySelectorAll('input[type="text"], input:not([type])');
-    for (const input of inputs) {
-      if (input.offsetParent !== null && !input.value) {
-        urlInput = input;
-        log('Step 9: Using fallback empty input field');
-        break;
-      }
-    }
-    if (!urlInput) {
-      throw new Error(
-        'Could not find URL input field on VPS panel. ' +
-        'Check DOM structure in DevTools. URL: ' + location.href
-      );
+    try {
+      urlInput = await waitForElement('input[placeholder*="localhost"]', 5000);
+    } catch {
+      throw new Error('Could not find callback URL input on VPS panel. URL: ' + location.href);
     }
   }
 
   fillInput(urlInput, localhostUrl);
-  log(`Step 9: Filled URL input with: ${localhostUrl}`);
+  log(`Step 9: Filled callback URL: ${localhostUrl.slice(0, 80)}...`);
 
-  // Find and click verify button
-  let verifyBtn = null;
+  // Find and click "提交回调 URL" button
+  let submitBtn = null;
   try {
-    verifyBtn = await waitForElementByText(
-      'button, [role="button"], .el-button, a',
-      /verif|确认|验证|submit|提交/i,
-      10000
+    submitBtn = await waitForElementByText(
+      '[class*="callbackActions"] button, [class*="callbackSection"] button',
+      /提交/,
+      5000
     );
   } catch {
-    throw new Error(
-      'Could not find verify/submit button. ' +
-      'Check VPS panel DOM in DevTools. URL: ' + location.href
-    );
+    try {
+      submitBtn = await waitForElementByText('button.btn', /提交回调/, 5000);
+    } catch {
+      throw new Error('Could not find "提交回调 URL" button. URL: ' + location.href);
+    }
   }
 
-  simulateClick(verifyBtn);
-  log('Step 9: Clicked verify button', 'ok');
+  simulateClick(submitBtn);
+  log('Step 9: Clicked "提交回调 URL", waiting for authentication result...');
+
+  // Wait for "认证成功！" status badge to appear
+  try {
+    await waitForElementByText('.status-badge, [class*="status"]', /认证成功/, 30000);
+    log('Step 9: Authentication successful!', 'ok');
+  } catch {
+    // Check if there's an error message instead
+    const statusEl = document.querySelector('.status-badge, [class*="status"]');
+    const statusText = statusEl ? statusEl.textContent : 'unknown';
+    if (/成功|success/i.test(statusText)) {
+      log('Step 9: Authentication successful!', 'ok');
+    } else {
+      log(`Step 9: Status after submit: "${statusText}". May still be processing.`, 'warn');
+    }
+  }
+
   reportComplete(9);
 }

@@ -128,9 +128,28 @@ function appendLog(entry) {
   const levelLabel = entry.level.toUpperCase().padEnd(5);
   const line = document.createElement('div');
   line.className = `log-${entry.level}`;
-  line.textContent = `${time} [${levelLabel}] ${entry.message}`;
+
+  // Extract step number from message (e.g., "Step 4: ..." or "[vps-panel] Step 1: ...")
+  const stepMatch = entry.message.match(/Step (\d)/);
+  const stepNum = stepMatch ? stepMatch[1] : null;
+
+  // Build rich HTML
+  let html = `<span class="log-time">${time}</span> `;
+  html += `<span class="log-level log-level-${entry.level}">[${levelLabel}]</span> `;
+  if (stepNum) {
+    html += `<span class="log-step-tag step-${stepNum}">S${stepNum}</span>`;
+  }
+  html += `<span>${escapeHtml(entry.message)}</span>`;
+
+  line.innerHTML = html;
   logArea.appendChild(line);
   logArea.scrollTop = logArea.scrollHeight;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
 }
 
 // ============================================================
@@ -163,6 +182,32 @@ document.querySelectorAll('.step-btn').forEach(btn => {
   });
 });
 
+// Auto Run button
+const btnAutoRun = document.getElementById('btn-auto-run');
+const btnAutoContinue = document.getElementById('btn-auto-continue');
+const autoContinueBar = document.getElementById('auto-continue-bar');
+
+btnAutoRun.addEventListener('click', async () => {
+  btnAutoRun.disabled = true;
+  btnAutoRun.textContent = 'Running...';
+  await chrome.runtime.sendMessage({ type: 'AUTO_RUN', source: 'sidepanel' });
+});
+
+btnAutoContinue.addEventListener('click', async () => {
+  const email = inputEmail.value.trim();
+  if (!email) {
+    appendLog({ message: 'Please paste DuckDuckGo email first!', level: 'error', timestamp: Date.now() });
+    return;
+  }
+  autoContinueBar.style.display = 'none';
+  btnAutoRun.textContent = 'Running...';
+  await chrome.runtime.sendMessage({
+    type: 'RESUME_AUTO_RUN',
+    source: 'sidepanel',
+    payload: { email },
+  });
+});
+
 // Reset button
 btnReset.addEventListener('click', async () => {
   if (confirm('Reset all steps and data?')) {
@@ -177,6 +222,9 @@ btnReset.addEventListener('click', async () => {
     displayStatus.classList.remove('has-value');
     logArea.innerHTML = '';
     document.querySelectorAll('.step-status').forEach(el => el.textContent = '\u2B1A');
+    btnAutoRun.disabled = false;
+    btnAutoRun.textContent = 'Auto Run';
+    autoContinueBar.style.display = 'none';
     updateButtonStates();
   }
 });
@@ -219,6 +267,27 @@ chrome.runtime.onMessage.addListener((message) => {
       if (message.payload.localhostUrl) {
         displayLocalhostUrl.textContent = message.payload.localhostUrl;
         displayLocalhostUrl.classList.add('has-value');
+      }
+      break;
+    }
+
+    case 'AUTO_RUN_STATUS': {
+      const { phase } = message.payload;
+      switch (phase) {
+        case 'waiting_email':
+          autoContinueBar.style.display = 'flex';
+          btnAutoRun.textContent = 'Waiting...';
+          break;
+        case 'complete':
+          btnAutoRun.disabled = false;
+          btnAutoRun.textContent = 'Auto Run';
+          autoContinueBar.style.display = 'none';
+          break;
+        case 'stopped':
+          btnAutoRun.disabled = false;
+          btnAutoRun.textContent = 'Auto Run';
+          autoContinueBar.style.display = 'none';
+          break;
       }
       break;
     }
