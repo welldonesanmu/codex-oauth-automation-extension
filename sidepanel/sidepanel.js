@@ -36,6 +36,12 @@ const rowInbucketMailbox = document.getElementById('row-inbucket-mailbox');
 const inputInbucketMailbox = document.getElementById('input-inbucket-mailbox');
 const inputRunCount = document.getElementById('input-run-count');
 const inputAutoSkipFailures = document.getElementById('input-auto-skip-failures');
+const autoStartModal = document.getElementById('auto-start-modal');
+const autoStartMessage = document.getElementById('auto-start-message');
+const btnAutoStartClose = document.getElementById('btn-auto-start-close');
+const btnAutoStartCancel = document.getElementById('btn-auto-start-cancel');
+const btnAutoStartRestart = document.getElementById('btn-auto-start-restart');
+const btnAutoStartContinue = document.getElementById('btn-auto-start-continue');
 const STEP_DEFAULT_STATUSES = {
   1: 'pending',
   2: 'pending',
@@ -60,6 +66,7 @@ let currentAutoRun = {
 let settingsDirty = false;
 let settingsSaveInFlight = false;
 let settingsAutoSaveTimer = null;
+let autoStartChoiceResolver = null;
 
 const EYE_OPEN_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
 const EYE_CLOSED_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19C5 19 1 12 1 12a21.77 21.77 0 0 1 5.06-6.94"/><path d="M9.9 4.24A10.94 10.94 0 0 1 12 5c7 0 11 7 11 7a21.86 21.86 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/></svg>';
@@ -103,12 +110,58 @@ function dismissToast(toast) {
   toast.addEventListener('animationend', () => toast.remove());
 }
 
+function resolveAutoStartChoice(choice) {
+  if (autoStartChoiceResolver) {
+    autoStartChoiceResolver(choice);
+    autoStartChoiceResolver = null;
+  }
+  if (autoStartModal) {
+    autoStartModal.hidden = true;
+  }
+}
+
+function openAutoStartChoiceDialog(startStep) {
+  if (!autoStartModal) {
+    return Promise.resolve('restart');
+  }
+
+  if (autoStartChoiceResolver) {
+    resolveAutoStartChoice(null);
+  }
+
+  autoStartMessage.textContent = `检测到当前已有流程进度。继续当前会从步骤 ${startStep} 开始自动执行，重新开始会清空当前流程进度并从步骤 1 新开一轮。`;
+  autoStartModal.hidden = false;
+
+  return new Promise((resolve) => {
+    autoStartChoiceResolver = resolve;
+  });
+}
+
 function isDoneStatus(status) {
   return status === 'completed' || status === 'manual_completed' || status === 'skipped';
 }
 
 function getStepStatuses(state = latestState) {
   return { ...STEP_DEFAULT_STATUSES, ...(state?.stepStatuses || {}) };
+}
+
+function getFirstUnfinishedStep(state = latestState) {
+  const statuses = getStepStatuses(state);
+  for (let step = 1; step <= 9; step++) {
+    if (!isDoneStatus(statuses[step])) {
+      return step;
+    }
+  }
+  return null;
+}
+
+function hasSavedProgress(state = latestState) {
+  const statuses = getStepStatuses(state);
+  return Object.values(statuses).some((status) => status !== 'pending');
+}
+
+function shouldOfferAutoModeChoice(state = latestState) {
+  return hasSavedProgress(state) && getFirstUnfinishedStep(state) !== null;
 }
 
 function syncLatestState(nextState) {
@@ -681,20 +734,51 @@ btnStop.addEventListener('click', async () => {
   showToast('正在停止当前流程...', 'warn', 2000);
 });
 
+autoStartModal?.addEventListener('click', (event) => {
+  if (event.target === autoStartModal) {
+    resolveAutoStartChoice(null);
+  }
+});
+btnAutoStartClose?.addEventListener('click', () => resolveAutoStartChoice(null));
+btnAutoStartCancel?.addEventListener('click', () => resolveAutoStartChoice(null));
+btnAutoStartRestart?.addEventListener('click', () => resolveAutoStartChoice('restart'));
+btnAutoStartContinue?.addEventListener('click', () => resolveAutoStartChoice('continue'));
+
 // Auto Run
 btnAutoRun.addEventListener('click', async () => {
-  const totalRuns = parseInt(inputRunCount.value) || 1;
-  btnAutoRun.disabled = true;
-  inputRunCount.disabled = true;
-  btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> 运行中...';
-  await chrome.runtime.sendMessage({
-    type: 'AUTO_RUN',
-    source: 'sidepanel',
-    payload: {
-      totalRuns,
-      autoRunSkipFailures: inputAutoSkipFailures.checked,
-    },
-  });
+  try {
+    const totalRuns = parseInt(inputRunCount.value) || 1;
+    let mode = 'restart';
+
+    if (shouldOfferAutoModeChoice()) {
+      const startStep = getFirstUnfinishedStep();
+      const choice = await openAutoStartChoiceDialog(startStep);
+      if (!choice) {
+        return;
+      }
+      mode = choice;
+    }
+
+    btnAutoRun.disabled = true;
+    inputRunCount.disabled = true;
+    btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> 运行中...';
+    const response = await chrome.runtime.sendMessage({
+      type: 'AUTO_RUN',
+      source: 'sidepanel',
+      payload: {
+        totalRuns,
+        autoRunSkipFailures: inputAutoSkipFailures.checked,
+        mode,
+      },
+    });
+    if (response?.error) {
+      throw new Error(response.error);
+    }
+  } catch (err) {
+    setDefaultAutoRunButton();
+    inputRunCount.disabled = false;
+    showToast(err.message, 'error');
+  }
 });
 
 btnAutoContinue.addEventListener('click', async () => {

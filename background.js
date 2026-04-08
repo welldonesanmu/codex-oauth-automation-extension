@@ -573,6 +573,19 @@ function isStepDoneStatus(status) {
   return status === 'completed' || status === 'manual_completed' || status === 'skipped';
 }
 
+function getFirstUnfinishedStep(statuses = {}) {
+  for (let step = 1; step <= 9; step++) {
+    if (!isStepDoneStatus(statuses[step] || 'pending')) {
+      return step;
+    }
+  }
+  return null;
+}
+
+function hasSavedProgress(statuses = {}) {
+  return Object.values({ ...DEFAULT_STATE.stepStatuses, ...statuses }).some((status) => status !== 'pending');
+}
+
 function clearStopRequest() {
   stopRequested = false;
 }
@@ -833,8 +846,9 @@ async function handleMessage(message, sender) {
       clearStopRequest();
       const totalRuns = message.payload?.totalRuns || 1;
       const autoRunSkipFailures = Boolean(message.payload?.autoRunSkipFailures);
+      const mode = message.payload?.mode === 'continue' ? 'continue' : 'restart';
       await setState({ autoRunSkipFailures });
-      autoRunLoop(totalRuns, { autoRunSkipFailures });  // fire-and-forget
+      autoRunLoop(totalRuns, { autoRunSkipFailures, mode });  // fire-and-forget
       return { ok: true };
     }
 
@@ -1120,6 +1134,17 @@ let autoRunActive = false;
 let autoRunCurrentRun = 0;
 let autoRunTotalRuns = 1;
 let autoRunAttemptRun = 0;
+const AUTO_STEP_DELAYS = {
+  1: 2000,
+  2: 2000,
+  3: 3000,
+  4: 2000,
+  5: 3000,
+  6: 3000,
+  7: 2000,
+  8: 2000,
+  9: 1000,
+};
 
 async function resumeAutoRunIfWaitingForEmail(options = {}) {
   const { silent = false } = options;
@@ -1140,6 +1165,75 @@ async function resumeAutoRunIfWaitingForEmail(options = {}) {
   return false;
 }
 
+async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
+  const currentState = await getState();
+  if (currentState.email) {
+    return currentState.email;
+  }
+
+  try {
+    const duckEmail = await fetchDuckEmail({ generateNew: true });
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：Duck 邮箱已就绪：${duckEmail}（第 ${attemptRuns} 次尝试）===`, 'ok');
+    return duckEmail;
+  } catch (err) {
+    await addLog(`Duck 邮箱自动获取失败：${err.message}`, 'warn');
+  }
+
+  await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮已暂停：请先获取 Duck 邮箱或手动粘贴邮箱，然后继续 ===`, 'warn');
+  await broadcastAutoRunStatus('waiting_email', {
+    currentRun: targetRun,
+    totalRuns,
+    attemptRun: attemptRuns,
+  });
+
+  await waitForResume();
+
+  const resumedState = await getState();
+  if (!resumedState.email) {
+    throw new Error('无法继续：当前没有邮箱地址。');
+  }
+  return resumedState.email;
+}
+
+async function runAutoSequenceFromStep(startStep, context = {}) {
+  const { targetRun, totalRuns, attemptRuns, continued = false } = context;
+
+  if (continued) {
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续当前进度，从步骤 ${startStep} 开始（第 ${attemptRuns} 次尝试）===`, 'info');
+  } else {
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：第 ${attemptRuns} 次尝试，阶段 1，获取 OAuth 链接并打开注册页 ===`, 'info');
+  }
+
+  if (startStep <= 2) {
+    for (const step of [1, 2]) {
+      if (step < startStep) continue;
+      await executeStepAndWait(step, AUTO_STEP_DELAYS[step]);
+    }
+  }
+
+  if (startStep <= 3) {
+    await ensureAutoEmailReady(targetRun, totalRuns, attemptRuns);
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，注册、验证、登录并完成授权（第 ${attemptRuns} 次尝试）===`, 'info');
+    await broadcastAutoRunStatus('running', {
+      currentRun: targetRun,
+      totalRuns,
+      attemptRun: attemptRuns,
+    });
+    await executeStepAndWait(3, AUTO_STEP_DELAYS[3]);
+  } else {
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续执行剩余流程（第 ${attemptRuns} 次尝试）===`, 'info');
+  }
+
+  const signupTabId = await getTabId('signup-page');
+  if (signupTabId) {
+    await chrome.tabs.update(signupTabId, { active: true });
+  }
+
+  for (let step = Math.max(startStep, 4); step <= 9; step++) {
+    await executeStepAndWait(step, AUTO_STEP_DELAYS[step]);
+  }
+}
+
 // Outer loop: keep retrying until the target number of successful runs is reached.
 async function autoRunLoop(totalRuns, options = {}) {
   if (autoRunActive) {
@@ -1153,10 +1247,12 @@ async function autoRunLoop(totalRuns, options = {}) {
   autoRunCurrentRun = 0;
   autoRunAttemptRun = 0;
   const autoRunSkipFailures = Boolean(options.autoRunSkipFailures);
+  const initialMode = options.mode === 'continue' ? 'continue' : 'restart';
   const maxAttempts = autoRunSkipFailures ? Math.max(totalRuns * 10, totalRuns + 20) : totalRuns;
   let successfulRuns = 0;
   let attemptRuns = 0;
   let forceFreshTabsNextRun = false;
+  let continueCurrentOnFirstAttempt = initialMode === 'continue';
 
   await setState({
     autoRunSkipFailures,
@@ -1168,31 +1264,50 @@ async function autoRunLoop(totalRuns, options = {}) {
     const targetRun = successfulRuns + 1;
     autoRunCurrentRun = targetRun;
     autoRunAttemptRun = attemptRuns;
+    let startStep = 1;
+    let useExistingProgress = false;
 
-    // Reset everything at the start of each attempt (keep user settings).
-    const prevState = await getState();
-    const keepSettings = {
-      vpsUrl: prevState.vpsUrl,
-      vpsPassword: prevState.vpsPassword,
-      customPassword: prevState.customPassword,
-      autoRunSkipFailures: prevState.autoRunSkipFailures,
-      mailProvider: prevState.mailProvider,
-      inbucketHost: prevState.inbucketHost,
-      inbucketMailbox: prevState.inbucketMailbox,
-      ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
-      ...(forceFreshTabsNextRun ? { tabRegistry: {} } : {}),
-    };
-    await resetState();
-    await setState(keepSettings);
-    chrome.runtime.sendMessage({ type: 'AUTO_RUN_RESET' }).catch(() => {});
-    await sleepWithStop(500);
+    if (continueCurrentOnFirstAttempt) {
+      const currentState = await getState();
+      const resumeStep = getFirstUnfinishedStep(currentState.stepStatuses);
+      if (resumeStep && hasSavedProgress(currentState.stepStatuses)) {
+        startStep = resumeStep;
+        useExistingProgress = true;
+      } else if (hasSavedProgress(currentState.stepStatuses)) {
+        await addLog('当前流程已全部处理，将按“重新开始”新开一轮自动运行。', 'info');
+      }
+      continueCurrentOnFirstAttempt = false;
+    }
+
+    if (!useExistingProgress) {
+      // Reset everything at the start of each fresh attempt (keep user settings).
+      const prevState = await getState();
+      const keepSettings = {
+        vpsUrl: prevState.vpsUrl,
+        vpsPassword: prevState.vpsPassword,
+        customPassword: prevState.customPassword,
+        autoRunSkipFailures: prevState.autoRunSkipFailures,
+        mailProvider: prevState.mailProvider,
+        inbucketHost: prevState.inbucketHost,
+        inbucketMailbox: prevState.inbucketMailbox,
+        ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
+        ...(forceFreshTabsNextRun ? { tabRegistry: {} } : {}),
+      };
+      await resetState();
+      await setState(keepSettings);
+      chrome.runtime.sendMessage({ type: 'AUTO_RUN_RESET' }).catch(() => {});
+      await sleepWithStop(500);
+    } else {
+      await setState({
+        autoRunSkipFailures,
+        ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
+      });
+    }
 
     if (forceFreshTabsNextRun) {
       await addLog(`兜底模式：上一轮已放弃，当前开始第 ${attemptRuns} 次尝试，将使用新线程继续补足第 ${targetRun}/${totalRuns} 轮。`, 'warn');
       forceFreshTabsNextRun = false;
     }
-
-      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：第 ${attemptRuns} 次尝试，阶段 1，获取 OAuth 链接并打开注册页 ===`, 'info');
 
     try {
       throwIfStopped();
@@ -1202,53 +1317,12 @@ async function autoRunLoop(totalRuns, options = {}) {
         attemptRun: attemptRuns,
       });
 
-      await executeStepAndWait(1, 2000);
-      await executeStepAndWait(2, 2000);
-
-      let emailReady = false;
-      try {
-        const duckEmail = await fetchDuckEmail({ generateNew: true });
-        await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：Duck 邮箱已就绪：${duckEmail}（第 ${attemptRuns} 次尝试）===`, 'ok');
-        emailReady = true;
-      } catch (err) {
-        await addLog(`Duck 邮箱自动获取失败：${err.message}`, 'warn');
-      }
-
-      if (!emailReady) {
-        await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮已暂停：请先获取 Duck 邮箱或手动粘贴邮箱，然后继续 ===`, 'warn');
-        await broadcastAutoRunStatus('waiting_email', {
-          currentRun: targetRun,
-          totalRuns,
-          attemptRun: attemptRuns,
-        });
-
-        await waitForResume();
-
-        const resumedState = await getState();
-        if (!resumedState.email) {
-          throw new Error('无法继续：当前没有邮箱地址。');
-        }
-      }
-
-      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，注册、验证、登录并完成授权（第 ${attemptRuns} 次尝试）===`, 'info');
-      await broadcastAutoRunStatus('running', {
-        currentRun: targetRun,
+      await runAutoSequenceFromStep(startStep, {
+        targetRun,
         totalRuns,
-        attemptRun: attemptRuns,
+        attemptRuns,
+        continued: useExistingProgress,
       });
-
-      const signupTabId = await getTabId('signup-page');
-      if (signupTabId) {
-        await chrome.tabs.update(signupTabId, { active: true });
-      }
-
-      await executeStepAndWait(3, 3000);
-      await executeStepAndWait(4, 2000);
-      await executeStepAndWait(5, 3000);
-      await executeStepAndWait(6, 3000);
-      await executeStepAndWait(7, 2000);
-      await executeStepAndWait(8, 2000);
-      await executeStepAndWait(9, 1000);
 
       successfulRuns += 1;
       autoRunCurrentRun = successfulRuns;
