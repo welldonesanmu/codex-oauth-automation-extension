@@ -2482,7 +2482,7 @@ async function executeStep6(state) {
     }
 
     if (authState?.state === 'add_phone') {
-      throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
+      await addLog('步骤 6：资料提交后进入手机号页面属于正常中间态，将按旧逻辑刷新 OAuth 链接继续登录。', 'info');
     }
   }
 
@@ -2522,7 +2522,7 @@ async function executeStep6(state) {
   }
 
   if (postOpenAuthState?.state === 'add_phone') {
-    throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
+    await addLog('步骤 6：刷新后的认证页仍显示手机号页面，继续沿用旧逻辑重新执行登录。', 'info');
   }
 
   // signup-page.js will inject (same auth.openai.com domain) and handle login

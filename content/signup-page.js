@@ -1078,10 +1078,6 @@ function getSerializableRect(el) {
 async function step5_fillNameBirthday(payload) {
   const { firstName, lastName, age, year, month, day } = payload;
 
-  if (isAddPhonePageReady()) {
-    throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
-  }
-
   if (!isStep5Ready()) {
     if (isStep8Ready()) {
       log('步骤 5：当前账号已跳过资料页，页面已直接进入 OAuth 同意页。', 'warn');
