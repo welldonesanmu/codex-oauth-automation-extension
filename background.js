@@ -868,109 +868,6 @@ function isCurrentAutoRunSession(sessionId) {
   return sessionId === autoRunSessionId;
 }
 
-function touchAutoRunProgress() {
-  if (!autoRunActive || autoRunWatchdogRecovering) return;
-  lastAutoRunProgressAt = Date.now();
-}
-
-function stopAutoRunWatchdog() {
-  if (autoRunWatchdogTimer) {
-    clearInterval(autoRunWatchdogTimer);
-    autoRunWatchdogTimer = null;
-  }
-}
-
-async function restartAutoRunAfterStall() {
-  if (autoRunWatchdogRecovering || !autoRunActive) return;
-  autoRunWatchdogRecovering = true;
-  const stalledSessionId = autoRunSessionId;
-  stopAutoRunWatchdog();
-
-  try {
-    const state = await getState();
-    await addLog('自动流程超过 5 分钟无进展，正在重置全部步骤并按 50 次重新自动开始...', 'error');
-
-    bumpAutoRunSessionId();
-    cancelPendingCommands('自动流程卡死超时，当前线程已被强制重置。');
-    if (webNavListener) {
-      chrome.webNavigation.onBeforeNavigate.removeListener(webNavListener);
-      webNavListener = null;
-    }
-
-    await broadcastStopToContentScripts();
-
-    const registry = await getTabRegistry();
-    const tabIds = [...new Set(Object.values(registry).map((entry) => entry?.tabId).filter((id) => Number.isInteger(id)))];
-    if (tabIds.length) {
-      await chrome.tabs.remove(tabIds).catch(() => { });
-    }
-
-    for (const waiter of stepWaiters.values()) {
-      waiter.reject(new Error('自动流程卡死超时，当前线程已被强制重置。'));
-    }
-    stepWaiters.clear();
-
-    if (resumeWaiter) {
-      resumeWaiter.reject(new Error('自动流程卡死超时，当前线程已被强制重置。'));
-      resumeWaiter = null;
-    }
-
-    if (!isCurrentAutoRunSession(stalledSessionId + 1)) {
-      autoRunWatchdogRecovering = false;
-      return;
-    }
-
-    autoRunActive = false;
-    stopRequested = false;
-    await resetState();
-    await setState({
-      autoRunSkipFailures: Boolean(state.autoRunSkipFailures),
-      ...getAutoRunStatusPayload('running', {
-        currentRun: 0,
-        totalRuns: 50,
-        attemptRun: 0,
-      }),
-    });
-    await broadcastAutoRunStatus('retrying', {
-      currentRun: 1,
-      totalRuns: 50,
-      attemptRun: 0,
-    });
-    autoRunLoop(50, {
-      autoRunSkipFailures: Boolean(state.autoRunSkipFailures),
-      mode: 'restart',
-    });
-  } catch (err) {
-    console.error(LOG_PREFIX, 'Auto-run watchdog recovery failed:', err);
-    autoRunWatchdogRecovering = false;
-    throw err;
-  }
-}
-
-function startAutoRunWatchdog() {
-  stopAutoRunWatchdog();
-  touchAutoRunProgress();
-  autoRunWatchdogTimer = setInterval(() => {
-    if (!autoRunActive || autoRunWatchdogRecovering) return;
-    const stateCheck = { active: autoRunActive, phase: null };
-    getState().then((state) => {
-      stateCheck.phase = state.autoRunPhase;
-      if (!state.autoRunning) return;
-      if (!['running', 'retrying'].includes(state.autoRunPhase)) return;
-      if (!lastAutoRunProgressAt) {
-        touchAutoRunProgress();
-        return;
-      }
-      if (Date.now() - lastAutoRunProgressAt <= AUTO_RUN_STALL_TIMEOUT_MS) {
-        return;
-      }
-      return restartAutoRunAfterStall();
-    }).catch((err) => {
-      console.warn(LOG_PREFIX, 'Auto-run watchdog check failed:', err?.message || err, stateCheck);
-    });
-  }, AUTO_RUN_WATCHDOG_INTERVAL_MS);
-}
-
 async function addLog(message, level = 'info') {
   const state = await getState();
   const logs = state.logs || [];
@@ -1001,7 +898,6 @@ function getSourceLabel(source) {
 // ============================================================
 
 async function setStepStatus(step, status) {
-  touchAutoRunProgress();
   const state = await getState();
   const statuses = { ...state.stepStatuses };
   statuses[step] = status;
@@ -1562,7 +1458,6 @@ function waitForStepComplete(step, timeoutMs = 120000) {
 }
 
 function notifyStepComplete(step, payload) {
-  touchAutoRunProgress();
   const waiter = stepWaiters.get(step);
   console.log(LOG_PREFIX, `[notifyStepComplete] step ${step}, hasWaiter=${Boolean(waiter)}`);
   if (waiter) waiter.resolve(payload);
@@ -1602,7 +1497,6 @@ async function requestStop(options = {}) {
   const { logMessage = '已收到停止请求，正在取消当前操作...' } = options;
   if (stopRequested) return;
 
-  stopAutoRunWatchdog();
   stopRequested = true;
   cancelPendingCommands();
   if (webNavListener) {
@@ -1752,13 +1646,8 @@ let autoRunCurrentRun = 0;
 let autoRunTotalRuns = 1;
 let autoRunAttemptRun = 0;
 let autoRunSessionId = 0;
-let lastAutoRunProgressAt = 0;
-let autoRunWatchdogTimer = null;
-let autoRunWatchdogRecovering = false;
 const DUCK_EMAIL_MAX_ATTEMPTS = 5;
 const VERIFICATION_POLL_MAX_ROUNDS = 5;
-const AUTO_RUN_STALL_TIMEOUT_MS = 5 * 60 * 1000;
-const AUTO_RUN_WATCHDOG_INTERVAL_MS = 15 * 1000;
 const DUCK_EMAIL_RESTART_ERROR_MESSAGE = 'Duck 邮箱自动获取失败，需要重新开始新一轮。';
 const AUTO_STEP_DELAYS = {
   1: 2000,
@@ -1884,7 +1773,6 @@ async function autoRunLoop(totalRuns, options = {}) {
 
   const sessionId = bumpAutoRunSessionId();
   clearStopRequest();
-  autoRunWatchdogRecovering = false;
   autoRunActive = true;
   autoRunTotalRuns = totalRuns;
   autoRunCurrentRun = 0;
@@ -1909,7 +1797,6 @@ async function autoRunLoop(totalRuns, options = {}) {
       attemptRun: resumeAttemptRunsProcessed,
     }),
   });
-  startAutoRunWatchdog();
 
   while (successfulRuns < totalRuns && attemptRuns < maxAttempts) {
     if (!isCurrentAutoRunSession(sessionId)) {
@@ -2084,7 +1971,6 @@ async function autoRunLoop(totalRuns, options = {}) {
       attemptRun: attemptRuns,
     });
   }
-  stopAutoRunWatchdog();
   autoRunActive = false;
   autoRunAttemptRun = attemptRuns;
   await setState(getAutoRunStatusPayload(stopRequested ? 'stopped' : (successfulRuns >= autoRunTotalRuns ? 'complete' : 'stopped'), {

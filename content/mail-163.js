@@ -19,7 +19,7 @@ if (!isTopFrame) {
 
 // Track codes we've already seen — persisted in chrome.storage.session to survive script re-injection
 let seenCodes = new Set();
-const MAIL163_WAKE_INTERVAL_MS = 30 * 60 * 1000;
+const MAIL163_WAKE_INTERVAL_MS = 10 * 60 * 1000;
 const MAIL163_LAST_WAKE_AT_KEY = 'mail163LastWakeAt';
 
 async function loadSeenCodes() {
