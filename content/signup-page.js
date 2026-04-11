@@ -514,6 +514,10 @@ function inspectAuthPageState() {
     return { state: 'step5', url: location.href };
   }
 
+  if (isSignupEmailAlreadyExistsPage()) {
+    return { state: 'email_exists', url: location.href };
+  }
+
   if (document.querySelector('input[type="password"]')) {
     return { state: 'password', url: location.href };
   }
@@ -641,6 +645,10 @@ function isSignupPasswordPage() {
   return /\/create-account\/password(?:[/?#]|$)/i.test(location.pathname || '');
 }
 
+function isLoginPasswordPage() {
+  return /\/log-in\/password(?:[/?#]|$)/i.test(location.pathname || '');
+}
+
 function getSignupPasswordInput() {
   const input = document.querySelector('input[type="password"]');
   return input && isVisibleElement(input) ? input : null;
@@ -686,7 +694,8 @@ function isSignupPasswordErrorPage() {
 }
 
 function isSignupEmailAlreadyExistsPage() {
-  return isSignupPasswordPage() && SIGNUP_EMAIL_EXISTS_PATTERN.test(getPageTextSnapshot());
+  return (isSignupPasswordPage() || isLoginPasswordPage())
+    && SIGNUP_EMAIL_EXISTS_PATTERN.test(getPageTextSnapshot());
 }
 
 function inspectSignupVerificationState() {
@@ -696,6 +705,10 @@ function inspectSignupVerificationState() {
 
   if (isVerificationPageStillVisible()) {
     return { state: 'verification' };
+  }
+
+  if (isLoginPasswordPage()) {
+    return { state: 'email_exists' };
   }
 
   if (isSignupPasswordErrorPage()) {
