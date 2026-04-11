@@ -770,7 +770,7 @@ function isVerificationMailPollingError(error) {
 
 function isRestartCurrentAttemptError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
-  return /当前邮箱已存在，需要重新开始新一轮/.test(message);
+  return /当前邮箱已存在，需要重新开始新一轮|当前流程已进入手机号页面，需要重新开始新一轮/.test(message);
 }
 
 function isStep9OAuthTimeoutError(error) {
@@ -1722,9 +1722,21 @@ async function autoRunLoop(totalRuns, options = {}) {
       }
 
       if (isRestartCurrentAttemptError(err)) {
-        await addLog(`目标 ${targetRun}/${totalRuns} 轮检测到当前邮箱已存在，当前线程已放弃，将重新开始新一轮。`, 'warn');
-        cancelPendingCommands('当前线程因邮箱已存在而放弃。');
+        const restartReason = getErrorMessage(err).includes('手机号页面')
+          ? '目标流程进入手机号页面'
+          : '检测到当前邮箱已存在';
+        await addLog(`目标 ${targetRun}/${totalRuns} 轮${restartReason}，当前线程已放弃，将重新开始新一轮。`, 'warn');
+        cancelPendingCommands(`当前线程因${restartReason}而放弃。`);
         await broadcastStopToContentScripts();
+        const signupTabId = await getTabId('signup-page');
+        if (signupTabId) {
+          await chrome.tabs.remove(signupTabId).catch(() => { });
+        }
+        const registry = await getTabRegistry();
+        if (registry['signup-page']) {
+          registry['signup-page'] = null;
+          await setState({ tabRegistry: registry });
+        }
         await broadcastAutoRunStatus('retrying', {
           currentRun: targetRun,
           totalRuns,
@@ -2161,6 +2173,11 @@ async function resolveVerificationStep(step, state, mail, options = {}) {
     await addLog(`步骤 ${step}：已获取${getVerificationCodeLabel(step)}验证码：${result.code}`);
     const submitResult = await submitVerificationCode(step, result.code);
 
+    if (submitResult.addPhonePage) {
+      await addLog(`步骤 ${step}：验证码通过后进入手机号页面，本轮线程作废，准备重新开始新一轮。`, 'warn');
+      throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
+    }
+
     if (submitResult.invalidCode) {
       rejectedCodes.add(result.code);
       await addLog(`步骤 ${step}：验证码被页面拒绝：${submitResult.errorText || result.code}`, 'warn');
@@ -2478,6 +2495,10 @@ async function executeStep8(state) {
         });
 
         if (clickResult?.error) {
+          if (/已进入手机号页面|add-phone/i.test(clickResult.error)) {
+            await addLog('步骤 8：检测到页面进入手机号绑定页，本轮线程作废，准备重新开始新一轮。', 'warn');
+            throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
+          }
           throw new Error(clickResult.error);
         }
 
