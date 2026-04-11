@@ -2276,6 +2276,16 @@ async function executeStep5(state) {
 
   await addLog(`步骤 5：已生成姓名 ${firstName} ${lastName}，生日 ${year}-${month}-${day}`);
 
+  const signupTabId = await getTabId('signup-page');
+  if (signupTabId) {
+    const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
+    if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
+      await addLog('步骤 5：认证页已直接进入 localhost 回调地址，资料页按已跳过处理。', 'ok');
+      await completeStepFromBackground(5, { skippedDirectToCallback: true });
+      return;
+    }
+  }
+
   await sendToContentScript('signup-page', {
     type: 'EXECUTE_STEP',
     step: 5,
@@ -2311,11 +2321,81 @@ async function executeStep6(state) {
     throw new Error('缺少邮箱地址，请先完成步骤 3。');
   }
 
+  const existingSignupTabId = await getTabId('signup-page');
+  if (existingSignupTabId) {
+    const existingSignupTab = await chrome.tabs.get(existingSignupTabId).catch(() => null);
+    if (isLocalhostOAuthCallbackUrl(existingSignupTab?.url)) {
+      await addLog('步骤 6：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+      await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
+      return;
+    }
+
+    const authState = await sendToContentScriptResilient('signup-page', {
+      type: 'INSPECT_AUTH_PAGE_STATE',
+      step: 6,
+      source: 'background',
+      payload: {},
+    }, {
+      timeoutMs: 15000,
+      retryDelayMs: 500,
+      logMessage: '步骤 6：认证页状态检测未就绪，正在重试...',
+    });
+
+    if (authState?.localhostUrl && isLocalhostOAuthCallbackUrl(authState.localhostUrl)) {
+      await addLog('步骤 6：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+      await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
+      return;
+    }
+
+    if (authState?.state === 'consent') {
+      await addLog('步骤 6：认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
+      await completeStepFromBackground(6, { needsOTP: false, skippedDirectToConsent: true });
+      return;
+    }
+
+    if (authState?.state === 'add_phone') {
+      throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
+    }
+  }
+
   const oauthUrl = await refreshOAuthUrlBeforeStep6(state);
 
   await addLog('步骤 6：正在打开最新 OAuth 链接并登录...');
   // Reuse the signup-page tab — navigate it to the OAuth URL
-  await reuseOrCreateTab('signup-page', oauthUrl);
+  const signupTabId = await reuseOrCreateTab('signup-page', oauthUrl);
+  const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
+  if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
+    await addLog('步骤 6：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
+    return;
+  }
+
+  const postOpenAuthState = await sendToContentScriptResilient('signup-page', {
+    type: 'INSPECT_AUTH_PAGE_STATE',
+    step: 6,
+    source: 'background',
+    payload: {},
+  }, {
+    timeoutMs: 15000,
+    retryDelayMs: 500,
+    logMessage: '步骤 6：正在等待刷新后的认证页就绪...',
+  });
+
+  if (postOpenAuthState?.localhostUrl && isLocalhostOAuthCallbackUrl(postOpenAuthState.localhostUrl)) {
+    await addLog('步骤 6：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
+    return;
+  }
+
+  if (postOpenAuthState?.state === 'consent') {
+    await addLog('步骤 6：刷新后的认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(6, { needsOTP: false, skippedDirectToConsent: true });
+    return;
+  }
+
+  if (postOpenAuthState?.state === 'add_phone') {
+    throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
+  }
 
   // signup-page.js will inject (same auth.openai.com domain) and handle login
   await sendToContentScript('signup-page', {
@@ -2343,6 +2423,40 @@ async function runStep7Attempt(state) {
       throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
     }
     await reuseOrCreateTab('signup-page', state.oauthUrl);
+  }
+
+  const currentAuthTab = authTabId ? await chrome.tabs.get(authTabId).catch(() => null) : null;
+  if (isLocalhostOAuthCallbackUrl(currentAuthTab?.url)) {
+    await addLog('步骤 7：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(7, { skippedDirectToCallback: true });
+    return;
+  }
+
+  const currentAuthState = await sendToContentScriptResilient('signup-page', {
+    type: 'INSPECT_AUTH_PAGE_STATE',
+    step: 7,
+    source: 'background',
+    payload: {},
+  }, {
+    timeoutMs: 15000,
+    retryDelayMs: 500,
+    logMessage: '步骤 7：认证页状态检测未就绪，正在重试...',
+  });
+
+  if (currentAuthState?.localhostUrl && isLocalhostOAuthCallbackUrl(currentAuthState.localhostUrl)) {
+    await addLog('步骤 7：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(7, { skippedDirectToCallback: true });
+    return;
+  }
+
+  if (currentAuthState?.state === 'consent') {
+    await addLog('步骤 7：认证页已直接进入 OAuth 同意页，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(7, { skippedDirectToConsent: true });
+    return;
+  }
+
+  if (currentAuthState?.state === 'add_phone') {
+    throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
   }
 
   await addLog('步骤 7：正在准备认证页，必要时切换到一次性验证码登录...');
@@ -2436,6 +2550,27 @@ async function executeStep8(state) {
 
   await addLog('步骤 8：正在监听 localhost 回调地址...');
 
+  async function completeIfCurrentTabAlreadyAtCallback(tabId, logMessage) {
+    if (!tabId) return false;
+
+    let tab = null;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      return false;
+    }
+
+    if (!isLocalhostOAuthCallbackUrl(tab?.url)) {
+      return false;
+    }
+
+    if (logMessage) {
+      await addLog(logMessage, 'ok');
+    }
+    await completeStepFromBackground(8, { localhostUrl: tab.url });
+    return true;
+  }
+
   // 只在当前步骤内注册 webNavigation 监听
   return new Promise((resolve, reject) => {
     let resolved = false;
@@ -2479,11 +2614,27 @@ async function executeStep8(state) {
       try {
         signupTabId = await getTabId('signup-page');
         if (signupTabId) {
+          if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 8：检测到认证页已停留在 localhost 回调地址，直接完成当前步骤。')) {
+            resolved = true;
+            clearTimeout(timeout);
+            cleanupListener();
+            resolve();
+            return;
+          }
+
           await chrome.tabs.update(signupTabId, { active: true });
           await addLog('步骤 8：已切回认证页，正在准备调试器点击...');
         } else {
           signupTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
           await addLog('步骤 8：已重新打开认证页，正在准备调试器点击...');
+        }
+
+        if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 8：检测到认证页已跳到 localhost 回调地址，直接完成当前步骤。')) {
+          resolved = true;
+          clearTimeout(timeout);
+          cleanupListener();
+          resolve();
+          return;
         }
 
         chrome.webNavigation.onBeforeNavigate.addListener(webNavListener);
@@ -2500,6 +2651,16 @@ async function executeStep8(state) {
             throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
           }
           throw new Error(clickResult.error);
+        }
+
+        if (clickResult?.alreadyAtCallback) {
+          resolved = true;
+          cleanupListener();
+          clearTimeout(timeout);
+          await addLog(`步骤 8：内容脚本确认当前页面已是 localhost 回调地址：${clickResult.url}`, 'ok');
+          await completeStepFromBackground(8, { localhostUrl: clickResult.url });
+          resolve();
+          return;
         }
 
         if (!resolved) {

@@ -12,6 +12,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     || message.type === 'PREPARE_LOGIN_CODE'
     || message.type === 'PREPARE_SIGNUP_VERIFICATION'
     || message.type === 'RESEND_VERIFICATION_CODE'
+    || message.type === 'INSPECT_AUTH_PAGE_STATE'
   ) {
     resetStopState();
     handleCommand(message).then((result) => {
@@ -56,6 +57,8 @@ async function handleCommand(message) {
       return await prepareLoginCodeFlow();
     case 'RESEND_VERIFICATION_CODE':
       return await resendVerificationCode(message.step);
+    case 'INSPECT_AUTH_PAGE_STATE':
+      return inspectAuthPageState();
     case 'STEP8_FIND_AND_CLICK':
       return await step8_findAndClick();
   }
@@ -168,6 +171,27 @@ function findResendVerificationCodeTrigger({ allowDisabled = false } = {}) {
 
 function isEmailVerificationPage() {
   return /\/email-verification(?:[/?#]|$)/i.test(location.pathname || '');
+}
+
+function parseUrlSafely(rawUrl) {
+  if (!rawUrl) return null;
+  try {
+    return new URL(rawUrl);
+  } catch {
+    return null;
+  }
+}
+
+function isLocalhostOAuthCallbackUrl(rawUrl = location.href) {
+  const parsed = parseUrlSafely(rawUrl);
+  if (!parsed) return false;
+  if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+  if (!['localhost', '127.0.0.1'].includes(parsed.hostname)) return false;
+  if (parsed.pathname !== '/auth/callback') return false;
+
+  const code = (parsed.searchParams.get('code') || '').trim();
+  const state = (parsed.searchParams.get('state') || '').trim();
+  return Boolean(code && state);
 }
 
 async function prepareLoginCodeFlow(timeout = 15000) {
@@ -467,6 +491,38 @@ function isStep8Ready() {
   if (isAddPhonePageReady()) return false;
 
   return OAUTH_CONSENT_PAGE_PATTERN.test(getPageTextSnapshot());
+}
+
+function inspectAuthPageState() {
+  if (isLocalhostOAuthCallbackUrl()) {
+    return { state: 'callback', localhostUrl: location.href };
+  }
+
+  if (isAddPhonePageReady()) {
+    return { state: 'add_phone', url: location.href };
+  }
+
+  if (isStep8Ready()) {
+    return { state: 'consent', url: location.href };
+  }
+
+  if (isEmailVerificationPage() || getVerificationCodeTarget() || isVerificationPageStillVisible()) {
+    return { state: 'verification', url: location.href };
+  }
+
+  if (isStep5Ready()) {
+    return { state: 'step5', url: location.href };
+  }
+
+  if (document.querySelector('input[type="password"]')) {
+    return { state: 'password', url: location.href };
+  }
+
+  if (document.querySelector('input[type="email"], input[name="email"], input[name="username"]')) {
+    return { state: 'email', url: location.href };
+  }
+
+  return { state: 'unknown', url: location.href };
 }
 
 function normalizeInlineText(text) {
@@ -926,6 +982,14 @@ async function step6_login(payload) {
 // Background performs the actual click through the debugger Input API.
 
 async function step8_findAndClick() {
+  if (isLocalhostOAuthCallbackUrl()) {
+    log('步骤 8：当前页面已是 localhost 回调地址，跳过“继续”按钮点击。', 'ok');
+    return {
+      alreadyAtCallback: true,
+      url: location.href,
+    };
+  }
+
   log('步骤 8：正在查找 OAuth 同意页的“继续”按钮...');
 
   const continueBtn = await findContinueButton();
@@ -1000,6 +1064,25 @@ function getSerializableRect(el) {
 
 async function step5_fillNameBirthday(payload) {
   const { firstName, lastName, age, year, month, day } = payload;
+
+  if (isAddPhonePageReady()) {
+    throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
+  }
+
+  if (!isStep5Ready()) {
+    if (isStep8Ready()) {
+      log('步骤 5：当前账号已跳过资料页，页面已直接进入 OAuth 同意页。', 'warn');
+      reportComplete(5, { skippedDirectToConsent: true });
+      return;
+    }
+
+    if (isLocalhostOAuthCallbackUrl()) {
+      log('步骤 5：当前账号已跳过资料页，页面已直接进入 localhost 回调地址。', 'warn');
+      reportComplete(5, { skippedDirectToCallback: true, localhostUrl: location.href });
+      return;
+    }
+  }
+
   if (!firstName || !lastName) throw new Error('未提供姓名数据。');
 
   const resolvedAge = age ?? (year ? new Date().getFullYear() - Number(year) : null);
