@@ -376,10 +376,21 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
   const start = Date.now();
   let lastError = null;
   let logged = false;
+  let attempt = 0;
+
+  console.log(
+    LOG_PREFIX,
+    `[ensureContentScriptReadyOnTab] start ${source} tab=${tabId}, timeout=${timeoutMs}ms, inject=${Array.isArray(inject) ? inject.join(',') : 'none'}`
+  );
 
   while (Date.now() - start < timeoutMs) {
+    attempt += 1;
     const pong = await pingContentScriptOnTab(tabId);
     if (pong?.ok && (!pong.source || pong.source === source)) {
+      console.log(
+        LOG_PREFIX,
+        `[ensureContentScriptReadyOnTab] ready ${source} tab=${tabId} on attempt ${attempt} after ${Date.now() - start}ms`
+      );
       await registerTab(source, tabId);
       return;
     }
@@ -411,15 +422,27 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
       });
     } catch (err) {
       lastError = err;
+      console.warn(
+        LOG_PREFIX,
+        `[ensureContentScriptReadyOnTab] inject attempt ${attempt} failed for ${source} tab=${tabId}: ${err?.message || err}`
+      );
     }
 
     const pongAfterInject = await pingContentScriptOnTab(tabId);
     if (pongAfterInject?.ok && (!pongAfterInject.source || pongAfterInject.source === source)) {
+      console.log(
+        LOG_PREFIX,
+        `[ensureContentScriptReadyOnTab] ready after inject ${source} tab=${tabId} on attempt ${attempt} after ${Date.now() - start}ms`
+      );
       await registerTab(source, tabId);
       return;
     }
 
     if (logMessage && !logged) {
+      console.warn(
+        LOG_PREFIX,
+        `[ensureContentScriptReadyOnTab] ${source} tab=${tabId} still not ready after ${Date.now() - start}ms`
+      );
       await addLog(logMessage, 'warn');
       logged = true;
     }
@@ -458,27 +481,86 @@ function getContentScriptResponseTimeoutMs(message) {
   return 30000;
 }
 
+function getMessageDebugLabel(source, message, tabId = null) {
+  const parts = [source || 'unknown', message?.type || 'UNKNOWN'];
+  if (Number.isInteger(message?.step)) {
+    parts.push(`step=${message.step}`);
+  }
+  if (Number.isInteger(tabId)) {
+    parts.push(`tab=${tabId}`);
+  }
+  return parts.join(' ');
+}
+
+function summarizeMessageResultForDebug(result) {
+  if (result === undefined) return 'undefined';
+  if (result === null) return 'null';
+  if (typeof result !== 'object') return JSON.stringify(result);
+
+  const summary = {};
+  for (const key of ['ok', 'error', 'stopped', 'source', 'step']) {
+    if (key in result) summary[key] = result[key];
+  }
+  if (result.payload && typeof result.payload === 'object') {
+    summary.payloadKeys = Object.keys(result.payload);
+  }
+  return JSON.stringify(summary);
+}
+
 function sendTabMessageWithTimeout(tabId, source, message, responseTimeoutMs = getContentScriptResponseTimeoutMs(message)) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    const startedAt = Date.now();
+    const debugLabel = getMessageDebugLabel(source, message, tabId);
 
-    const finalize = (callback) => (value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      callback(value);
-    };
+    console.log(LOG_PREFIX, `[sendTabMessageWithTimeout] dispatch ${debugLabel}, timeout=${responseTimeoutMs}ms`);
 
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       const seconds = Math.ceil(responseTimeoutMs / 1000);
+      console.warn(LOG_PREFIX, `[sendTabMessageWithTimeout] timeout ${debugLabel} after ${Date.now() - startedAt}ms`);
       reject(new Error(`Content script on ${source} did not respond in ${seconds}s. Try refreshing the tab and retry.`));
     }, responseTimeoutMs);
 
     chrome.tabs.sendMessage(tabId, message)
-      .then(finalize(resolve))
-      .catch(finalize(reject));
+      .then((value) => {
+        const elapsed = Date.now() - startedAt;
+        if (settled) {
+          console.warn(
+            LOG_PREFIX,
+            `[sendTabMessageWithTimeout] late response ignored for ${debugLabel} after ${elapsed}ms: ${summarizeMessageResultForDebug(value)}`
+          );
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timer);
+        console.log(
+          LOG_PREFIX,
+          `[sendTabMessageWithTimeout] response ${debugLabel} after ${elapsed}ms: ${summarizeMessageResultForDebug(value)}`
+        );
+        resolve(value);
+      })
+      .catch((error) => {
+        const elapsed = Date.now() - startedAt;
+        const errorMessage = error?.message || String(error);
+        if (settled) {
+          console.warn(
+            LOG_PREFIX,
+            `[sendTabMessageWithTimeout] late rejection ignored for ${debugLabel} after ${elapsed}ms: ${errorMessage}`
+          );
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timer);
+        console.warn(
+          LOG_PREFIX,
+          `[sendTabMessageWithTimeout] rejection ${debugLabel} after ${elapsed}ms: ${errorMessage}`
+        );
+        reject(error);
+      });
   });
 }
 
@@ -687,14 +769,36 @@ async function sendToContentScriptResilient(source, message, options = {}) {
   const start = Date.now();
   let lastError = null;
   let logged = false;
+  let attempt = 0;
+  const debugLabel = getMessageDebugLabel(source, message);
+
+  console.log(
+    LOG_PREFIX,
+    `[sendToContentScriptResilient] start ${debugLabel}, totalTimeout=${timeoutMs}ms, retryDelay=${retryDelayMs}ms`
+  );
 
   while (Date.now() - start < timeoutMs) {
     throwIfStopped();
+    attempt += 1;
 
     try {
-      return await sendToContentScript(source, message);
+      console.log(
+        LOG_PREFIX,
+        `[sendToContentScriptResilient] attempt ${attempt} -> ${debugLabel}, elapsed=${Date.now() - start}ms`
+      );
+      const result = await sendToContentScript(source, message);
+      console.log(
+        LOG_PREFIX,
+        `[sendToContentScriptResilient] success ${debugLabel} on attempt ${attempt} after ${Date.now() - start}ms`
+      );
+      return result;
     } catch (err) {
-      if (!isRetryableContentScriptTransportError(err)) {
+      const retryable = isRetryableContentScriptTransportError(err);
+      console.warn(
+        LOG_PREFIX,
+        `[sendToContentScriptResilient] attempt ${attempt} failed for ${debugLabel}, retryable=${retryable}, elapsed=${Date.now() - start}ms: ${err?.message || err}`
+      );
+      if (!retryable) {
         throw err;
       }
 
@@ -1312,8 +1416,13 @@ const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([4, 7, 8]);
 function waitForStepComplete(step, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     throwIfStopped();
+    if (stepWaiters.has(step)) {
+      console.warn(LOG_PREFIX, `[waitForStepComplete] replacing existing waiter for step ${step}`);
+    }
+    console.log(LOG_PREFIX, `[waitForStepComplete] register step ${step}, timeout=${timeoutMs}ms`);
     const timer = setTimeout(() => {
       stepWaiters.delete(step);
+      console.warn(LOG_PREFIX, `[waitForStepComplete] timeout for step ${step} after ${timeoutMs}ms`);
       reject(new Error(`Step ${step} timed out after ${timeoutMs / 1000}s`));
     }, timeoutMs);
 
@@ -1326,11 +1435,13 @@ function waitForStepComplete(step, timeoutMs = 120000) {
 
 function notifyStepComplete(step, payload) {
   const waiter = stepWaiters.get(step);
+  console.log(LOG_PREFIX, `[notifyStepComplete] step ${step}, hasWaiter=${Boolean(waiter)}`);
   if (waiter) waiter.resolve(payload);
 }
 
 function notifyStepError(step, error) {
   const waiter = stepWaiters.get(step);
+  console.warn(LOG_PREFIX, `[notifyStepError] step ${step}, hasWaiter=${Boolean(waiter)}, error=${error}`);
   if (waiter) waiter.reject(new Error(error));
 }
 
@@ -2309,9 +2420,13 @@ async function refreshOAuthUrlBeforeStep6(state) {
   }
 
   await addLog('步骤 6：正在刷新登录用的 CPA OAuth 链接...');
+  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] preparing fresh OAuth via step 1');
   const waitForFreshOAuth = waitForStepComplete(1, 120000);
+  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] executing step 1 for fresh OAuth');
   await executeStep1(state);
+  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] step 1 execute returned, waiting for completion signal');
   await waitForFreshOAuth;
+  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] step 1 completion signal received');
 
   const latestState = await getState();
   if (!latestState.oauthUrl) {
