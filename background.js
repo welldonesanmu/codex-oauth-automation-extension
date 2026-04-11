@@ -1193,6 +1193,21 @@ async function handleMessage(message, sender) {
       return { ok: true, email: message.payload.email };
     }
 
+    case 'DEBUGGER_CLICK_CURRENT_TAB': {
+      const tabId = sender.tab?.id;
+      const rect = message.payload?.rect;
+      if (!tabId) {
+        throw new Error('当前消息未附带邮箱标签页。');
+      }
+      if (!rect || !Number.isFinite(rect.centerX) || !Number.isFinite(rect.centerY)) {
+        throw new Error('缺少有效的点击坐标。');
+      }
+
+      await chrome.tabs.update(tabId, { active: true });
+      await clickWithDebugger(tabId, rect);
+      return { ok: true };
+    }
+
     case 'FETCH_DUCK_EMAIL': {
       clearStopRequest();
       const state = await getState();

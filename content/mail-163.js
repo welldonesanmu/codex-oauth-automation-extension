@@ -19,6 +19,8 @@ if (!isTopFrame) {
 
 // Track codes we've already seen — persisted in chrome.storage.session to survive script re-injection
 let seenCodes = new Set();
+const MAIL163_WAKE_INTERVAL_MS = 30 * 60 * 1000;
+const MAIL163_LAST_WAKE_AT_KEY = 'mail163LastWakeAt';
 
 async function loadSeenCodes() {
   try {
@@ -71,6 +73,102 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 function findMailItems() {
   return document.querySelectorAll('div[sign="letter"]');
+}
+
+function getInboxEntry() {
+  return document.querySelector('.nui-tree-item-text[title="收件箱"]');
+}
+
+function getPageActivationTarget() {
+  return document.querySelector('.js-component-component.ra0.mD0')
+    || document.querySelector('.js-component-component.ra0')
+    || document.querySelector('.mD0')
+    || document.querySelector('#dvContainer')
+    || document.body;
+}
+
+function getSerializableRect(el) {
+  if (!el) return null;
+  const rect = el.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  return {
+    left: rect.left,
+    top: rect.top,
+    width: rect.width,
+    height: rect.height,
+    centerX: rect.left + (rect.width / 2),
+    centerY: rect.top + (rect.height / 2),
+  };
+}
+
+async function getMail163LastWakeAt() {
+  try {
+    const data = await chrome.storage.session.get(MAIL163_LAST_WAKE_AT_KEY);
+    const value = Number(data[MAIL163_LAST_WAKE_AT_KEY] || 0);
+    return Number.isFinite(value) ? value : 0;
+  } catch (err) {
+    console.warn(MAIL163_PREFIX, 'Could not read last wake timestamp:', err?.message || err);
+    return 0;
+  }
+}
+
+async function setMail163LastWakeAt(timestamp) {
+  try {
+    await chrome.storage.session.set({ [MAIL163_LAST_WAKE_AT_KEY]: timestamp });
+  } catch (err) {
+    console.warn(MAIL163_PREFIX, 'Could not persist last wake timestamp:', err?.message || err);
+  }
+}
+
+async function maybeActivateMail163Page(step, reason = '页面疑似休眠，尝试激活', options = {}) {
+  const { force = false } = options;
+  const now = Date.now();
+  const lastWakeAt = await getMail163LastWakeAt();
+  const nextWakeInMs = MAIL163_WAKE_INTERVAL_MS - (now - lastWakeAt);
+
+  if (!force && lastWakeAt && nextWakeInMs > 0) {
+    log(`步骤 ${step}：暂不执行 163 保活点击，距离下次保活窗口还有 ${Math.ceil(nextWakeInMs / 60000)} 分钟。`, 'info');
+    return false;
+  }
+
+  const activationTarget = getPageActivationTarget();
+  if (!activationTarget) {
+    log(`步骤 ${step}：${reason}，但未找到可点击的 163 页面区域。`, 'warn');
+    return false;
+  }
+
+  window.focus?.();
+  activationTarget.scrollIntoView({ block: 'center', inline: 'center' });
+  activationTarget.focus?.();
+  activationTarget.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true }));
+  activationTarget.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+  activationTarget.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true }));
+  activationTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, buttons: 1 }));
+  activationTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, button: 0, buttons: 0 }));
+  activationTarget.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+  await sleep(300);
+
+  const rect = getSerializableRect(activationTarget);
+  if (!rect) {
+    log(`步骤 ${step}：163 页面保活仅执行了 DOM 点击，因为无法获取坐标。`, 'warn');
+    await setMail163LastWakeAt(now);
+    return true;
+  }
+
+  try {
+    await chrome.runtime.sendMessage({
+      type: 'DEBUGGER_CLICK_CURRENT_TAB',
+      source: 'mail-163',
+      payload: { rect },
+    });
+    await setMail163LastWakeAt(now);
+    log(`步骤 ${step}：已执行 163 页面保活点击（${reason}）。`, 'warn');
+    await sleep(500);
+    return true;
+  } catch (err) {
+    log(`步骤 ${step}：163 页面保活点击失败：${err.message}`, 'warn');
+    return false;
+  }
 }
 
 function getCurrentMailIds() {
@@ -166,7 +264,8 @@ async function handlePollEmail(step, payload) {
     inboxLink.click();
     log(`步骤 ${step}：已点击收件箱`);
   } catch {
-    log(`步骤 ${step}：未找到收件箱入口，继续尝试后续流程...`, 'warn');
+    log(`步骤 ${step}：未找到收件箱入口，先尝试执行一次 163 页面保活点击...`, 'warn');
+    await maybeActivateMail163Page(step, '初次未找到收件箱入口');
   }
 
   // Wait for mail list to appear
@@ -175,6 +274,16 @@ async function handlePollEmail(step, payload) {
   for (let i = 0; i < 20; i++) {
     items = findMailItems();
     if (items.length > 0) break;
+
+    if (i === 5 || i === 12) {
+      await maybeActivateMail163Page(step, '邮件列表长时间未出现');
+      const inboxLink = getInboxEntry();
+      if (inboxLink) {
+        inboxLink.click();
+        await sleep(500);
+      }
+    }
+
     await sleep(500);
   }
 
@@ -185,7 +294,19 @@ async function handlePollEmail(step, payload) {
   }
 
   if (items.length === 0) {
-    throw new Error('163 邮箱列表未加载完成，请确认当前已打开收件箱。');
+    await maybeActivateMail163Page(step, '刷新后邮件列表仍为空', { force: true });
+    const inboxLink = getInboxEntry();
+    if (inboxLink) {
+      inboxLink.click();
+      await sleep(800);
+    }
+    await refreshInbox();
+    await sleep(2000);
+    items = findMailItems();
+  }
+
+  if (items.length === 0) {
+    throw new Error('163 邮箱列表未加载完成，请确认当前已打开收件箱；若页面休眠，请手动点一下 163 页面后重试。');
   }
 
   log(`步骤 ${step}：邮件列表已加载，共 ${items.length} 封邮件`);
@@ -204,7 +325,18 @@ async function handlePollEmail(step, payload) {
       await sleep(1000);
     }
 
-    const allItems = findMailItems();
+    let allItems = findMailItems();
+    if (allItems.length === 0) {
+      await maybeActivateMail163Page(step, `第 ${attempt} 次轮询时邮件列表为空`);
+      const inboxLink = getInboxEntry();
+      if (inboxLink) {
+        inboxLink.click();
+        await sleep(500);
+      }
+      await refreshInbox();
+      await sleep(1000);
+      allItems = findMailItems();
+    }
     const useFallback = attempt > FALLBACK_AFTER;
 
     for (const item of allItems) {
