@@ -376,10 +376,21 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
   const start = Date.now();
   let lastError = null;
   let logged = false;
+  let attempt = 0;
+
+  console.log(
+    LOG_PREFIX,
+    `[ensureContentScriptReadyOnTab] start ${source} tab=${tabId}, timeout=${timeoutMs}ms, inject=${Array.isArray(inject) ? inject.join(',') : 'none'}`
+  );
 
   while (Date.now() - start < timeoutMs) {
+    attempt += 1;
     const pong = await pingContentScriptOnTab(tabId);
     if (pong?.ok && (!pong.source || pong.source === source)) {
+      console.log(
+        LOG_PREFIX,
+        `[ensureContentScriptReadyOnTab] ready ${source} tab=${tabId} on attempt ${attempt} after ${Date.now() - start}ms`
+      );
       await registerTab(source, tabId);
       return;
     }
@@ -411,15 +422,27 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
       });
     } catch (err) {
       lastError = err;
+      console.warn(
+        LOG_PREFIX,
+        `[ensureContentScriptReadyOnTab] inject attempt ${attempt} failed for ${source} tab=${tabId}: ${err?.message || err}`
+      );
     }
 
     const pongAfterInject = await pingContentScriptOnTab(tabId);
     if (pongAfterInject?.ok && (!pongAfterInject.source || pongAfterInject.source === source)) {
+      console.log(
+        LOG_PREFIX,
+        `[ensureContentScriptReadyOnTab] ready after inject ${source} tab=${tabId} on attempt ${attempt} after ${Date.now() - start}ms`
+      );
       await registerTab(source, tabId);
       return;
     }
 
     if (logMessage && !logged) {
+      console.warn(
+        LOG_PREFIX,
+        `[ensureContentScriptReadyOnTab] ${source} tab=${tabId} still not ready after ${Date.now() - start}ms`
+      );
       await addLog(logMessage, 'warn');
       logged = true;
     }
@@ -435,6 +458,111 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
 // ============================================================
 
 const pendingCommands = new Map(); // source -> { message, resolve, reject, timer }
+
+function getContentScriptResponseTimeoutMs(message) {
+  if (!message || typeof message !== 'object') {
+    return 30000;
+  }
+
+  if (message.type === 'POLL_EMAIL') {
+    const maxAttempts = Math.max(1, Number(message.payload?.maxAttempts) || 1);
+    const intervalMs = Math.max(0, Number(message.payload?.intervalMs) || 0);
+    return Math.max(45000, maxAttempts * intervalMs + 25000);
+  }
+
+  if (message.type === 'FILL_CODE') {
+    return Number(message.step) === 7 ? 45000 : 30000;
+  }
+
+  if (message.type === 'PREPARE_SIGNUP_VERIFICATION') {
+    return 45000;
+  }
+
+  return 30000;
+}
+
+function getMessageDebugLabel(source, message, tabId = null) {
+  const parts = [source || 'unknown', message?.type || 'UNKNOWN'];
+  if (Number.isInteger(message?.step)) {
+    parts.push(`step=${message.step}`);
+  }
+  if (Number.isInteger(tabId)) {
+    parts.push(`tab=${tabId}`);
+  }
+  return parts.join(' ');
+}
+
+function summarizeMessageResultForDebug(result) {
+  if (result === undefined) return 'undefined';
+  if (result === null) return 'null';
+  if (typeof result !== 'object') return JSON.stringify(result);
+
+  const summary = {};
+  for (const key of ['ok', 'error', 'stopped', 'source', 'step']) {
+    if (key in result) summary[key] = result[key];
+  }
+  if (result.payload && typeof result.payload === 'object') {
+    summary.payloadKeys = Object.keys(result.payload);
+  }
+  return JSON.stringify(summary);
+}
+
+function sendTabMessageWithTimeout(tabId, source, message, responseTimeoutMs = getContentScriptResponseTimeoutMs(message)) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const startedAt = Date.now();
+    const debugLabel = getMessageDebugLabel(source, message, tabId);
+
+    console.log(LOG_PREFIX, `[sendTabMessageWithTimeout] dispatch ${debugLabel}, timeout=${responseTimeoutMs}ms`);
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const seconds = Math.ceil(responseTimeoutMs / 1000);
+      console.warn(LOG_PREFIX, `[sendTabMessageWithTimeout] timeout ${debugLabel} after ${Date.now() - startedAt}ms`);
+      reject(new Error(`Content script on ${source} did not respond in ${seconds}s. Try refreshing the tab and retry.`));
+    }, responseTimeoutMs);
+
+    chrome.tabs.sendMessage(tabId, message)
+      .then((value) => {
+        const elapsed = Date.now() - startedAt;
+        if (settled) {
+          console.warn(
+            LOG_PREFIX,
+            `[sendTabMessageWithTimeout] late response ignored for ${debugLabel} after ${elapsed}ms: ${summarizeMessageResultForDebug(value)}`
+          );
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timer);
+        console.log(
+          LOG_PREFIX,
+          `[sendTabMessageWithTimeout] response ${debugLabel} after ${elapsed}ms: ${summarizeMessageResultForDebug(value)}`
+        );
+        resolve(value);
+      })
+      .catch((error) => {
+        const elapsed = Date.now() - startedAt;
+        const errorMessage = error?.message || String(error);
+        if (settled) {
+          console.warn(
+            LOG_PREFIX,
+            `[sendTabMessageWithTimeout] late rejection ignored for ${debugLabel} after ${elapsed}ms: ${errorMessage}`
+          );
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timer);
+        console.warn(
+          LOG_PREFIX,
+          `[sendTabMessageWithTimeout] rejection ${debugLabel} after ${elapsed}ms: ${errorMessage}`
+        );
+        reject(error);
+      });
+  });
+}
 
 function queueCommand(source, message, timeout = 15000) {
   return new Promise((resolve, reject) => {
@@ -454,7 +582,7 @@ function flushCommand(source, tabId) {
   if (pending) {
     clearTimeout(pending.timer);
     pendingCommands.delete(source);
-    chrome.tabs.sendMessage(tabId, pending.message).then(pending.resolve).catch(pending.reject);
+    sendTabMessageWithTimeout(tabId, source, pending.message).then(pending.resolve).catch(pending.reject);
     console.log(LOG_PREFIX, `Flushed queued command to ${source} (tab ${tabId})`);
   }
 }
@@ -614,7 +742,8 @@ async function reuseOrCreateTab(source, url, options = {}) {
 // Send command to content script (with readiness check)
 // ============================================================
 
-async function sendToContentScript(source, message) {
+async function sendToContentScript(source, message, options = {}) {
+  const { responseTimeoutMs = getContentScriptResponseTimeoutMs(message) } = options;
   const registry = await getTabRegistry();
   const entry = registry[source];
 
@@ -632,7 +761,7 @@ async function sendToContentScript(source, message) {
   }
 
   console.log(LOG_PREFIX, `Sending to ${source} (tab ${entry.tabId}):`, message.type);
-  return chrome.tabs.sendMessage(entry.tabId, message);
+  return sendTabMessageWithTimeout(entry.tabId, source, message, responseTimeoutMs);
 }
 
 async function sendToContentScriptResilient(source, message, options = {}) {
@@ -640,14 +769,36 @@ async function sendToContentScriptResilient(source, message, options = {}) {
   const start = Date.now();
   let lastError = null;
   let logged = false;
+  let attempt = 0;
+  const debugLabel = getMessageDebugLabel(source, message);
+
+  console.log(
+    LOG_PREFIX,
+    `[sendToContentScriptResilient] start ${debugLabel}, totalTimeout=${timeoutMs}ms, retryDelay=${retryDelayMs}ms`
+  );
 
   while (Date.now() - start < timeoutMs) {
     throwIfStopped();
+    attempt += 1;
 
     try {
-      return await sendToContentScript(source, message);
+      console.log(
+        LOG_PREFIX,
+        `[sendToContentScriptResilient] attempt ${attempt} -> ${debugLabel}, elapsed=${Date.now() - start}ms`
+      );
+      const result = await sendToContentScript(source, message);
+      console.log(
+        LOG_PREFIX,
+        `[sendToContentScriptResilient] success ${debugLabel} on attempt ${attempt} after ${Date.now() - start}ms`
+      );
+      return result;
     } catch (err) {
-      if (!isRetryableContentScriptTransportError(err)) {
+      const retryable = isRetryableContentScriptTransportError(err);
+      console.warn(
+        LOG_PREFIX,
+        `[sendToContentScriptResilient] attempt ${attempt} failed for ${debugLabel}, retryable=${retryable}, elapsed=${Date.now() - start}ms: ${err?.message || err}`
+      );
+      if (!retryable) {
         throw err;
       }
 
@@ -869,7 +1020,7 @@ function isStopError(error) {
 
 function isRetryableContentScriptTransportError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
-  return /back\/forward cache|message channel is closed|Receiving end does not exist|port closed before a response was received|A listener indicated an asynchronous response/i.test(message);
+  return /back\/forward cache|message channel is closed|Receiving end does not exist|port closed before a response was received|A listener indicated an asynchronous response|did not respond in \d+s/i.test(message);
 }
 
 function getErrorMessage(error) {
@@ -883,7 +1034,7 @@ function isVerificationMailPollingError(error) {
 
 function isRestartCurrentAttemptError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
-  return /当前邮箱已存在，需要重新开始新一轮|当前流程已进入手机号页面，需要重新开始新一轮|Duck 邮箱自动获取失败，需要重新开始新一轮/.test(message);
+  return /当前邮箱已存在，需要重新开始新一轮|当前流程已进入手机号页面，需要重新开始新一轮|Duck 邮箱自动获取失败，需要重新开始新一轮|认证页进入了手机号页面|点击“继续”后页面跳到了手机号页面|当前页面已进入手机号页面，不是 OAuth 授权同意页/.test(message);
 }
 
 function isStep9OAuthTimeoutError(error) {
@@ -1393,8 +1544,13 @@ const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([4, 7, 8]);
 function waitForStepComplete(step, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     throwIfStopped();
+    if (stepWaiters.has(step)) {
+      console.warn(LOG_PREFIX, `[waitForStepComplete] replacing existing waiter for step ${step}`);
+    }
+    console.log(LOG_PREFIX, `[waitForStepComplete] register step ${step}, timeout=${timeoutMs}ms`);
     const timer = setTimeout(() => {
       stepWaiters.delete(step);
+      console.warn(LOG_PREFIX, `[waitForStepComplete] timeout for step ${step} after ${timeoutMs}ms`);
       reject(new Error(`Step ${step} timed out after ${timeoutMs / 1000}s`));
     }, timeoutMs);
 
@@ -1408,11 +1564,13 @@ function waitForStepComplete(step, timeoutMs = 120000) {
 function notifyStepComplete(step, payload) {
   touchAutoRunProgress();
   const waiter = stepWaiters.get(step);
+  console.log(LOG_PREFIX, `[notifyStepComplete] step ${step}, hasWaiter=${Boolean(waiter)}`);
   if (waiter) waiter.resolve(payload);
 }
 
 function notifyStepError(step, error) {
   const waiter = stepWaiters.get(step);
+  console.warn(LOG_PREFIX, `[notifyStepError] step ${step}, hasWaiter=${Boolean(waiter)}, error=${error}`);
   if (waiter) waiter.reject(new Error(error));
 }
 
@@ -2432,9 +2590,13 @@ async function refreshOAuthUrlBeforeStep6(state) {
   }
 
   await addLog('步骤 6：正在刷新登录用的 CPA OAuth 链接...');
+  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] preparing fresh OAuth via step 1');
   const waitForFreshOAuth = waitForStepComplete(1, 120000);
+  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] executing step 1 for fresh OAuth');
   await executeStep1(state);
+  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] step 1 execute returned, waiting for completion signal');
   await waitForFreshOAuth;
+  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] step 1 completion signal received');
 
   const latestState = await getState();
   if (!latestState.oauthUrl) {
@@ -2670,6 +2832,138 @@ async function executeStep7(state) {
 // ============================================================
 
 let webNavListener = null;
+const STEP8_CLICK_EFFECT_TIMEOUT_MS = 3500;
+const STEP8_CLICK_RETRY_DELAY_MS = 500;
+const STEP8_READY_WAIT_TIMEOUT_MS = 30000;
+const STEP8_STRATEGIES = [
+  { mode: 'content', strategy: 'requestSubmit', label: 'form.requestSubmit' },
+  { mode: 'debugger', label: 'debugger click' },
+  { mode: 'content', strategy: 'nativeClick', label: 'element.click' },
+  { mode: 'content', strategy: 'dispatchClick', label: 'dispatch click' },
+  { mode: 'debugger', label: 'debugger click retry' },
+];
+
+async function getStep8PageState(tabId, responseTimeoutMs = 1500) {
+  try {
+    const result = await sendTabMessageWithTimeout(tabId, 'signup-page', {
+      type: 'STEP8_GET_STATE',
+      source: 'background',
+      payload: {},
+    }, responseTimeoutMs);
+    if (result?.error) {
+      throw new Error(result.error);
+    }
+    return result;
+  } catch (err) {
+    if (isRetryableContentScriptTransportError(err)) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    throwIfStopped();
+    const pageState = await getStep8PageState(tabId);
+    if (pageState?.addPhonePage) {
+      throw new Error('步骤 8：认证页进入了手机号页面，当前不是 OAuth 同意页，无法继续自动授权。');
+    }
+    if (pageState?.consentReady) {
+      return pageState;
+    }
+    await sleepWithStop(250);
+  }
+
+  throw new Error('步骤 8：长时间未进入 OAuth 同意页，无法定位“继续”按钮。');
+}
+
+async function prepareStep8DebuggerClick() {
+  const result = await sendToContentScriptResilient('signup-page', {
+    type: 'STEP8_FIND_AND_CLICK',
+    source: 'background',
+    payload: {},
+  }, {
+    timeoutMs: 15000,
+    retryDelayMs: 600,
+    logMessage: '步骤 8：认证页正在切换，等待 OAuth 同意页按钮重新就绪...',
+  });
+
+  if (result?.error) {
+    throw new Error(result.error);
+  }
+
+  return result;
+}
+
+async function triggerStep8ContentStrategy(strategy) {
+  const result = await sendToContentScriptResilient('signup-page', {
+    type: 'STEP8_TRIGGER_CONTINUE',
+    source: 'background',
+    payload: {
+      strategy,
+      findTimeoutMs: 4000,
+      enabledTimeoutMs: 3000,
+    },
+  }, {
+    timeoutMs: 15000,
+    retryDelayMs: 600,
+    logMessage: '步骤 8：认证页正在切换，等待“继续”按钮重新就绪...',
+  });
+
+  if (result?.error) {
+    throw new Error(result.error);
+  }
+
+  return result;
+}
+
+async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLICK_EFFECT_TIMEOUT_MS) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    throwIfStopped();
+
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) {
+      throw new Error('步骤 8：认证页面标签页已关闭，无法继续自动授权。');
+    }
+
+    if (baselineUrl && typeof tab.url === 'string' && tab.url !== baselineUrl) {
+      return { progressed: true, reason: 'url_changed', url: tab.url };
+    }
+
+    const pageState = await getStep8PageState(tabId);
+    if (pageState?.addPhonePage) {
+      throw new Error('步骤 8：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
+    }
+    if (pageState === null) {
+      return { progressed: true, reason: 'page_reloading' };
+    }
+    if (pageState && !pageState.consentPage) {
+      return { progressed: true, reason: 'left_consent_page', url: pageState.url };
+    }
+
+    await sleepWithStop(200);
+  }
+
+  return { progressed: false, reason: 'no_effect' };
+}
+
+function getStep8EffectLabel(effect) {
+  switch (effect?.reason) {
+    case 'url_changed':
+      return `URL 已变化：${effect.url}`;
+    case 'page_reloading':
+      return '页面正在跳转或重载';
+    case 'left_consent_page':
+      return `页面已离开 OAuth 同意页：${effect.url || 'unknown'}`;
+    default:
+      return '页面仍停留在 OAuth 同意页';
+  }
+}
 
 async function executeStep8(state) {
   if (!state.oauthUrl) {
@@ -2699,7 +2993,6 @@ async function executeStep8(state) {
     return true;
   }
 
-  // 只在当前步骤内注册 webNavigation 监听
   return new Promise((resolve, reject) => {
     let resolved = false;
     let signupTabId = null;
@@ -2711,9 +3004,16 @@ async function executeStep8(state) {
       }
     };
 
-    const timeout = setTimeout(() => {
+    const failStep8 = (error) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeout);
       cleanupListener();
-      reject(new Error('120 秒内未捕获到 localhost 回调跳转，步骤 8 的点击可能被拦截了。'));
+      reject(error);
+    };
+
+    const timeout = setTimeout(() => {
+      failStep8(new Error('120 秒内未捕获到 localhost 回调跳转，步骤 8 已持续重试点击“继续”但页面仍未完成授权。'));
     }, 120000);
 
     webNavListener = (details) => {
@@ -2735,9 +3035,6 @@ async function executeStep8(state) {
       }
     };
 
-
-    // 步骤 7 之后，认证页会进入 OAuth 同意页，出现“继续”按钮。
-    // 这里先在页面内定位按钮，再通过 debugger 输入事件发起点击。
     (async () => {
       try {
         signupTabId = await getTabId('signup-page');
@@ -2751,10 +3048,10 @@ async function executeStep8(state) {
           }
 
           await chrome.tabs.update(signupTabId, { active: true });
-          await addLog('步骤 8：已切回认证页，正在准备调试器点击...');
+          await addLog('步骤 8：已切回认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         } else {
           signupTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
-          await addLog('步骤 8：已重新打开认证页，正在准备调试器点击...');
+          await addLog('步骤 8：已重新打开认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         }
 
         if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 8：检测到认证页已跳到 localhost 回调地址，直接完成当前步骤。')) {
@@ -2767,38 +3064,57 @@ async function executeStep8(state) {
 
         chrome.webNavigation.onBeforeNavigate.addListener(webNavListener);
 
-        const clickResult = await sendToContentScript('signup-page', {
-          type: 'STEP8_FIND_AND_CLICK',
-          source: 'background',
-          payload: {},
-        });
-
-        if (clickResult?.error) {
-          if (/已进入手机号页面|add-phone/i.test(clickResult.error)) {
-            await addLog('步骤 8：检测到页面进入手机号绑定页，本轮线程作废，准备重新开始新一轮。', 'warn');
-            throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
+        let attempt = 0;
+        while (!resolved) {
+          const pageState = await waitForStep8Ready(signupTabId);
+          if (!pageState?.consentReady) {
+            await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
+            continue;
           }
-          throw new Error(clickResult.error);
-        }
 
-        if (clickResult?.alreadyAtCallback) {
-          resolved = true;
-          cleanupListener();
-          clearTimeout(timeout);
-          await addLog(`步骤 8：内容脚本确认当前页面已是 localhost 回调地址：${clickResult.url}`, 'ok');
-          await completeStepFromBackground(8, { localhostUrl: clickResult.url });
-          resolve();
-          return;
-        }
+          const strategy = STEP8_STRATEGIES[attempt % STEP8_STRATEGIES.length];
+          const round = attempt + 1;
+          attempt += 1;
 
-        if (!resolved) {
-          await clickWithDebugger(signupTabId, clickResult?.rect);
-          await addLog('步骤 8：已发送调试器点击，正在等待跳转...');
+          await addLog(`步骤 8：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
+
+          if (strategy.mode === 'debugger') {
+            const clickTarget = await prepareStep8DebuggerClick();
+            if (clickTarget?.alreadyAtCallback) {
+              resolved = true;
+              cleanupListener();
+              clearTimeout(timeout);
+              await addLog(`步骤 8：内容脚本确认当前页面已是 localhost 回调地址：${clickTarget.url}`, 'ok');
+              await completeStepFromBackground(8, { localhostUrl: clickTarget.url });
+              resolve();
+              return;
+            }
+            if (!resolved) {
+              await clickWithDebugger(signupTabId, clickTarget?.rect);
+            }
+          } else {
+            await triggerStep8ContentStrategy(strategy.strategy);
+          }
+
+          if (resolved) {
+            return;
+          }
+
+          const effect = await waitForStep8ClickEffect(signupTabId, pageState.url);
+          if (resolved) {
+            return;
+          }
+
+          if (effect.progressed) {
+            await addLog(`步骤 8：检测到本次点击已生效，${getStep8EffectLabel(effect)}，继续等待 localhost 回调...`, 'info');
+            break;
+          }
+
+          await addLog(`步骤 8：${strategy.label} 本次未触发页面离开同意页，准备继续重试。`, 'warn');
+          await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
         }
       } catch (err) {
-        clearTimeout(timeout);
-        cleanupListener();
-        reject(err);
+        failStep8(err);
       }
     })();
   });
