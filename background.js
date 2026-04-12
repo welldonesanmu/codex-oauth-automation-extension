@@ -37,6 +37,7 @@ const DEFAULT_STATE = {
   email: null, // 运行时邮箱，由程序自动获取并写入，不能手动预填。
   password: null, // 运行时实际密码，由 customPassword 或程序自动生成后写入。
   accounts: [], // 已生成账号记录：{ email, password, createdAt }。
+  seenDuckEmails: [], // 已接受过的 Duck 邮箱，跨 reset 保留，用于避免重复进入流程。
   lastEmailTimestamp: null, // 最近一次获取到邮箱数据的运行时时间戳。
   lastSignupCode: null, // 注册验证码，运行时由程序自动读取并写入。
   lastLoginCode: null, // 登录验证码，运行时由程序自动读取并写入。
@@ -130,6 +131,7 @@ async function resetState() {
     chrome.storage.session.get([
       'seenCodes',
       'seenInbucketMailIds',
+      'seenDuckEmails',
       'accounts',
       'tabRegistry',
       'sourceLastUrls',
@@ -142,6 +144,7 @@ async function resetState() {
     ...persistedSettings,
     seenCodes: prev.seenCodes || [],
     seenInbucketMailIds: prev.seenInbucketMailIds || [],
+    seenDuckEmails: prev.seenDuckEmails || [],
     accounts: prev.accounts || [],
     tabRegistry: prev.tabRegistry || {},
     sourceLastUrls: prev.sourceLastUrls || {},
@@ -880,6 +883,35 @@ async function addLog(message, level = 'info') {
   chrome.runtime.sendMessage({ type: 'LOG_ENTRY', payload: entry }).catch(() => { });
 }
 
+function normalizeDuckEmail(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function isDuckEmail(email) {
+  return normalizeDuckEmail(email).endsWith('@duck.com');
+}
+
+function getSeenDuckEmailSet(state) {
+  const seenDuckEmails = Array.isArray(state?.seenDuckEmails) ? state.seenDuckEmails : [];
+  const accounts = Array.isArray(state?.accounts) ? state.accounts : [];
+  const normalizedSeen = seenDuckEmails.map(normalizeDuckEmail).filter(isDuckEmail);
+  const normalizedAccounts = accounts.map((account) => normalizeDuckEmail(account?.email)).filter(isDuckEmail);
+  return new Set([...normalizedSeen, ...normalizedAccounts]);
+}
+
+function hasSeenDuckEmail(email, state) {
+  if (!isDuckEmail(email)) return false;
+  return getSeenDuckEmailSet(state).has(normalizeDuckEmail(email));
+}
+
+async function recordSeenDuckEmail(email, state = null) {
+  if (!isDuckEmail(email)) return;
+  const currentState = state || await getState();
+  const nextSeenSet = getSeenDuckEmailSet(currentState);
+  nextSeenSet.add(normalizeDuckEmail(email));
+  await setState({ seenDuckEmails: [...nextSeenSet] });
+}
+
 function getSourceLabel(source) {
   const labels = {
     'sidepanel': '侧边栏',
@@ -1615,26 +1647,47 @@ async function executeStepAndWait(step, delayAfter = 2000) {
 async function fetchDuckEmail(options = {}) {
   throwIfStopped();
   const { generateNew = true } = options;
+  const maxDuplicateRefreshes = generateNew ? 5 : 1;
 
   await addLog(`Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
   await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL);
 
-  const result = await sendToContentScript('duck-mail', {
-    type: 'FETCH_DUCK_EMAIL',
-    source: 'background',
-    payload: { generateNew },
-  });
+  for (let duplicateAttempt = 1; duplicateAttempt <= maxDuplicateRefreshes; duplicateAttempt++) {
+    throwIfStopped();
 
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-  if (!result?.email) {
-    throw new Error('未返回 Duck 邮箱地址。');
+    const result = await sendToContentScript('duck-mail', {
+      type: 'FETCH_DUCK_EMAIL',
+      source: 'background',
+      payload: { generateNew },
+    });
+
+    if (result?.error) {
+      throw new Error(result.error);
+    }
+    if (!result?.email) {
+      throw new Error('未返回 Duck 邮箱地址。');
+    }
+
+    const normalizedEmail = normalizeDuckEmail(result.email);
+    const state = await getState();
+
+    if (!hasSeenDuckEmail(normalizedEmail, state)) {
+      await recordSeenDuckEmail(normalizedEmail, state);
+      await setEmailState(normalizedEmail);
+      await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${normalizedEmail}`, 'ok');
+      return normalizedEmail;
+    }
+
+    await addLog(`Duck 邮箱：检测到重复地址 ${normalizedEmail}，正在尝试重新获取新地址（${duplicateAttempt}/${maxDuplicateRefreshes}）...`, 'warn');
+
+    if (duplicateAttempt >= maxDuplicateRefreshes) {
+      break;
+    }
+
+    await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL, { reloadIfSameUrl: true });
   }
 
-  await setEmailState(result.email);
-  await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
-  return result.email;
+  throw new Error('Duck 邮箱重复多次，未能获取全新地址。');
 }
 
 // ============================================================
