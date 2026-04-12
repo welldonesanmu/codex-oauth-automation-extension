@@ -22,6 +22,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, reason: 'wrong-frame' });
       return;
     }
+    setCurrentCommandContext(message);
     resetStopState();
     handlePollEmail(message.step, message.payload).then(result => {
       sendResponse(result);

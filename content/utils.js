@@ -16,12 +16,14 @@ const SCRIPT_SOURCE = (() => {
 const LOG_PREFIX = `[MultiPage:${SCRIPT_SOURCE}]`;
 const STOP_ERROR_MESSAGE = '流程已被用户停止。';
 let flowStopped = false;
+let currentCommandAutoRunAttemptId = null;
 
 if (!window.__MULTIPAGE_UTILS_LISTENER_READY__) {
   window.__MULTIPAGE_UTILS_LISTENER_READY__ = true;
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'STOP_FLOW') {
+      setCurrentCommandContext(message);
       flowStopped = true;
       console.warn(LOG_PREFIX, STOP_ERROR_MESSAGE);
       return;
@@ -38,6 +40,22 @@ if (!window.__MULTIPAGE_UTILS_LISTENER_READY__) {
 
 function resetStopState() {
   flowStopped = false;
+}
+
+function setCurrentCommandContext(message = null) {
+  currentCommandAutoRunAttemptId = Number.isInteger(message?.autoRunAttemptId)
+    ? message.autoRunAttemptId
+    : null;
+}
+
+function withCurrentCommandContext(message) {
+  if (!Number.isInteger(currentCommandAutoRunAttemptId)) {
+    return message;
+  }
+  return {
+    ...message,
+    autoRunAttemptId: currentCommandAutoRunAttemptId,
+  };
 }
 
 function isStopError(error) {
@@ -242,13 +260,13 @@ function fillSelect(el, value) {
  * @param {string} level - 'info' | 'ok' | 'warn' | 'error'
  */
 function log(message, level = 'info') {
-  chrome.runtime.sendMessage({
+  chrome.runtime.sendMessage(withCurrentCommandContext({
     type: 'LOG',
     source: SCRIPT_SOURCE,
     step: null,
     payload: { message, level, timestamp: Date.now() },
     error: null,
-  });
+  }));
 }
 
 /**
@@ -280,13 +298,13 @@ function reportReady() {
 function reportComplete(step, data = {}) {
   console.log(LOG_PREFIX, `步骤 ${step} 已完成`, data);
   log(`步骤 ${step} 已成功完成`, 'ok');
-  const message = {
+  const message = withCurrentCommandContext({
     type: 'STEP_COMPLETE',
     source: SCRIPT_SOURCE,
     step,
     payload: data,
     error: null,
-  };
+  });
   Promise.resolve(chrome.runtime.sendMessage(message))
     .then((response) => {
       console.log(LOG_PREFIX, `STEP_COMPLETE sent successfully for step ${step}`, {
@@ -311,13 +329,13 @@ function reportComplete(step, data = {}) {
 function reportError(step, errorMessage) {
   console.error(LOG_PREFIX, `步骤 ${step} 失败: ${errorMessage}`);
   log(`步骤 ${step} 失败：${errorMessage}`, 'error');
-  const message = {
+  const message = withCurrentCommandContext({
     type: 'STEP_ERROR',
     source: SCRIPT_SOURCE,
     step,
     payload: {},
     error: errorMessage,
-  };
+  });
   Promise.resolve(chrome.runtime.sendMessage(message))
     .then((response) => {
       console.log(LOG_PREFIX, `STEP_ERROR sent successfully for step ${step}`, {

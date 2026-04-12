@@ -33,6 +33,7 @@ if (document.documentElement.getAttribute(VPS_PANEL_LISTENER_SENTINEL) !== '1') 
   // Listen for commands from Background
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'EXECUTE_STEP') {
+      setCurrentCommandContext(message);
       resetStopState();
       const startedAt = Date.now();
       console.log(LOG_PREFIX, `EXECUTE_STEP received for step ${message.step}`, {

@@ -576,6 +576,12 @@ function updateStatusDisplay(state) {
     return;
   }
 
+  if (currentAutoRun.phase === 'retrying') {
+    displayStatus.textContent = `自动重试中${getAutoRunLabel()}`;
+    statusBar.classList.add('running');
+    return;
+  }
+
   const running = Object.entries(state.stepStatuses).find(([, s]) => s === 'running');
   if (running) {
     displayStatus.textContent = `步骤 ${running[0]} 运行中...`;
@@ -1031,6 +1037,7 @@ chrome.runtime.onMessage.addListener((message) => {
       document.querySelectorAll('.step-row').forEach(row => row.className = 'step-row');
       document.querySelectorAll('.step-status').forEach(el => el.textContent = '');
       applyAutoRunStatus(currentAutoRun);
+      updateStatusDisplay(latestState);
       updateProgressCounter();
       updateButtonStates();
       break;

@@ -16,6 +16,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     || message.type === 'RESEND_VERIFICATION_CODE'
     || message.type === 'INSPECT_AUTH_PAGE_STATE'
   ) {
+    setCurrentCommandContext(message);
     resetStopState();
     handleCommand(message).then((result) => {
       sendResponse({ ok: true, ...(result || {}) });

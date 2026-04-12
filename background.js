@@ -37,7 +37,6 @@ const DEFAULT_STATE = {
   email: null, // 运行时邮箱，由程序自动获取并写入，不能手动预填。
   password: null, // 运行时实际密码，由 customPassword 或程序自动生成后写入。
   accounts: [], // 已生成账号记录：{ email, password, createdAt }。
-  seenDuckEmails: [], // 已接受过的 Duck 邮箱，跨 reset 保留，用于避免重复进入流程。
   lastEmailTimestamp: null, // 最近一次获取到邮箱数据的运行时时间戳。
   lastSignupCode: null, // 注册验证码，运行时由程序自动读取并写入。
   lastLoginCode: null, // 登录验证码，运行时由程序自动读取并写入。
@@ -131,7 +130,6 @@ async function resetState() {
     chrome.storage.session.get([
       'seenCodes',
       'seenInbucketMailIds',
-      'seenDuckEmails',
       'accounts',
       'tabRegistry',
       'sourceLastUrls',
@@ -144,7 +142,6 @@ async function resetState() {
     ...persistedSettings,
     seenCodes: prev.seenCodes || [],
     seenInbucketMailIds: prev.seenInbucketMailIds || [],
-    seenDuckEmails: prev.seenDuckEmails || [],
     accounts: prev.accounts || [],
     tabRegistry: prev.tabRegistry || {},
     sourceLastUrls: prev.sourceLastUrls || {},
@@ -746,13 +743,14 @@ async function reuseOrCreateTab(source, url, options = {}) {
 // ============================================================
 
 async function sendToContentScript(source, message, options = {}) {
-  const { responseTimeoutMs = getContentScriptResponseTimeoutMs(message) } = options;
+  const messageWithSession = withActiveAutoRunAttemptSession(message);
+  const { responseTimeoutMs = getContentScriptResponseTimeoutMs(messageWithSession) } = options;
   const registry = await getTabRegistry();
   const entry = registry[source];
 
   if (!entry || !entry.ready) {
     console.log(LOG_PREFIX, `${source} not ready, queuing command`);
-    return queueCommand(source, message);
+    return queueCommand(source, messageWithSession);
   }
 
   // Verify tab is still alive
@@ -760,11 +758,11 @@ async function sendToContentScript(source, message, options = {}) {
   if (!alive) {
     // Tab was closed — queue the command, it will be sent when tab is reopened
     console.log(LOG_PREFIX, `${source} tab was closed, queuing command`);
-    return queueCommand(source, message);
+    return queueCommand(source, messageWithSession);
   }
 
-  console.log(LOG_PREFIX, `Sending to ${source} (tab ${entry.tabId}):`, message.type);
-  return sendTabMessageWithTimeout(entry.tabId, source, message, responseTimeoutMs);
+  console.log(LOG_PREFIX, `Sending to ${source} (tab ${entry.tabId}):`, messageWithSession.type);
+  return sendTabMessageWithTimeout(entry.tabId, source, messageWithSession, responseTimeoutMs);
 }
 
 async function sendToContentScriptResilient(source, message, options = {}) {
@@ -871,6 +869,37 @@ function isCurrentAutoRunSession(sessionId) {
   return sessionId === autoRunSessionId;
 }
 
+function bumpAutoRunAttemptSessionId() {
+  autoRunAttemptSessionId += 1;
+  activeAutoRunAttemptSessionId = autoRunAttemptSessionId;
+  return activeAutoRunAttemptSessionId;
+}
+
+function clearActiveAutoRunAttemptSession() {
+  activeAutoRunAttemptSessionId = null;
+}
+
+function isCurrentAutoRunAttemptSession(sessionId) {
+  return Number.isInteger(sessionId)
+    && Number.isInteger(activeAutoRunAttemptSessionId)
+    && sessionId === activeAutoRunAttemptSessionId;
+}
+
+function shouldIgnoreAutoRunAttemptMessage(message) {
+  return Number.isInteger(message?.autoRunAttemptId)
+    && !isCurrentAutoRunAttemptSession(message.autoRunAttemptId);
+}
+
+function withActiveAutoRunAttemptSession(message) {
+  if (!Number.isInteger(activeAutoRunAttemptSessionId)) {
+    return message;
+  }
+  return {
+    ...message,
+    autoRunAttemptId: activeAutoRunAttemptSessionId,
+  };
+}
+
 async function addLog(message, level = 'info') {
   const state = await getState();
   const logs = state.logs || [];
@@ -881,35 +910,6 @@ async function addLog(message, level = 'info') {
   await setState({ logs });
   // Broadcast to side panel
   chrome.runtime.sendMessage({ type: 'LOG_ENTRY', payload: entry }).catch(() => { });
-}
-
-function normalizeDuckEmail(email) {
-  return String(email || '').trim().toLowerCase();
-}
-
-function isDuckEmail(email) {
-  return normalizeDuckEmail(email).endsWith('@duck.com');
-}
-
-function getSeenDuckEmailSet(state) {
-  const seenDuckEmails = Array.isArray(state?.seenDuckEmails) ? state.seenDuckEmails : [];
-  const accounts = Array.isArray(state?.accounts) ? state.accounts : [];
-  const normalizedSeen = seenDuckEmails.map(normalizeDuckEmail).filter(isDuckEmail);
-  const normalizedAccounts = accounts.map((account) => normalizeDuckEmail(account?.email)).filter(isDuckEmail);
-  return new Set([...normalizedSeen, ...normalizedAccounts]);
-}
-
-function hasSeenDuckEmail(email, state) {
-  if (!isDuckEmail(email)) return false;
-  return getSeenDuckEmailSet(state).has(normalizeDuckEmail(email));
-}
-
-async function recordSeenDuckEmail(email, state = null) {
-  if (!isDuckEmail(email)) return;
-  const currentState = state || await getState();
-  const nextSeenSet = getSeenDuckEmailSet(currentState);
-  nextSeenSet.add(normalizeDuckEmail(email));
-  await setState({ seenDuckEmails: [...nextSeenSet] });
 }
 
 function getSourceLabel(source) {
@@ -1230,13 +1230,66 @@ async function broadcastStopToContentScripts() {
   for (const entry of Object.values(registry)) {
     if (!entry?.tabId) continue;
     try {
-      await chrome.tabs.sendMessage(entry.tabId, {
+      await chrome.tabs.sendMessage(entry.tabId, withActiveAutoRunAttemptSession({
         type: 'STOP_FLOW',
         source: 'background',
         payload: {},
-      });
+      }));
     } catch { }
   }
+}
+
+async function clearTabRegistrySources(sources = []) {
+  const uniqueSources = [...new Set(sources.filter(Boolean))];
+  if (!uniqueSources.length) return;
+  const registry = await getTabRegistry();
+  let changed = false;
+  for (const source of uniqueSources) {
+    if (registry[source]) {
+      registry[source] = null;
+      changed = true;
+    }
+  }
+  if (changed) {
+    await setState({ tabRegistry: registry });
+  }
+}
+
+async function abandonCurrentAutoRunAttempt({ targetRun, totalRuns, attemptRun, reason, mailSource }) {
+  cancelPendingCommands(reason || '当前尝试已放弃。');
+  await broadcastStopToContentScripts();
+  await markRunningStepsStopped();
+
+  const state = await getState();
+  const sourcesToClose = ['signup-page'];
+  if (mailSource) {
+    sourcesToClose.push(mailSource);
+  }
+
+  for (const source of sourcesToClose) {
+    const tabId = await getTabId(source);
+    if (tabId) {
+      await chrome.tabs.remove(tabId).catch(() => { });
+    }
+  }
+
+  const signupReferenceUrl = state.oauthUrl || state.sourceLastUrls?.['signup-page'] || 'https://auth.openai.com/';
+  await closeConflictingTabsForSource('signup-page', signupReferenceUrl).catch(() => { });
+
+  if (mailSource) {
+    const mail = getMailConfig(state);
+    if (!mail.error && mail.source === mailSource && mail.url) {
+      await closeConflictingTabsForSource(mailSource, mail.url).catch(() => { });
+    }
+  }
+
+  await clearTabRegistrySources(sourcesToClose);
+  clearActiveAutoRunAttemptSession();
+  await broadcastAutoRunStatus('retrying', {
+    currentRun: targetRun,
+    totalRuns,
+    attemptRun,
+  });
 }
 
 let stopRequested = false;
@@ -1271,12 +1324,20 @@ async function handleMessage(message, sender) {
     }
 
     case 'LOG': {
+      if (shouldIgnoreAutoRunAttemptMessage(message)) {
+        console.log(LOG_PREFIX, `Ignored stale LOG from ${message.source}`, message);
+        return { ok: true, ignored: true };
+      }
       const { message: msg, level } = message.payload;
       await addLog(`[${getSourceLabel(message.source)}] ${msg}`, level);
       return { ok: true };
     }
 
     case 'STEP_COMPLETE': {
+      if (shouldIgnoreAutoRunAttemptMessage(message)) {
+        console.log(LOG_PREFIX, `Ignored stale STEP_COMPLETE for step ${message.step} from ${message.source}`, message);
+        return { ok: true, ignored: true };
+      }
       if (stopRequested) {
         await setStepStatus(message.step, 'stopped');
         notifyStepError(message.step, STOP_ERROR_MESSAGE);
@@ -1290,6 +1351,10 @@ async function handleMessage(message, sender) {
     }
 
     case 'STEP_ERROR': {
+      if (shouldIgnoreAutoRunAttemptMessage(message)) {
+        console.log(LOG_PREFIX, `Ignored stale STEP_ERROR for step ${message.step} from ${message.source}`, message);
+        return { ok: true, ignored: true };
+      }
       if (isStopError(message.error)) {
         await setStepStatus(message.step, 'stopped');
         await addLog(`步骤 ${message.step} 已被用户停止`, 'warn');
@@ -1550,6 +1615,7 @@ async function requestStop(options = {}) {
   }
 
   await markRunningStepsStopped();
+  clearActiveAutoRunAttemptSession();
   autoRunActive = false;
   await broadcastAutoRunStatus('stopped', {
     currentRun: autoRunCurrentRun,
@@ -1647,47 +1713,26 @@ async function executeStepAndWait(step, delayAfter = 2000) {
 async function fetchDuckEmail(options = {}) {
   throwIfStopped();
   const { generateNew = true } = options;
-  const maxDuplicateRefreshes = generateNew ? 5 : 1;
 
   await addLog(`Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
   await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL);
 
-  for (let duplicateAttempt = 1; duplicateAttempt <= maxDuplicateRefreshes; duplicateAttempt++) {
-    throwIfStopped();
+  const result = await sendToContentScript('duck-mail', {
+    type: 'FETCH_DUCK_EMAIL',
+    source: 'background',
+    payload: { generateNew },
+  });
 
-    const result = await sendToContentScript('duck-mail', {
-      type: 'FETCH_DUCK_EMAIL',
-      source: 'background',
-      payload: { generateNew },
-    });
-
-    if (result?.error) {
-      throw new Error(result.error);
-    }
-    if (!result?.email) {
-      throw new Error('未返回 Duck 邮箱地址。');
-    }
-
-    const normalizedEmail = normalizeDuckEmail(result.email);
-    const state = await getState();
-
-    if (!hasSeenDuckEmail(normalizedEmail, state)) {
-      await recordSeenDuckEmail(normalizedEmail, state);
-      await setEmailState(normalizedEmail);
-      await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${normalizedEmail}`, 'ok');
-      return normalizedEmail;
-    }
-
-    await addLog(`Duck 邮箱：检测到重复地址 ${normalizedEmail}，正在尝试重新获取新地址（${duplicateAttempt}/${maxDuplicateRefreshes}）...`, 'warn');
-
-    if (duplicateAttempt >= maxDuplicateRefreshes) {
-      break;
-    }
-
-    await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL, { reloadIfSameUrl: true });
+  if (result?.error) {
+    throw new Error(result.error);
+  }
+  if (!result?.email) {
+    throw new Error('未返回 Duck 邮箱地址。');
   }
 
-  throw new Error('Duck 邮箱重复多次，未能获取全新地址。');
+  await setEmailState(result.email);
+  await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
+  return result.email;
 }
 
 // ============================================================
@@ -1699,6 +1744,8 @@ let autoRunCurrentRun = 0;
 let autoRunTotalRuns = 1;
 let autoRunAttemptRun = 0;
 let autoRunSessionId = 0;
+let autoRunAttemptSessionId = 0;
+let activeAutoRunAttemptSessionId = null;
 const DUCK_EMAIL_MAX_ATTEMPTS = 5;
 const VERIFICATION_POLL_MAX_ROUNDS = 5;
 const DUCK_EMAIL_RESTART_ERROR_MESSAGE = 'Duck 邮箱自动获取失败，需要重新开始新一轮。';
@@ -1860,6 +1907,7 @@ async function autoRunLoop(totalRuns, options = {}) {
     const targetRun = successfulRuns + 1;
     autoRunCurrentRun = targetRun;
     autoRunAttemptRun = attemptRuns;
+    const attemptSessionId = bumpAutoRunAttemptSessionId();
     let startStep = 1;
     let useExistingProgress = false;
 
@@ -1922,6 +1970,7 @@ async function autoRunLoop(totalRuns, options = {}) {
 
       successfulRuns += 1;
       autoRunCurrentRun = successfulRuns;
+      clearActiveAutoRunAttemptSession();
       await addLog(`=== 目标 ${successfulRuns}/${totalRuns} 轮已完成（第 ${attemptRuns} 次尝试成功）===`, 'ok');
       continue;
     } catch (err) {
@@ -1940,6 +1989,9 @@ async function autoRunLoop(totalRuns, options = {}) {
       }
 
       if (isRestartCurrentAttemptError(err)) {
+        if (attemptSessionId !== activeAutoRunAttemptSessionId) {
+          return;
+        }
         const errorMessage = getErrorMessage(err);
         const restartReason = errorMessage.includes('手机号页面')
           ? '目标流程进入手机号页面'
@@ -1947,21 +1999,13 @@ async function autoRunLoop(totalRuns, options = {}) {
             ? 'Duck 邮箱自动获取连续失败'
             : '检测到当前邮箱已存在');
         await addLog(`目标 ${targetRun}/${totalRuns} 轮${restartReason}，当前线程已放弃，将重新开始新一轮。`, 'warn');
-        cancelPendingCommands(`当前线程因${restartReason}而放弃。`);
-        await broadcastStopToContentScripts();
-        const signupTabId = await getTabId('signup-page');
-        if (signupTabId) {
-          await chrome.tabs.remove(signupTabId).catch(() => { });
-        }
-        const registry = await getTabRegistry();
-        if (registry['signup-page']) {
-          registry['signup-page'] = null;
-          await setState({ tabRegistry: registry });
-        }
-        await broadcastAutoRunStatus('retrying', {
-          currentRun: targetRun,
+        const mailSource = getMailConfig(await getState()).source;
+        await abandonCurrentAutoRunAttempt({
+          targetRun,
           totalRuns,
           attemptRun: attemptRuns,
+          reason: `当前线程因${restartReason}而放弃。`,
+          mailSource,
         });
         forceFreshTabsNextRun = true;
         maxAttempts = Math.max(maxAttempts, Math.min(forcedRetryCap, attemptRuns + 1));
@@ -1978,14 +2022,18 @@ async function autoRunLoop(totalRuns, options = {}) {
         break;
       }
 
+      if (attemptSessionId !== activeAutoRunAttemptSessionId) {
+        return;
+      }
       await addLog(`目标 ${targetRun}/${totalRuns} 轮的第 ${attemptRuns} 次尝试失败：${err.message}`, 'error');
       await addLog('兜底开关已开启：将放弃当前线程，重新开一轮继续补足目标次数。', 'warn');
-      cancelPendingCommands('当前尝试已放弃。');
-      await broadcastStopToContentScripts();
-      await broadcastAutoRunStatus('retrying', {
-        currentRun: targetRun,
+      const mailSource = getMailConfig(await getState()).source;
+      await abandonCurrentAutoRunAttempt({
+        targetRun,
         totalRuns,
         attemptRun: attemptRuns,
+        reason: '当前尝试已放弃。',
+        mailSource,
       });
       forceFreshTabsNextRun = true;
     }
@@ -1994,6 +2042,8 @@ async function autoRunLoop(totalRuns, options = {}) {
   if (!isCurrentAutoRunSession(sessionId)) {
     return;
   }
+
+  clearActiveAutoRunAttemptSession();
 
   if (!stopRequested && autoRunSkipFailures && successfulRuns < totalRuns && attemptRuns >= maxAttempts) {
     await addLog(`已达到安全重试上限（${attemptRuns} 次尝试），当前仅完成 ${successfulRuns}/${totalRuns} 轮。`, 'error');

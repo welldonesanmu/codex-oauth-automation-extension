@@ -5,6 +5,7 @@ console.log('[MultiPage:duck-mail] Content script loaded on', location.href);
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type !== 'FETCH_DUCK_EMAIL') return;
 
+  setCurrentCommandContext(message);
   resetStopState();
   fetchDuckEmail(message.payload).then(result => {
     sendResponse(result);
