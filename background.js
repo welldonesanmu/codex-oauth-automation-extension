@@ -817,7 +817,13 @@ async function sendToContentScriptResilient(source, message, options = {}) {
 }
 
 async function sendToMailContentScriptResilient(mail, message, options = {}) {
-  const { timeoutMs = 45000, maxRecoveryAttempts = 2 } = options;
+  const defaultResponseTimeoutMs = getContentScriptResponseTimeoutMs(message);
+  const responseTimeoutMs = Math.max(1000, Number(options.responseTimeoutMs) || defaultResponseTimeoutMs);
+  const timeoutMs = Math.max(
+    responseTimeoutMs,
+    Number(options.timeoutMs) || (responseTimeoutMs + VERIFICATION_MAIL_RECOVERY_GRACE_MS)
+  );
+  const maxRecoveryAttempts = Math.max(0, Number(options.maxRecoveryAttempts) || 2);
   const start = Date.now();
   let lastError = null;
   let recoveries = 0;
@@ -827,7 +833,7 @@ async function sendToMailContentScriptResilient(mail, message, options = {}) {
     throwIfStopped();
 
     try {
-      return await sendToContentScript(mail.source, message);
+      return await sendToContentScript(mail.source, message, { responseTimeoutMs });
     } catch (err) {
       if (!isRetryableContentScriptTransportError(err)) {
         throw err;
@@ -1748,6 +1754,7 @@ let autoRunAttemptSessionId = 0;
 let activeAutoRunAttemptSessionId = null;
 const DUCK_EMAIL_MAX_ATTEMPTS = 5;
 const VERIFICATION_POLL_MAX_ROUNDS = 5;
+const VERIFICATION_MAIL_RECOVERY_GRACE_MS = 30000;
 const DUCK_EMAIL_RESTART_ERROR_MESSAGE = 'Duck 邮箱自动获取失败，需要重新开始新一轮。';
 const AUTO_STEP_DELAYS = {
   1: 2000,
@@ -2368,7 +2375,10 @@ async function pollFreshVerificationCode(step, state, mail, pollOverrides = {}) 
           payload,
         },
         {
-          timeoutMs: 45000,
+          timeoutMs: getContentScriptResponseTimeoutMs({
+            type: 'POLL_EMAIL',
+            payload,
+          }) + VERIFICATION_MAIL_RECOVERY_GRACE_MS,
           maxRecoveryAttempts: 2,
         }
       );
