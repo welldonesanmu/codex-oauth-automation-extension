@@ -20,6 +20,7 @@ const PERSISTED_SETTING_DEFAULTS = {
   vpsPassword: '', // VPS 面板登录密码，可手动填写。
   customPassword: '', // 自定义账号密码；留空时由程序自动生成随机密码。
   autoRunSkipFailures: false, // 自动运行遇到失败步骤后，是否继续执行后续流程。
+  autoRunBackgroundFirst: false, // 自动运行时优先后台处理，尽量减少抢前台。
   mailProvider: '163', // 验证码邮箱来源，当前支持 163 / inbucket。
   inbucketHost: '', // 仅当 mailProvider 为 inbucket 时填写 Inbucket 地址，其他情况保持为空。
   inbucketMailbox: '', // 仅当 mailProvider 为 inbucket 时填写邮箱名，其他情况保持为空。
@@ -59,6 +60,7 @@ async function getPersistedSettings() {
     ...PERSISTED_SETTING_DEFAULTS,
     ...stored,
     autoRunSkipFailures: Boolean(stored.autoRunSkipFailures ?? PERSISTED_SETTING_DEFAULTS.autoRunSkipFailures),
+    autoRunBackgroundFirst: Boolean(stored.autoRunBackgroundFirst ?? PERSISTED_SETTING_DEFAULTS.autoRunBackgroundFirst),
   };
 }
 
@@ -92,7 +94,7 @@ async function setPersistentSettings(updates) {
   const persistedUpdates = {};
   for (const key of PERSISTED_SETTING_KEYS) {
     if (updates[key] !== undefined) {
-      persistedUpdates[key] = key === 'autoRunSkipFailures'
+      persistedUpdates[key] = ['autoRunSkipFailures', 'autoRunBackgroundFirst'].includes(key)
         ? Boolean(updates[key])
         : updates[key];
     }
@@ -601,6 +603,7 @@ function cancelPendingCommands(reason = STOP_ERROR_MESSAGE) {
 // ============================================================
 
 async function reuseOrCreateTab(source, url, options = {}) {
+  const activateTab = shouldActivateTab(options);
   const alive = await isTabAlive(source);
   if (alive) {
     const tabId = await getTabId(source);
@@ -611,7 +614,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
 
     const registry = await getTabRegistry();
     if (sameUrl) {
-      await chrome.tabs.update(tabId, { active: true });
+      await maybeActivateTab(tabId, { activateTab });
       console.log(LOG_PREFIX, `Reused tab ${source} (${tabId}) on same URL`);
 
       if (shouldReloadOnReuse) {
@@ -661,7 +664,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
     await setState({ tabRegistry: registry });
 
     // Navigate existing tab to new URL
-    await chrome.tabs.update(tabId, { url, active: true });
+    await chrome.tabs.update(tabId, activateTab ? { url, active: true } : { url, active: false });
     console.log(LOG_PREFIX, `Reused tab ${source} (${tabId}), navigated to ${url.slice(0, 60)}`);
 
     // Wait for page load complete (with 30s timeout)
@@ -703,7 +706,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
 
   // Create new tab
   await closeConflictingTabsForSource(source, url);
-  const tab = await chrome.tabs.create({ url, active: true });
+  const tab = await chrome.tabs.create({ url, active: activateTab });
   console.log(LOG_PREFIX, `Created new tab ${source} (${tab.id})`);
 
   // If dynamic injection needed (VPS panel), inject scripts after load
@@ -819,6 +822,9 @@ async function sendToContentScriptResilient(source, message, options = {}) {
 async function sendToMailContentScriptResilient(mail, message, options = {}) {
   const defaultResponseTimeoutMs = getContentScriptResponseTimeoutMs(message);
   const responseTimeoutMs = Math.max(1000, Number(options.responseTimeoutMs) || defaultResponseTimeoutMs);
+  const preferBackground = options.preferBackground !== undefined
+    ? Boolean(options.preferBackground)
+    : shouldPreferBackgroundForState(await getState());
   const timeoutMs = Math.max(
     responseTimeoutMs,
     Number(options.timeoutMs) || (responseTimeoutMs + VERIFICATION_MAIL_RECOVERY_GRACE_MS)
@@ -854,6 +860,7 @@ async function sendToMailContentScriptResilient(mail, message, options = {}) {
         inject: mail.inject,
         injectSource: mail.injectSource,
         reloadIfSameUrl: true,
+        preferBackground,
       });
       await new Promise((resolve) => setTimeout(resolve, 800));
     }
@@ -1109,6 +1116,24 @@ function isAutoRunPausedState(state) {
   return Boolean(state.autoRunning) && state.autoRunPhase === 'waiting_email';
 }
 
+function shouldPreferBackgroundForState(state) {
+  return Boolean(state?.autoRunBackgroundFirst) && isAutoRunLockedState(state || {});
+}
+
+function shouldActivateTab(options = {}) {
+  if (options.activateTab !== undefined) {
+    return Boolean(options.activateTab);
+  }
+  return !Boolean(options.preferBackground);
+}
+
+async function maybeActivateTab(tabId, options = {}) {
+  if (!tabId || !shouldActivateTab(options)) {
+    return;
+  }
+  await chrome.tabs.update(tabId, { active: true });
+}
+
 async function ensureManualInteractionAllowed(actionLabel) {
   const state = await getState();
 
@@ -1179,7 +1204,7 @@ async function humanStepDelay(min = HUMAN_STEP_DELAY_MIN, max = HUMAN_STEP_DELAY
   await sleepWithStop(duration);
 }
 
-async function clickWithDebugger(tabId, rect) {
+async function clickWithDebugger(tabId, rect, options = {}) {
   if (!tabId) {
     throw new Error('未找到用于调试点击的认证页面标签页。');
   }
@@ -1187,6 +1212,7 @@ async function clickWithDebugger(tabId, rect) {
     throw new Error('步骤 8 的调试器兜底点击需要有效的按钮坐标。');
   }
 
+  const bringToFront = Boolean(options.bringToFront);
   const target = { tabId };
   try {
     await chrome.debugger.attach(target, '1.3');
@@ -1201,7 +1227,9 @@ async function clickWithDebugger(tabId, rect) {
     const x = Math.round(rect.centerX);
     const y = Math.round(rect.centerY);
 
-    await chrome.debugger.sendCommand(target, 'Page.bringToFront');
+    if (bringToFront) {
+      await chrome.debugger.sendCommand(target, 'Page.bringToFront');
+    }
     await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
       type: 'mouseMoved',
       x,
@@ -1405,9 +1433,10 @@ async function handleMessage(message, sender) {
       clearStopRequest();
       const totalRuns = message.payload?.totalRuns || 1;
       const autoRunSkipFailures = Boolean(message.payload?.autoRunSkipFailures);
+      const autoRunBackgroundFirst = Boolean(message.payload?.autoRunBackgroundFirst);
       const mode = message.payload?.mode === 'continue' ? 'continue' : 'restart';
-      await setState({ autoRunSkipFailures });
-      autoRunLoop(totalRuns, { autoRunSkipFailures, mode });  // fire-and-forget
+      await setState({ autoRunSkipFailures, autoRunBackgroundFirst });
+      autoRunLoop(totalRuns, { autoRunSkipFailures, autoRunBackgroundFirst, mode });  // fire-and-forget
       return { ok: true };
     }
 
@@ -1437,6 +1466,7 @@ async function handleMessage(message, sender) {
       if (message.payload.vpsPassword !== undefined) updates.vpsPassword = message.payload.vpsPassword;
       if (message.payload.customPassword !== undefined) updates.customPassword = message.payload.customPassword;
       if (message.payload.autoRunSkipFailures !== undefined) updates.autoRunSkipFailures = Boolean(message.payload.autoRunSkipFailures);
+      if (message.payload.autoRunBackgroundFirst !== undefined) updates.autoRunBackgroundFirst = Boolean(message.payload.autoRunBackgroundFirst);
       if (message.payload.mailProvider !== undefined) updates.mailProvider = message.payload.mailProvider;
       if (message.payload.inbucketHost !== undefined) updates.inbucketHost = message.payload.inbucketHost;
       if (message.payload.inbucketMailbox !== undefined) updates.inbucketMailbox = message.payload.inbucketMailbox;
@@ -1467,7 +1497,7 @@ async function handleMessage(message, sender) {
       }
 
       await chrome.tabs.update(tabId, { active: true });
-      await clickWithDebugger(tabId, rect);
+      await clickWithDebugger(tabId, rect, { bringToFront: true });
       return { ok: true };
     }
 
@@ -1719,9 +1749,10 @@ async function executeStepAndWait(step, delayAfter = 2000) {
 async function fetchDuckEmail(options = {}) {
   throwIfStopped();
   const { generateNew = true } = options;
+  const preferBackground = shouldPreferBackgroundForState(await getState());
 
   await addLog(`Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
-  await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL);
+  await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL, { preferBackground });
 
   const result = await sendToContentScript('duck-mail', {
     type: 'FETCH_DUCK_EMAIL',
@@ -1816,6 +1847,8 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
   const { targetRun, totalRuns, attemptRuns, continued = false } = context;
   const maxStep9RestartAttempts = 5;
   let step9RestartAttempts = 0;
+  const runtimeState = await getState();
+  const preferBackground = shouldPreferBackgroundForState(runtimeState);
 
   if (continued) {
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续当前进度，从步骤 ${startStep} 开始（第 ${attemptRuns} 次尝试）===`, 'info');
@@ -1845,7 +1878,7 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
 
   const signupTabId = await getTabId('signup-page');
   if (signupTabId) {
-    await chrome.tabs.update(signupTabId, { active: true });
+    await maybeActivateTab(signupTabId, { preferBackground });
   }
 
   let step = Math.max(startStep, 4);
@@ -1938,6 +1971,7 @@ async function autoRunLoop(totalRuns, options = {}) {
         vpsPassword: prevState.vpsPassword,
         customPassword: prevState.customPassword,
         autoRunSkipFailures: prevState.autoRunSkipFailures,
+        autoRunBackgroundFirst: prevState.autoRunBackgroundFirst,
         mailProvider: prevState.mailProvider,
         inbucketHost: prevState.inbucketHost,
         inbucketMailbox: prevState.inbucketMailbox,
@@ -2199,8 +2233,9 @@ async function executeStep2(state) {
   if (!state.oauthUrl) {
     throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
   }
+  const preferBackground = shouldPreferBackgroundForState(state);
   await addLog('步骤 2：正在打开认证链接...');
-  await reuseOrCreateTab('signup-page', state.oauthUrl);
+  await reuseOrCreateTab('signup-page', state.oauthUrl, { preferBackground });
 
   await sendToContentScript('signup-page', {
     type: 'EXECUTE_STEP',
@@ -2323,7 +2358,8 @@ async function requestVerificationCodeResend(step) {
     throw new Error('认证页面标签页已关闭，无法重新请求验证码。');
   }
 
-  await chrome.tabs.update(signupTabId, { active: true });
+  const runtimeState = await getState();
+  await maybeActivateTab(signupTabId, { preferBackground: shouldPreferBackgroundForState(runtimeState) });
   await addLog(`步骤 ${step}：正在请求新的${getVerificationCodeLabel(step)}验证码...`, 'warn');
 
   const result = await sendToContentScript('signup-page', {
@@ -2380,6 +2416,7 @@ async function pollFreshVerificationCode(step, state, mail, pollOverrides = {}) 
             payload,
           }) + VERIFICATION_MAIL_RECOVERY_GRACE_MS,
           maxRecoveryAttempts: 2,
+          preferBackground: shouldPreferBackgroundForState(state),
         }
       );
 
@@ -2414,7 +2451,8 @@ async function submitVerificationCode(step, code) {
     throw new Error('认证页面标签页已关闭，无法填写验证码。');
   }
 
-  await chrome.tabs.update(signupTabId, { active: true });
+  const runtimeState = await getState();
+  await maybeActivateTab(signupTabId, { preferBackground: shouldPreferBackgroundForState(runtimeState) });
   const result = await sendToContentScript('signup-page', {
     type: 'FILL_CODE',
     step,
@@ -2493,12 +2531,13 @@ async function executeStep4(state) {
   const mail = getMailConfig(state);
   if (mail.error) throw new Error(mail.error);
   const stepStartedAt = Date.now();
+  const preferBackground = shouldPreferBackgroundForState(state);
   const signupTabId = await getTabId('signup-page');
   if (!signupTabId) {
     throw new Error('认证页面标签页已关闭，无法继续步骤 4。');
   }
 
-  await chrome.tabs.update(signupTabId, { active: true });
+  await maybeActivateTab(signupTabId, { preferBackground });
   await addLog('步骤 4：正在确认注册验证码页面是否就绪，必要时自动恢复密码页超时报错...');
   const prepareResult = await sendToContentScriptResilient(
     'signup-page',
@@ -2532,15 +2571,17 @@ async function executeStep4(state) {
       await reuseOrCreateTab(mail.source, mail.url, {
         inject: mail.inject,
         injectSource: mail.injectSource,
+        preferBackground,
       });
     } else {
       const tabId = await getTabId(mail.source);
-      await chrome.tabs.update(tabId, { active: true });
+      await maybeActivateTab(tabId, { preferBackground });
     }
   } else {
     await reuseOrCreateTab(mail.source, mail.url, {
       inject: mail.inject,
       injectSource: mail.injectSource,
+      preferBackground,
     });
   }
 
@@ -2648,10 +2689,11 @@ async function executeStep6(state) {
   }
 
   const oauthUrl = await refreshOAuthUrlBeforeStep6(state);
+  const preferBackground = shouldPreferBackgroundForState(state);
 
   await addLog('步骤 6：正在打开最新 OAuth 链接并登录...');
   // Reuse the signup-page tab — navigate it to the OAuth URL
-  const signupTabId = await reuseOrCreateTab('signup-page', oauthUrl);
+  const signupTabId = await reuseOrCreateTab('signup-page', oauthUrl, { preferBackground });
   const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
   if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
     await addLog('步骤 6：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
@@ -2703,15 +2745,16 @@ async function runStep7Attempt(state) {
   const mail = getMailConfig(state);
   if (mail.error) throw new Error(mail.error);
   const stepStartedAt = Date.now();
+  const preferBackground = shouldPreferBackgroundForState(state);
   const authTabId = await getTabId('signup-page');
 
   if (authTabId) {
-    await chrome.tabs.update(authTabId, { active: true });
+    await maybeActivateTab(authTabId, { preferBackground });
   } else {
     if (!state.oauthUrl) {
       throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
     }
-    await reuseOrCreateTab('signup-page', state.oauthUrl);
+    await reuseOrCreateTab('signup-page', state.oauthUrl, { preferBackground });
   }
 
   const currentAuthTab = authTabId ? await chrome.tabs.get(authTabId).catch(() => null) : null;
@@ -2768,15 +2811,17 @@ async function runStep7Attempt(state) {
       await reuseOrCreateTab(mail.source, mail.url, {
         inject: mail.inject,
         injectSource: mail.injectSource,
+        preferBackground,
       });
     } else {
       const tabId = await getTabId(mail.source);
-      await chrome.tabs.update(tabId, { active: true });
+      await maybeActivateTab(tabId, { preferBackground });
     }
   } else {
     await reuseOrCreateTab(mail.source, mail.url, {
       inject: mail.inject,
       injectSource: mail.injectSource,
+      preferBackground,
     });
   }
 
@@ -2969,6 +3014,8 @@ async function executeStep8(state) {
     throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
   }
 
+  const preferBackground = shouldPreferBackgroundForState(state);
+  const lastDebuggerStrategyIndex = STEP8_STRATEGIES.map((strategy) => strategy.mode).lastIndexOf('debugger');
   await addLog('步骤 8：正在监听 localhost 回调地址...');
 
   async function completeIfCurrentTabAlreadyAtCallback(tabId, logMessage) {
@@ -3046,11 +3093,15 @@ async function executeStep8(state) {
             return;
           }
 
-          await chrome.tabs.update(signupTabId, { active: true });
-          await addLog('步骤 8：已切回认证页，准备循环确认“继续”按钮直到页面真正跳转...');
+          await maybeActivateTab(signupTabId, { preferBackground });
+          await addLog(preferBackground
+            ? '步骤 8：已定位认证页，准备尽量后台循环确认“继续”按钮直到页面真正跳转...'
+            : '步骤 8：已切回认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         } else {
-          signupTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
-          await addLog('步骤 8：已重新打开认证页，准备循环确认“继续”按钮直到页面真正跳转...');
+          signupTabId = await reuseOrCreateTab('signup-page', state.oauthUrl, { preferBackground });
+          await addLog(preferBackground
+            ? '步骤 8：已重新打开认证页，准备尽量后台循环确认“继续”按钮直到页面真正跳转...'
+            : '步骤 8：已重新打开认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         }
 
         if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 8：检测到认证页已跳到 localhost 回调地址，直接完成当前步骤。')) {
@@ -3089,7 +3140,12 @@ async function executeStep8(state) {
               return;
             }
             if (!resolved) {
-              await clickWithDebugger(signupTabId, clickTarget?.rect);
+              const isFinalDebuggerFallback = attempt - 1 === lastDebuggerStrategyIndex;
+              const shouldBringToFront = !preferBackground || isFinalDebuggerFallback;
+              if (shouldBringToFront && preferBackground) {
+                await addLog('步骤 8：前面的后台点击仍未生效，正在使用最终前台 debugger 兜底。', 'warn');
+              }
+              await clickWithDebugger(signupTabId, clickTarget?.rect, { bringToFront: shouldBringToFront });
             }
           } else {
             await triggerStep8ContentStrategy(strategy.strategy);
@@ -3124,6 +3180,7 @@ async function executeStep8(state) {
 // ============================================================
 
 async function executeStep9(state) {
+  const preferBackground = shouldPreferBackgroundForState(state);
   if (state.localhostUrl && !isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
     throw new Error('步骤 8 捕获到的 localhost OAuth 回调地址无效，请重新执行步骤 8。');
   }
@@ -3144,10 +3201,11 @@ async function executeStep9(state) {
     tabId = await reuseOrCreateTab('vps-panel', state.vpsUrl, {
       inject: injectFiles,
       reloadIfSameUrl: true,
+      preferBackground,
     });
   } else {
     await closeConflictingTabsForSource('vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
-    await chrome.tabs.update(tabId, { active: true });
+    await maybeActivateTab(tabId, { preferBackground });
     await rememberSourceLastUrl('vps-panel', state.vpsUrl);
   }
 
