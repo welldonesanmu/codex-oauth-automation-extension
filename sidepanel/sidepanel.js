@@ -37,7 +37,6 @@ const rowInbucketMailbox = document.getElementById('row-inbucket-mailbox');
 const inputInbucketMailbox = document.getElementById('input-inbucket-mailbox');
 const inputRunCount = document.getElementById('input-run-count');
 const inputAutoSkipFailures = document.getElementById('input-auto-skip-failures');
-const inputAutoRunBackgroundFirst = document.getElementById('input-auto-run-background-first');
 const autoStartModal = document.getElementById('auto-start-modal');
 const autoStartTitle = autoStartModal?.querySelector('.modal-title');
 const autoStartMessage = document.getElementById('auto-start-message');
@@ -284,7 +283,6 @@ function collectSettingsPayload() {
     inbucketHost: inputInbucketHost.value.trim(),
     inbucketMailbox: inputInbucketMailbox.value.trim(),
     autoRunSkipFailures: inputAutoSkipFailures.checked,
-    autoRunBackgroundFirst: inputAutoRunBackgroundFirst.checked,
   };
 }
 
@@ -453,7 +451,6 @@ async function restoreState() {
       inputInbucketMailbox.value = state.inbucketMailbox;
     }
     inputAutoSkipFailures.checked = Boolean(state.autoRunSkipFailures);
-    inputAutoRunBackgroundFirst.checked = Boolean(state.autoRunBackgroundFirst);
 
     if (state.stepStatuses) {
       for (const [step, status] of Object.entries(state.stepStatuses)) {
@@ -867,7 +864,6 @@ btnAutoRun.addEventListener('click', async () => {
       payload: {
         totalRuns,
         autoRunSkipFailures: inputAutoSkipFailures.checked,
-        autoRunBackgroundFirst: inputAutoRunBackgroundFirst.checked,
         mode,
       },
     });
@@ -985,11 +981,6 @@ inputInbucketHost.addEventListener('blur', () => {
 });
 
 inputAutoSkipFailures.addEventListener('change', () => {
-  markSettingsDirty(true);
-  saveSettings({ silent: true }).catch(() => { });
-});
-
-inputAutoRunBackgroundFirst.addEventListener('change', () => {
   markSettingsDirty(true);
   saveSettings({ silent: true }).catch(() => { });
 });

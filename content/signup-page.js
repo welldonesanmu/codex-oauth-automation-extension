@@ -657,12 +657,20 @@ async function waitForStep5SubmitOutcome(timeout = 15000) {
       return { invalidProfile: true, errorText };
     }
 
+    if (isLocalhostOAuthCallbackUrl()) {
+      return {
+        success: true,
+        terminalState: 'callback',
+        localhostUrl: location.href,
+      };
+    }
+
     if (isAddPhonePageReady()) {
-      return { success: true, addPhonePage: true };
+      return { success: true, terminalState: 'add_phone', addPhonePage: true };
     }
 
     if (isStep8Ready()) {
-      return { success: true };
+      return { success: true, terminalState: 'consent' };
     }
 
     await sleep(150);
@@ -1443,5 +1451,18 @@ async function step5_fillNameBirthday(payload) {
   }
 
   log(`步骤 5：资料已通过。`, 'ok');
+  if (outcome.terminalState === 'callback') {
+    reportComplete(5, {
+      skippedDirectToCallback: true,
+      localhostUrl: outcome.localhostUrl || location.href,
+    });
+    return;
+  }
+
+  if (outcome.terminalState === 'consent') {
+    reportComplete(5, { skippedDirectToConsent: true });
+    return;
+  }
+
   reportComplete(5, { addPhonePage: Boolean(outcome.addPhonePage) });
 }
