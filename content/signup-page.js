@@ -85,7 +85,6 @@ const VERIFICATION_CODE_INPUT_SELECTOR = [
 const ONE_TIME_CODE_LOGIN_PATTERN = /使用一次性验证码登录|改用(?:一次性)?验证码(?:登录)?|使用验证码登录|一次性验证码|验证码登录|one[-\s]*time\s*(?:passcode|password|code)|use\s+(?:a\s+)?one[-\s]*time\s*(?:passcode|password|code)(?:\s+instead)?|use\s+(?:a\s+)?code(?:\s+instead)?|sign\s+in\s+with\s+(?:email|code)|email\s+(?:me\s+)?(?:a\s+)?code/i;
 
 const RESEND_VERIFICATION_CODE_PATTERN = /重新发送(?:验证码)?|再次发送(?:验证码)?|重发(?:验证码)?|未收到(?:验证码|邮件)|resend(?:\s+code)?|send\s+(?:a\s+)?new\s+code|send\s+(?:it\s+)?again|request\s+(?:a\s+)?new\s+code|didn'?t\s+receive/i;
-const VERIFICATION_SUBMIT_BUTTON_PATTERN = /verify|confirm|continue|submit|确认|验证|继续|下一步/i;
 
 function isVisibleElement(el) {
   if (!el) return false;
@@ -179,35 +178,6 @@ function findResendVerificationCodeTrigger({ allowDisabled = false } = {}) {
 
 function isEmailVerificationPage() {
   return /\/email-verification(?:[/?#]|$)/i.test(location.pathname || '');
-}
-
-function findVerificationSubmitButton({ allowDisabled = false } = {}) {
-  const candidates = document.querySelectorAll(
-    'button[type="submit"], input[type="submit"], button, [role="button"]'
-  );
-
-  for (const el of candidates) {
-    if (!isVisibleElement(el)) continue;
-    if (!allowDisabled && !isActionEnabled(el)) continue;
-
-    const text = getActionText(el);
-    const form = el.form || el.closest('form');
-    const formAction = form?.getAttribute?.('action') || '';
-    const buttonName = el.getAttribute?.('name') || '';
-    const buttonValue = el.getAttribute?.('value') || '';
-    const actionName = el.getAttribute?.('data-dd-action-name') || '';
-    const actionLike = `${buttonName} ${buttonValue} ${actionName}`;
-
-    if (
-      VERIFICATION_SUBMIT_BUTTON_PATTERN.test(text)
-      || /action|intent/i.test(actionLike)
-      || /email-verification/i.test(formAction)
-    ) {
-      return el;
-    }
-  }
-
-  return null;
 }
 
 function parseUrlSafely(rawUrl) {
@@ -502,7 +472,6 @@ function getPrimaryContinueButton() {
 function isVerificationPageStillVisible() {
   if (getVerificationCodeTarget()) return true;
   if (findResendVerificationCodeTrigger({ allowDisabled: true })) return true;
-  if (findVerificationSubmitButton({ allowDisabled: true })) return true;
   if (document.querySelector('form[action*="email-verification" i]')) return true;
 
   return VERIFICATION_PAGE_PATTERN.test(getPageTextSnapshot());
@@ -657,20 +626,12 @@ async function waitForStep5SubmitOutcome(timeout = 15000) {
       return { invalidProfile: true, errorText };
     }
 
-    if (isLocalhostOAuthCallbackUrl()) {
-      return {
-        success: true,
-        terminalState: 'callback',
-        localhostUrl: location.href,
-      };
-    }
-
     if (isAddPhonePageReady()) {
-      return { success: true, terminalState: 'add_phone', addPhonePage: true };
+      return { success: true, addPhonePage: true };
     }
 
     if (isStep8Ready()) {
-      return { success: true, terminalState: 'consent' };
+      return { success: true };
     }
 
     await sleep(150);
@@ -906,32 +867,6 @@ async function waitForVerificationSubmitOutcome(step, timeout) {
   return { success: true, assumed: true };
 }
 
-async function submitVerificationCodeForm(step) {
-  const submitBtn = findVerificationSubmitButton({ allowDisabled: false });
-  const form = submitBtn?.form || submitBtn?.closest('form');
-
-  if (submitBtn) {
-    await humanPause(450, 1200);
-
-    if (typeof submitBtn.click === 'function') {
-      submitBtn.click();
-    } else if (form && typeof form.requestSubmit === 'function' && !isEmailVerificationPage()) {
-      form.requestSubmit(submitBtn);
-    } else {
-      simulateClick(submitBtn);
-    }
-
-    log(`步骤 ${step}：验证码已提交`);
-    return true;
-  }
-
-  if (step === 7) {
-    return false;
-  }
-
-  throw new Error('未找到验证码提交按钮。URL: ' + location.href);
-}
-
 async function fillVerificationCode(step, payload) {
   const { code } = payload;
   if (!code) throw new Error('未提供验证码。');
@@ -955,8 +890,6 @@ async function fillVerificationCode(step, payload) {
         fillInput(singleInputs[i], code[i]);
         await sleep(100);
       }
-      await sleep(500);
-      await submitVerificationCodeForm(step);
       const outcome = await waitForVerificationSubmitOutcome(step);
       if (outcome.invalidCode) {
         log(`步骤 ${step}：验证码被拒绝：${outcome.errorText}`, 'warn');
@@ -977,7 +910,14 @@ async function fillVerificationCode(step, payload) {
 
   // Submit
   await sleep(500);
-  await submitVerificationCodeForm(step);
+  const submitBtn = document.querySelector('button[type="submit"]')
+    || await waitForElementByText('button', /verify|confirm|submit|continue|确认|验证/i, 5000).catch(() => null);
+
+  if (submitBtn) {
+    await humanPause(450, 1200);
+    simulateClick(submitBtn);
+    log(`步骤 ${step}：验证码已提交`);
+  }
 
   const outcome = await waitForVerificationSubmitOutcome(step);
   if (outcome.invalidCode) {
@@ -1451,18 +1391,5 @@ async function step5_fillNameBirthday(payload) {
   }
 
   log(`步骤 5：资料已通过。`, 'ok');
-  if (outcome.terminalState === 'callback') {
-    reportComplete(5, {
-      skippedDirectToCallback: true,
-      localhostUrl: outcome.localhostUrl || location.href,
-    });
-    return;
-  }
-
-  if (outcome.terminalState === 'consent') {
-    reportComplete(5, { skippedDirectToConsent: true });
-    return;
-  }
-
   reportComplete(5, { addPhonePage: Boolean(outcome.addPhonePage) });
 }

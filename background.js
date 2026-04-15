@@ -41,7 +41,6 @@ const DEFAULT_STATE = {
   lastSignupCode: null, // 注册验证码，运行时由程序自动读取并写入。
   lastLoginCode: null, // 登录验证码，运行时由程序自动读取并写入。
   localhostUrl: null, // 运行时捕获到的 localhost 回调地址，不要手动预填。
-  authPageState: null, // 记录认证页当前已知的终态：add_phone / consent / callback。
   flowStartTime: null, // 当前流程开始时间。
   tabRegistry: {}, // 程序维护的标签页注册表。
   sourceLastUrls: {}, // 各来源页面最近一次打开的地址记录。
@@ -612,7 +611,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
 
     const registry = await getTabRegistry();
     if (sameUrl) {
-      await maybeActivateTab(tabId);
+      await chrome.tabs.update(tabId, { active: true });
       console.log(LOG_PREFIX, `Reused tab ${source} (${tabId}) on same URL`);
 
       if (shouldReloadOnReuse) {
@@ -1004,7 +1003,6 @@ function getDownstreamStateResets(step) {
       lastSignupCode: null,
       lastLoginCode: null,
       localhostUrl: null,
-      authPageState: null,
     };
   }
   if (step === 2) {
@@ -1014,7 +1012,6 @@ function getDownstreamStateResets(step) {
       lastSignupCode: null,
       lastLoginCode: null,
       localhostUrl: null,
-      authPageState: null,
     };
   }
   if (step === 3 || step === 4) {
@@ -1023,20 +1020,17 @@ function getDownstreamStateResets(step) {
       lastSignupCode: null,
       lastLoginCode: null,
       localhostUrl: null,
-      authPageState: null,
     };
   }
   if (step === 5 || step === 6 || step === 7) {
     return {
       lastLoginCode: null,
       localhostUrl: null,
-      authPageState: null,
     };
   }
   if (step === 8) {
     return {
       localhostUrl: null,
-      authPageState: null,
     };
   }
   return {};
@@ -1115,13 +1109,6 @@ function isAutoRunPausedState(state) {
   return Boolean(state.autoRunning) && state.autoRunPhase === 'waiting_email';
 }
 
-async function maybeActivateTab(tabId) {
-  if (!tabId) {
-    return;
-  }
-  await chrome.tabs.update(tabId, { active: true });
-}
-
 async function ensureManualInteractionAllowed(actionLabel) {
   const state = await getState();
 
@@ -1192,7 +1179,7 @@ async function humanStepDelay(min = HUMAN_STEP_DELAY_MIN, max = HUMAN_STEP_DELAY
   await sleepWithStop(duration);
 }
 
-async function clickWithDebugger(tabId, rect, options = {}) {
+async function clickWithDebugger(tabId, rect) {
   if (!tabId) {
     throw new Error('未找到用于调试点击的认证页面标签页。');
   }
@@ -1200,7 +1187,6 @@ async function clickWithDebugger(tabId, rect, options = {}) {
     throw new Error('步骤 8 的调试器兜底点击需要有效的按钮坐标。');
   }
 
-  const bringToFront = Boolean(options.bringToFront);
   const target = { tabId };
   try {
     await chrome.debugger.attach(target, '1.3');
@@ -1215,9 +1201,7 @@ async function clickWithDebugger(tabId, rect, options = {}) {
     const x = Math.round(rect.centerX);
     const y = Math.round(rect.centerY);
 
-    if (bringToFront) {
-      await chrome.debugger.sendCommand(target, 'Page.bringToFront');
-    }
+    await chrome.debugger.sendCommand(target, 'Page.bringToFront');
     await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
       type: 'mouseMoved',
       x,
@@ -1483,7 +1467,7 @@ async function handleMessage(message, sender) {
       }
 
       await chrome.tabs.update(tabId, { active: true });
-      await clickWithDebugger(tabId, rect, { bringToFront: true });
+      await clickWithDebugger(tabId, rect);
       return { ok: true };
     }
 
@@ -1527,38 +1511,12 @@ async function handleStepData(step, payload) {
     case 4:
       if (payload.emailTimestamp) await setState({ lastEmailTimestamp: payload.emailTimestamp });
       break;
-    case 5:
-    case 6:
-    case 7: {
-      const updates = {};
-      if (payload.localhostUrl) {
-        if (!isLocalhostOAuthCallbackUrl(payload.localhostUrl)) {
-          throw new Error(`步骤 ${step} 返回了无效的 localhost OAuth 回调地址。`);
-        }
-        updates.localhostUrl = payload.localhostUrl;
-        updates.authPageState = 'callback';
-      } else if (payload.skippedDirectToCallback || payload.alreadyAtCallback) {
-        updates.authPageState = 'callback';
-      } else if (payload.skippedDirectToConsent) {
-        updates.authPageState = 'consent';
-      } else if (payload.addPhonePage) {
-        updates.authPageState = 'add_phone';
-      }
-
-      if (Object.keys(updates).length) {
-        await setState(updates);
-        if (updates.localhostUrl) {
-          broadcastDataUpdate({ localhostUrl: updates.localhostUrl });
-        }
-      }
-      break;
-    }
     case 8:
       if (payload.localhostUrl) {
         if (!isLocalhostOAuthCallbackUrl(payload.localhostUrl)) {
           throw new Error('步骤 8 返回了无效的 localhost OAuth 回调地址。');
         }
-        await setState({ localhostUrl: payload.localhostUrl, authPageState: 'callback' });
+        await setState({ localhostUrl: payload.localhostUrl });
         broadcastDataUpdate({ localhostUrl: payload.localhostUrl });
       }
       break;
@@ -1887,7 +1845,7 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
 
   const signupTabId = await getTabId('signup-page');
   if (signupTabId) {
-    await maybeActivateTab(signupTabId);
+    await chrome.tabs.update(signupTabId, { active: true });
   }
 
   let step = Math.max(startStep, 4);
@@ -2365,7 +2323,7 @@ async function requestVerificationCodeResend(step) {
     throw new Error('认证页面标签页已关闭，无法重新请求验证码。');
   }
 
-  await maybeActivateTab(signupTabId);
+  await chrome.tabs.update(signupTabId, { active: true });
   await addLog(`步骤 ${step}：正在请求新的${getVerificationCodeLabel(step)}验证码...`, 'warn');
 
   const result = await sendToContentScript('signup-page', {
@@ -2456,7 +2414,7 @@ async function submitVerificationCode(step, code) {
     throw new Error('认证页面标签页已关闭，无法填写验证码。');
   }
 
-  await maybeActivateTab(signupTabId);
+  await chrome.tabs.update(signupTabId, { active: true });
   const result = await sendToContentScript('signup-page', {
     type: 'FILL_CODE',
     step,
@@ -2540,7 +2498,7 @@ async function executeStep4(state) {
     throw new Error('认证页面标签页已关闭，无法继续步骤 4。');
   }
 
-  await maybeActivateTab(signupTabId);
+  await chrome.tabs.update(signupTabId, { active: true });
   await addLog('步骤 4：正在确认注册验证码页面是否就绪，必要时自动恢复密码页超时报错...');
   const prepareResult = await sendToContentScriptResilient(
     'signup-page',
@@ -2577,7 +2535,7 @@ async function executeStep4(state) {
       });
     } else {
       const tabId = await getTabId(mail.source);
-      await maybeActivateTab(tabId);
+      await chrome.tabs.update(tabId, { active: true });
     }
   } else {
     await reuseOrCreateTab(mail.source, mail.url, {
@@ -2650,24 +2608,6 @@ async function refreshOAuthUrlBeforeStep6(state) {
 async function executeStep6(state) {
   if (!state.email) {
     throw new Error('缺少邮箱地址，请先完成步骤 3。');
-  }
-
-  if (state.localhostUrl && isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
-    await addLog('步骤 6：已记录 localhost 回调地址，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true, localhostUrl: state.localhostUrl });
-    return;
-  }
-
-  if (state.authPageState === 'callback') {
-    await addLog('步骤 6：已记录认证页直达 localhost 回调，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
-    return;
-  }
-
-  if (state.authPageState === 'consent') {
-    await addLog('步骤 6：已记录认证页直达 OAuth 同意页，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(6, { needsOTP: false, skippedDirectToConsent: true });
-    return;
   }
 
   const existingSignupTabId = await getTabId('signup-page');
@@ -2763,29 +2703,10 @@ async function runStep7Attempt(state) {
   const mail = getMailConfig(state);
   if (mail.error) throw new Error(mail.error);
   const stepStartedAt = Date.now();
-
-  if (state.localhostUrl && isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
-    await addLog('步骤 7：已记录 localhost 回调地址，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(7, { skippedDirectToCallback: true, localhostUrl: state.localhostUrl });
-    return;
-  }
-
-  if (state.authPageState === 'callback') {
-    await addLog('步骤 7：已记录认证页直达 localhost 回调，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(7, { skippedDirectToCallback: true });
-    return;
-  }
-
-  if (state.authPageState === 'consent') {
-    await addLog('步骤 7：已记录认证页直达 OAuth 同意页，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(7, { skippedDirectToConsent: true });
-    return;
-  }
-
   const authTabId = await getTabId('signup-page');
 
   if (authTabId) {
-    await maybeActivateTab(authTabId);
+    await chrome.tabs.update(authTabId, { active: true });
   } else {
     if (!state.oauthUrl) {
       throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
@@ -2850,7 +2771,7 @@ async function runStep7Attempt(state) {
       });
     } else {
       const tabId = await getTabId(mail.source);
-      await maybeActivateTab(tabId);
+      await chrome.tabs.update(tabId, { active: true });
     }
   } else {
     await reuseOrCreateTab(mail.source, mail.url, {
@@ -3048,12 +2969,6 @@ async function executeStep8(state) {
     throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
   }
 
-  if (state.localhostUrl && isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
-    await addLog('步骤 8：已记录 localhost 回调地址，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(8, { localhostUrl: state.localhostUrl });
-    return;
-  }
-
   await addLog('步骤 8：正在监听 localhost 回调地址...');
 
   async function completeIfCurrentTabAlreadyAtCallback(tabId, logMessage) {
@@ -3131,7 +3046,7 @@ async function executeStep8(state) {
             return;
           }
 
-          await maybeActivateTab(signupTabId);
+          await chrome.tabs.update(signupTabId, { active: true });
           await addLog('步骤 8：已切回认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         } else {
           signupTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
@@ -3174,7 +3089,7 @@ async function executeStep8(state) {
               return;
             }
             if (!resolved) {
-              await clickWithDebugger(signupTabId, clickTarget?.rect, { bringToFront: true });
+              await clickWithDebugger(signupTabId, clickTarget?.rect);
             }
           } else {
             await triggerStep8ContentStrategy(strategy.strategy);
@@ -3232,7 +3147,7 @@ async function executeStep9(state) {
     });
   } else {
     await closeConflictingTabsForSource('vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
-    await maybeActivateTab(tabId);
+    await chrome.tabs.update(tabId, { active: true });
     await rememberSourceLastUrl('vps-panel', state.vpsUrl);
   }
 

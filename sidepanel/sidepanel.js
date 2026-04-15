@@ -837,12 +837,6 @@ btnAutoStartClose?.addEventListener('click', () => resolveModalChoice(null));
 // Auto Run
 btnAutoRun.addEventListener('click', async () => {
   try {
-    if (settingsSaveInFlight) {
-      await saveSettings({ silent: true });
-    } else if (settingsDirty) {
-      await saveSettings({ silent: true });
-    }
-
     const totalRuns = parseInt(inputRunCount.value) || 1;
     let mode = 'restart';
 
