@@ -11,7 +11,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     || message.type === 'STEP8_FIND_AND_CLICK'
     || message.type === 'STEP8_GET_STATE'
     || message.type === 'STEP8_TRIGGER_CONTINUE'
-    || message.type === 'PREPARE_LOGIN_CODE'
     || message.type === 'PREPARE_SIGNUP_VERIFICATION'
     || message.type === 'RESEND_VERIFICATION_CODE'
     || message.type === 'INSPECT_AUTH_PAGE_STATE'
@@ -28,7 +27,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (message.type === 'STEP8_FIND_AND_CLICK') {
-        log(`步骤 8：${err.message}`, 'error');
+        log(`步骤 6：${err.message}`, 'error');
         sendResponse({ error: err.message });
         return;
       }
@@ -47,8 +46,7 @@ async function handleCommand(message) {
         case 2: return await step2_clickRegister();
         case 3: return await step3_fillEmailPassword(message.payload);
         case 5: return await step5_fillNameBirthday(message.payload);
-        case 6: return await step6_login(message.payload);
-        case 8: return await step8_findAndClick();
+        case 6: return await step8_findAndClick();
         default: throw new Error(`signup-page.js 不处理步骤 ${message.step}`);
       }
     case 'FILL_CODE':
@@ -56,8 +54,6 @@ async function handleCommand(message) {
       return await fillVerificationCode(message.step, message.payload);
     case 'PREPARE_SIGNUP_VERIFICATION':
       return await prepareSignupVerificationFlow(message.payload);
-    case 'PREPARE_LOGIN_CODE':
-      return await prepareLoginCodeFlow();
     case 'RESEND_VERIFICATION_CODE':
       return await resendVerificationCode(message.step);
     case 'INSPECT_AUTH_PAGE_STATE':
@@ -932,90 +928,27 @@ async function fillVerificationCode(step, payload) {
 }
 
 // ============================================================
-// Step 6: Login with registered account (on OAuth auth page)
+// Step 6: Find "继续" on OAuth consent page for debugger click
 // ============================================================
-
-async function step6_login(payload) {
-  const { email, password } = payload;
-  if (!email) throw new Error('登录时缺少邮箱地址。');
-
-  log(`步骤 6：正在使用 ${email} 登录...`);
-
-  // Wait for email input on the auth page
-  let emailInput = null;
-  try {
-    emailInput = await waitForElement(
-      'input[type="email"], input[name="email"], input[name="username"], input[id*="email"], input[placeholder*="email" i], input[placeholder*="Email"]',
-      15000
-    );
-  } catch {
-    throw new Error('在登录页未找到邮箱输入框。URL: ' + location.href);
-  }
-
-  await humanPause(500, 1400);
-  fillInput(emailInput, email);
-  log('步骤 6：邮箱已填写');
-
-  // Submit email
-  await sleep(500);
-  const submitBtn1 = document.querySelector('button[type="submit"]')
-    || await waitForElementByText('button', /continue|next|submit|继续|下一步/i, 5000).catch(() => null);
-  if (submitBtn1) {
-    await humanPause(400, 1100);
-    simulateClick(submitBtn1);
-    log('步骤 6：邮箱已提交');
-  }
-
-  await sleep(2000);
-
-  // Check for password field
-  const passwordInput = document.querySelector('input[type="password"]');
-  if (passwordInput) {
-    log('步骤 6：已找到密码输入框，正在填写密码...');
-    await humanPause(550, 1450);
-    fillInput(passwordInput, password);
-
-    await sleep(500);
-    const submitBtn2 = document.querySelector('button[type="submit"]')
-      || await waitForElementByText('button', /continue|log\s*in|submit|sign\s*in|登录|继续/i, 5000).catch(() => null);
-    // Report complete BEFORE submit in case page navigates
-    reportComplete(6, { needsOTP: true });
-
-    if (submitBtn2) {
-      await humanPause(450, 1200);
-      simulateClick(submitBtn2);
-      log('步骤 6：密码已提交，可能还需要验证码（步骤 7）');
-    }
-    return;
-  }
-
-  // No password field — OTP flow
-  log('步骤 6：未发现密码输入框，可能进入验证码流程或自动跳转。');
-  reportComplete(6, { needsOTP: true });
-}
-
-// ============================================================
-// Step 8: Find "继续" on OAuth consent page for debugger click
-// ============================================================
-// After login + verification, page shows:
+// After verification, page shows:
 // "使用 ChatGPT 登录到 Codex" with a "继续" submit button.
 // Background performs the actual click through the debugger Input API.
 
 async function step8_findAndClick() {
   if (isLocalhostOAuthCallbackUrl()) {
-    log('步骤 8：当前页面已是 localhost 回调地址，跳过“继续”按钮点击。', 'ok');
+    log('步骤 6：当前页面已是 localhost 回调地址，跳过“继续”按钮点击。', 'ok');
     return {
       alreadyAtCallback: true,
       url: location.href,
     };
   }
 
-  log('步骤 8：正在查找 OAuth 同意页的“继续”按钮...');
+  log('步骤 6：正在查找 OAuth 同意页的“继续”按钮...');
 
   const continueBtn = await prepareStep8ContinueButton();
 
   const rect = getSerializableRect(continueBtn);
-  log('步骤 8：已找到“继续”按钮并准备好调试器点击坐标。');
+  log('步骤 6：已找到“继续”按钮并准备好调试器点击坐标。');
   return {
     rect,
     buttonText: (continueBtn.textContent || '').trim(),
@@ -1070,10 +1003,10 @@ async function step8_triggerContinue(payload = {}) {
       simulateClick(continueBtn);
       break;
     default:
-      throw new Error(`未知的 Step 8 触发策略：${strategy}`);
+      throw new Error(`未知的 Step 6 触发策略：${strategy}`);
   }
 
-  log(`Step 8: continue button triggered via ${strategy}.`);
+  log(`Step 6: continue button triggered via ${strategy}.`);
   return {
     strategy,
     ...getStep8State(),

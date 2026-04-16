@@ -49,7 +49,7 @@
   - 页面要求填写 `age`
 - 支持 `Auto` 多轮运行
 - 支持中途 `Stop`
-- Step 8 会自动寻找 OAuth 同意页的“继续”按钮，并通过 Chrome debugger 输入事件发起点击，然后监听本地回调地址
+- Step 6 会自动处理剩余登录校验，并在 OAuth 同意页自动点击“继续”，再监听本地回调地址
 
 
 ## 环境要求
@@ -80,7 +80,7 @@
 http(s)://<your-host>/management.html#/oauth
 ```
 
-Step 1 和 Step 9 都依赖这个地址。
+Step 1 和 Step 7 都依赖这个地址。
 
 ### `Mail`
 
@@ -166,17 +166,15 @@ Step 3 使用的注册邮箱。
 
 ### 单步模式
 
-侧边栏共有 9 个步骤按钮，可逐步执行：
+侧边栏共有 7 个步骤按钮，可逐步执行：
 
 1. `Get OAuth Link`
 2. `Open Signup`
 3. `Fill Email / Password`
 4. `Get Signup Code`
 5. `Fill Name / Birthday`
-6. `Login via OAuth`
-7. `Get Login Code`
-8. `Manual OAuth Confirm`
-9. `CPA Verify`
+6. `Auto OAuth Confirm`
+7. `CPA Verify`
 
 ### Auto 模式
 
@@ -188,7 +186,7 @@ Step 3 使用的注册邮箱。
 2. Step 2 打开 OpenAI 注册页
 3. 尝试自动获取 Duck 邮箱
 4. 如果 Duck 自动获取失败，暂停并等待你在侧边栏填写邮箱后点击 `Continue`
-5. 继续执行 Step 3 ~ Step 9
+5. 继续执行 Step 3 ~ Step 7
 
 也就是说：
 
@@ -257,28 +255,24 @@ Step 3 使用的注册邮箱。
 
 如果页面是生日模式，会填写年月日；如果页面上存在 `input[name='age']`，则直接填写年龄。
 
-### Step 6: Login via OAuth
+### Step 6: Auto OAuth Confirm
 
-在登录前会先重新获取一遍最新的 CPA OAuth 链接，再使用刚注册的账号登录。
+这一步现在会自动兜底处理 Step 5 之后剩余的认证阶段。
 
-支持：
+行为包括：
 
-- 邮箱 + 密码登录
-- 提交后进入验证码验证流程
+- 如果页面已经在 OAuth 同意页，直接自动点击“继续”
+- 如果页面仍停留在登录 / 登录验证码阶段，会先自动补做登录验证码流程
+- 如果页面已经直接跳到 localhost 回调地址，会直接视为完成
 
-### Step 7: Get Login Code
-
-与 Step 4 类似，但会使用稍微不同的关键词组合去找登录验证码邮件。
-
-### Step 8: Manual OAuth Confirm
 
 严格回调捕获规则：
 
-- 步骤 8 现在只接受 `http(s)://localhost:<port>/auth/callback?code=...&state=...` 或 `http(s)://127.0.0.1:<port>/auth/callback?code=...&state=...`
+- 步骤 6 现在只接受 `http(s)://localhost:<port>/auth/callback?code=...&state=...` 或 `http(s)://127.0.0.1:<port>/auth/callback?code=...&state=...`
 - 监听范围只限于当前 OAuth 认证标签页的主 frame 跳转
 - 普通 `localhost` 页面，包括本地部署的 CPA 面板，不会再被误判为回调地址
 
-虽然按钮名称还是 `Manual OAuth Confirm`，但当前代码已经做了自动尝试：
+当前代码已经做了自动尝试：
 
 - 在授权页定位“继续”按钮
 - 等待按钮可点击
@@ -293,11 +287,11 @@ Step 3 使用的注册邮箱。
 - 如果 120 秒内没有捕获到 localhost 回调，会报错超时
 - README 中的按钮名称沿用了旧文案，但代码行为是“自动尝试点击”
 
-### Step 9: CPA Verify
+### Step 7: CPA Verify
 
 校验规则：
 
-- 步骤 9 会拒绝任何不是真实 `/auth/callback`，或缺少 `code` / `state` 的本地回调地址
+- 步骤 7 会拒绝任何不是真实 `/auth/callback`，或缺少 `code` / `state` 的本地回调地址
 - 成功后的清理只会针对 `/auth` 这一类真实回调标签页，不会再泛化清理任意 localhost 路径
 
 回到 CPA 面板：
@@ -372,12 +366,12 @@ Step 3 使用的注册邮箱。
 ## 项目结构
 
 ```txt
-background.js              后台主控，编排 1~9 步、Tab 复用、状态管理
+background.js              后台主控，编排 1~7 步、Tab 复用、状态管理
 manifest.json              扩展清单
 data/names.js              随机姓名、生日数据
 content/utils.js           通用工具：等待元素、点击、日志、停止控制
-content/vps-panel.js       CPA 面板步骤：Step 1 / Step 9
-content/signup-page.js     OpenAI 注册/登录页步骤：Step 2 / 3 / 5 / 6 / 8
+content/vps-panel.js       CPA 面板步骤：Step 1 / Step 7
+content/signup-page.js     OpenAI 注册/认证页步骤：Step 2 / 3 / 5 / 6
 content/duck-mail.js       Duck 邮箱自动获取
 content/qq-mail.js         QQ 邮箱验证码轮询
 content/mail-163.js        163 邮箱验证码轮询
@@ -395,8 +389,11 @@ sidepanel/                 侧边栏 UI
 2. Step 2
 3. Step 3
 4. Step 4
+5. Step 5
+6. Step 6
+7. Step 7
 
-确认邮箱和验证码链路稳定后，再使用 `Auto`。
+确认链路稳定后，再使用 `Auto`。
 
 ### 2. Inbucket 建议使用专用 mailbox
 
@@ -420,7 +417,7 @@ sidepanel/                 侧边栏 UI
 - 跳过按钮的规则很简单：只要上一步已完成、当前步骤没在运行，就可以使用；Step 1 没有前置步骤，也可直接跳过
 - 如果 Auto 处于暂停状态，点击该按钮会先确认是否接管 Auto
 
-### 5. Step 8 失败时重点检查
+### 5. Step 6 失败时重点检查
 
 补充检查项：
 
@@ -435,10 +432,9 @@ sidepanel/                 侧边栏 UI
 
 ## 已知限制
 
-- Step 8 对页面结构较敏感
+- Step 6 对页面结构较敏感
 - Duck 自动获取依赖 Duck 页面真实 DOM
 - CPA 面板 DOM 也需要和当前脚本选择器匹配
-- `Auto` 按钮名称和 Step 8 的旧文案还未完全统一，但代码行为以实际实现为准
 
 ## 调试建议
 

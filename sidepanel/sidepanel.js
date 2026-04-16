@@ -44,6 +44,8 @@ const btnAutoStartClose = document.getElementById('btn-auto-start-close');
 const btnAutoStartCancel = document.getElementById('btn-auto-start-cancel');
 const btnAutoStartRestart = document.getElementById('btn-auto-start-restart');
 const btnAutoStartContinue = document.getElementById('btn-auto-start-continue');
+const MAX_FLOW_STEP = 7;
+const FLOW_VERSION = 7;
 const STEP_DEFAULT_STATUSES = {
   1: 'pending',
   2: 'pending',
@@ -52,10 +54,8 @@ const STEP_DEFAULT_STATUSES = {
   5: 'pending',
   6: 'pending',
   7: 'pending',
-  8: 'pending',
-  9: 'pending',
 };
-const SKIPPABLE_STEPS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+const SKIPPABLE_STEPS = new Set([1, 2, 3, 4, 5, 6, 7]);
 
 let latestState = null;
 let currentAutoRun = {
@@ -200,13 +200,64 @@ function isDoneStatus(status) {
   return status === 'completed' || status === 'manual_completed' || status === 'skipped';
 }
 
+function normalizeFlowStep(step) {
+  const numericStep = Number(step) || 0;
+  if (numericStep === 8) return 6;
+  if (numericStep === 9) return 7;
+  return numericStep;
+}
+
+function isLegacyFlowState(state = {}) {
+  const storedVersion = Number(state?.flowVersion || 0);
+  if (storedVersion >= FLOW_VERSION) {
+    return false;
+  }
+
+  const statuses = state?.stepStatuses || {};
+  return Boolean(
+    Number(state?.currentStep)
+    || statuses[6] !== undefined
+    || statuses[7] !== undefined
+    || statuses[8] !== undefined
+    || statuses[9] !== undefined
+    || state?.localhostUrl
+  );
+}
+
+function normalizeStepStatuses(statuses = {}, options = {}) {
+  const { legacy = false, localhostUrl = null } = options;
+  const normalized = { ...STEP_DEFAULT_STATUSES };
+  for (let step = 1; step <= 5; step++) {
+    if (statuses[step] !== undefined) {
+      normalized[step] = statuses[step];
+    }
+  }
+  if (legacy) {
+    if (statuses[8] !== undefined) normalized[6] = statuses[8];
+    if (statuses[9] !== undefined) normalized[7] = statuses[9];
+  } else {
+    if (statuses[6] !== undefined) normalized[6] = statuses[6];
+    if (statuses[7] !== undefined) normalized[7] = statuses[7];
+  }
+  if (localhostUrl) {
+    normalized[6] = isDoneStatus(normalized[6]) ? normalized[6] : 'completed';
+  }
+  if (isDoneStatus(normalized[7]) && !isDoneStatus(normalized[6])) {
+    normalized[6] = 'completed';
+  }
+  return normalized;
+}
+
 function getStepStatuses(state = latestState) {
-  return { ...STEP_DEFAULT_STATUSES, ...(state?.stepStatuses || {}) };
+  return normalizeStepStatuses(state?.stepStatuses || {}, {
+    legacy: isLegacyFlowState(state),
+    localhostUrl: state?.localhostUrl,
+  });
 }
 
 function getFirstUnfinishedStep(state = latestState) {
   const statuses = getStepStatuses(state);
-  for (let step = 1; step <= 9; step++) {
+  for (let step = 1; step <= MAX_FLOW_STEP; step++) {
     if (!isDoneStatus(statuses[step])) {
       return step;
     }
@@ -224,13 +275,20 @@ function shouldOfferAutoModeChoice(state = latestState) {
 }
 
 function syncLatestState(nextState) {
-  const mergedStepStatuses = nextState?.stepStatuses
-    ? { ...STEP_DEFAULT_STATUSES, ...(latestState?.stepStatuses || {}), ...nextState.stepStatuses }
-    : getStepStatuses(latestState);
-
-  latestState = {
+  const mergedState = {
     ...(latestState || {}),
     ...(nextState || {}),
+  };
+  const mergedStepStatuses = nextState?.stepStatuses
+    ? getStepStatuses({
+        ...mergedState,
+        stepStatuses: { ...(latestState?.stepStatuses || {}), ...nextState.stepStatuses },
+      })
+    : getStepStatuses(mergedState);
+
+  latestState = {
+    ...mergedState,
+    flowVersion: FLOW_VERSION,
     stepStatuses: mergedStepStatuses,
   };
 }
@@ -490,13 +548,14 @@ function updateMailProviderUI() {
 // ============================================================
 
 function updateStepUI(step, status) {
-  const statusEl = document.querySelector(`.step-status[data-step="${step}"]`);
-  const row = document.querySelector(`.step-row[data-step="${step}"]`);
+  const normalizedStep = normalizeFlowStep(step);
+  const statusEl = document.querySelector(`.step-status[data-step="${normalizedStep}"]`);
+  const row = document.querySelector(`.step-row[data-step="${normalizedStep}"]`);
 
   syncLatestState({
     stepStatuses: {
       ...getStepStatuses(),
-      [step]: status,
+      [normalizedStep]: status,
     },
   });
 
@@ -511,7 +570,7 @@ function updateStepUI(step, status) {
 
 function updateProgressCounter() {
   const completed = Object.values(getStepStatuses()).filter(isDoneStatus).length;
-  stepsProgress.textContent = `${completed} / 9`;
+  stepsProgress.textContent = `${completed} / ${MAX_FLOW_STEP}`;
 }
 
 function updateButtonStates() {
@@ -519,7 +578,7 @@ function updateButtonStates() {
   const anyRunning = Object.values(statuses).some(s => s === 'running');
   const autoLocked = isAutoRunLockedPhase();
 
-  for (let step = 1; step <= 9; step++) {
+  for (let step = 1; step <= MAX_FLOW_STEP; step++) {
     const btn = document.querySelector(`.step-btn[data-step="${step}"]`);
     if (!btn) continue;
 
@@ -535,7 +594,7 @@ function updateButtonStates() {
   }
 
   document.querySelectorAll('.step-manual-btn').forEach((btn) => {
-    const step = Number(btn.dataset.step);
+    const step = normalizeFlowStep(btn.dataset.step);
     const currentStatus = statuses[step];
     const prevStatus = statuses[step - 1];
 
@@ -614,8 +673,8 @@ function updateStatusDisplay(state) {
     .map(([k]) => Number(k))
     .sort((a, b) => b - a)[0];
 
-  if (lastCompleted === 9) {
-    displayStatus.textContent = (state.stepStatuses[9] === 'manual_completed' || state.stepStatuses[9] === 'skipped') ? '全部步骤已跳过/完成' : '全部步骤已完成';
+  if (lastCompleted === MAX_FLOW_STEP) {
+    displayStatus.textContent = (state.stepStatuses[MAX_FLOW_STEP] === 'manual_completed' || state.stepStatuses[MAX_FLOW_STEP] === 'skipped') ? '全部步骤已跳过/完成' : '全部步骤已完成';
     statusBar.classList.add('completed');
   } else if (lastCompleted) {
     displayStatus.textContent = (state.stepStatuses[lastCompleted] === 'manual_completed' || state.stepStatuses[lastCompleted] === 'skipped')
@@ -761,7 +820,7 @@ async function handleSkipStep(step) {
 document.querySelectorAll('.step-btn').forEach(btn => {
   btn.addEventListener('click', async () => {
     try {
-      const step = Number(btn.dataset.step);
+      const step = normalizeFlowStep(btn.dataset.step);
       if (!(await maybeTakeoverAutoRun(`执行步骤 ${step}`))) {
         return;
       }
@@ -993,7 +1052,8 @@ chrome.runtime.onMessage.addListener((message) => {
       break;
 
     case 'STEP_STATUS_CHANGED': {
-      const { step, status } = message.payload;
+      const step = normalizeFlowStep(message.payload.step);
+      const { status } = message.payload;
       updateStepUI(step, status);
       chrome.runtime.sendMessage({ type: 'GET_STATE', source: 'sidepanel' }).then(state => {
         syncLatestState(state);

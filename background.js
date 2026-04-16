@@ -7,7 +7,8 @@ const DUCK_AUTOFILL_URL = 'https://duckduckgo.com/email/settings/autofill';
 const STOP_ERROR_MESSAGE = '流程已被用户停止。';
 const HUMAN_STEP_DELAY_MIN = 700;
 const HUMAN_STEP_DELAY_MAX = 2200;
-const STEP7_RESTART_MAX_ROUNDS = 8;
+const MAX_FLOW_STEP = 7;
+const FLOW_VERSION = 7;
 
 initializeSessionStorageAccess();
 
@@ -28,10 +29,11 @@ const PERSISTED_SETTING_DEFAULTS = {
 const PERSISTED_SETTING_KEYS = Object.keys(PERSISTED_SETTING_DEFAULTS);
 
 const DEFAULT_STATE = {
+  flowVersion: FLOW_VERSION,
   currentStep: 0, // 当前流程执行到的步骤编号。
   stepStatuses: {
     1: 'pending', 2: 'pending', 3: 'pending', 4: 'pending', 5: 'pending', // 运行时步骤状态映射，不要手动预填。
-    6: 'pending', 7: 'pending', 8: 'pending', 9: 'pending',
+    6: 'pending', 7: 'pending',
   },
   oauthUrl: null, // 运行时抓取到的 OAuth 地址，不要手动预填。
   email: null, // 运行时邮箱，由程序自动获取并写入，不能手动预填。
@@ -62,12 +64,100 @@ async function getPersistedSettings() {
   };
 }
 
+function normalizeFlowStep(step) {
+  const numericStep = Number(step) || 0;
+  if (numericStep === 8) return 6;
+  if (numericStep === 9) return 7;
+  return numericStep;
+}
+
+function isLegacyFlowState(rawState = {}) {
+  const storedVersion = Number(rawState.flowVersion || 0);
+  if (storedVersion >= FLOW_VERSION) {
+    return false;
+  }
+
+  const statuses = rawState.stepStatuses || {};
+  return Boolean(
+    Number(rawState.currentStep)
+    || statuses[6] !== undefined
+    || statuses[7] !== undefined
+    || statuses[8] !== undefined
+    || statuses[9] !== undefined
+    || rawState.localhostUrl
+    || rawState.lastLoginCode
+  );
+}
+
+function normalizeStepStatuses(statuses = {}, options = {}) {
+  const { legacy = false, localhostUrl = null } = options;
+  const normalized = { ...DEFAULT_STATE.stepStatuses };
+
+  for (let step = 1; step <= 5; step++) {
+    if (statuses[step] !== undefined) {
+      normalized[step] = statuses[step];
+    }
+  }
+
+  if (legacy) {
+    if (statuses[8] !== undefined) {
+      normalized[6] = statuses[8];
+    }
+    if (statuses[9] !== undefined) {
+      normalized[7] = statuses[9];
+    }
+  } else {
+    if (statuses[6] !== undefined) {
+      normalized[6] = statuses[6];
+    }
+    if (statuses[7] !== undefined) {
+      normalized[7] = statuses[7];
+    }
+  }
+
+  if (localhostUrl) {
+    normalized[6] = isStepDoneStatus(normalized[6]) ? normalized[6] : 'completed';
+  }
+  if (isStepDoneStatus(normalized[7]) && !isStepDoneStatus(normalized[6])) {
+    normalized[6] = 'completed';
+  }
+  return normalized;
+}
+
+function normalizeCurrentStep(currentStep, rawStepStatuses = {}, stepStatuses = normalizeStepStatuses(rawStepStatuses), options = {}) {
+  const { legacy = false } = options;
+  const numericStep = Number(currentStep) || 0;
+  if (numericStep <= 0) return 0;
+  if (numericStep > MAX_FLOW_STEP) {
+    return normalizeFlowStep(numericStep);
+  }
+  if (legacy && numericStep >= 6) {
+    return getFirstUnfinishedStep(stepStatuses) || 0;
+  }
+  return numericStep;
+}
+
+function normalizeState(rawState = {}) {
+  const rawStepStatuses = rawState.stepStatuses || {};
+  const legacy = isLegacyFlowState(rawState);
+  const stepStatuses = normalizeStepStatuses(rawStepStatuses, {
+    legacy,
+    localhostUrl: rawState.localhostUrl,
+  });
+  return {
+    ...rawState,
+    flowVersion: FLOW_VERSION,
+    stepStatuses,
+    currentStep: normalizeCurrentStep(rawState.currentStep, rawStepStatuses, stepStatuses, { legacy }),
+  };
+}
+
 async function getState() {
   const [state, persistedSettings] = await Promise.all([
     chrome.storage.session.get(null),
     getPersistedSettings(),
   ]);
-  return { ...DEFAULT_STATE, ...persistedSettings, ...state };
+  return { ...DEFAULT_STATE, ...persistedSettings, ...normalizeState(state) };
 }
 
 async function initializeSessionStorageAccess() {
@@ -84,8 +174,21 @@ async function initializeSessionStorageAccess() {
 }
 
 async function setState(updates) {
-  console.log(LOG_PREFIX, 'storage.set:', JSON.stringify(updates).slice(0, 200));
-  await chrome.storage.session.set(updates);
+  const normalizedUpdates = {
+    ...updates,
+    flowVersion: FLOW_VERSION,
+  };
+  if (normalizedUpdates.stepStatuses) {
+    normalizedUpdates.stepStatuses = normalizeStepStatuses(normalizedUpdates.stepStatuses);
+  }
+  if (normalizedUpdates.currentStep !== undefined) {
+    normalizedUpdates.currentStep = normalizeCurrentStep(
+      normalizedUpdates.currentStep,
+      normalizedUpdates.stepStatuses || DEFAULT_STATE.stepStatuses,
+    );
+  }
+  console.log(LOG_PREFIX, 'storage.set:', JSON.stringify(normalizedUpdates).slice(0, 200));
+  await chrome.storage.session.set(normalizedUpdates);
 }
 
 async function setPersistentSettings(updates) {
@@ -140,6 +243,7 @@ async function resetState() {
   await chrome.storage.session.set({
     ...DEFAULT_STATE,
     ...persistedSettings,
+    flowVersion: FLOW_VERSION,
     seenCodes: prev.seenCodes || [],
     seenInbucketMailIds: prev.seenInbucketMailIds || [],
     accounts: prev.accounts || [],
@@ -909,7 +1013,7 @@ function withActiveAutoRunAttemptSession(message) {
 async function addLog(message, level = 'info') {
   const state = await getState();
   const logs = state.logs || [];
-  const entry = { message, level, timestamp: Date.now() };
+  const entry = { message: normalizeUserFacingStepText(message), level, timestamp: Date.now() };
   logs.push(entry);
   // Keep last 500 logs
   if (logs.length > 500) logs.splice(0, logs.length - 500);
@@ -936,14 +1040,15 @@ function getSourceLabel(source) {
 // ============================================================
 
 async function setStepStatus(step, status) {
+  const normalizedStep = normalizeFlowStep(step);
   const state = await getState();
   const statuses = { ...state.stepStatuses };
-  statuses[step] = status;
-  await setState({ stepStatuses: statuses, currentStep: step });
+  statuses[normalizedStep] = status;
+  await setState({ stepStatuses: statuses, currentStep: normalizedStep });
   // Broadcast to side panel
   chrome.runtime.sendMessage({
     type: 'STEP_STATUS_CHANGED',
-    payload: { step, status },
+    payload: { step: normalizedStep, status },
   }).catch(() => { });
 }
 
@@ -955,6 +1060,15 @@ function isStopError(error) {
 function isRetryableContentScriptTransportError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
   return /back\/forward cache|message channel is closed|Receiving end does not exist|port closed before a response was received|A listener indicated an asynchronous response|did not respond in \d+s/i.test(message);
+}
+
+function normalizeUserFacingStepText(text) {
+  return String(text || '')
+    .replace(/STEP9_OAUTH_TIMEOUT::/g, 'STEP7_OAUTH_TIMEOUT::')
+    .replace(/步骤\s*8/g, '步骤 6')
+    .replace(/步骤\s*9/g, '步骤 7')
+    .replace(/\b[Ss]tep\s*8\b/g, 'Step 6')
+    .replace(/\b[Ss]tep\s*9\b/g, 'Step 7');
 }
 
 function getErrorMessage(error) {
@@ -973,7 +1087,7 @@ function isRestartCurrentAttemptError(error) {
 
 function isStep9OAuthTimeoutError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
-  return /STEP9_OAUTH_TIMEOUT::|认证失败:\s*Timeout waiting for OAuth callback/i.test(message);
+  return /STEP9_OAUTH_TIMEOUT::|STEP7_OAUTH_TIMEOUT::|认证失败:\s*Timeout waiting for OAuth callback/i.test(message);
 }
 
 function isStepDoneStatus(status) {
@@ -981,8 +1095,9 @@ function isStepDoneStatus(status) {
 }
 
 function getFirstUnfinishedStep(statuses = {}) {
-  for (let step = 1; step <= 9; step++) {
-    if (!isStepDoneStatus(statuses[step] || 'pending')) {
+  const normalized = normalizeStepStatuses(statuses);
+  for (let step = 1; step <= MAX_FLOW_STEP; step++) {
+    if (!isStepDoneStatus(normalized[step] || 'pending')) {
       return step;
     }
   }
@@ -990,7 +1105,7 @@ function getFirstUnfinishedStep(statuses = {}) {
 }
 
 function hasSavedProgress(statuses = {}) {
-  return Object.values({ ...DEFAULT_STATE.stepStatuses, ...statuses }).some((status) => status !== 'pending');
+  return Object.values(normalizeStepStatuses(statuses)).some((status) => status !== 'pending');
 }
 
 function getDownstreamStateResets(step) {
@@ -1022,13 +1137,13 @@ function getDownstreamStateResets(step) {
       localhostUrl: null,
     };
   }
-  if (step === 5 || step === 6 || step === 7) {
+  if (step === 5) {
     return {
       lastLoginCode: null,
       localhostUrl: null,
     };
   }
-  if (step === 8) {
+  if (step === 6) {
     return {
       localhostUrl: null,
     };
@@ -1037,12 +1152,13 @@ function getDownstreamStateResets(step) {
 }
 
 async function invalidateDownstreamAfterStepRestart(step, options = {}) {
-  const { logLabel = `步骤 ${step} 重新执行` } = options;
+  const normalizedStep = normalizeFlowStep(step);
+  const { logLabel = `步骤 ${normalizedStep} 重新执行` } = options;
   const state = await getState();
-  const statuses = { ...(state.stepStatuses || {}) };
+  const statuses = normalizeStepStatuses(state.stepStatuses || {});
   const changedSteps = [];
 
-  for (let downstream = step + 1; downstream <= 9; downstream++) {
+  for (let downstream = normalizedStep + 1; downstream <= MAX_FLOW_STEP; downstream++) {
     if (statuses[downstream] !== 'pending') {
       statuses[downstream] = 'pending';
       changedSteps.push(downstream);
@@ -1060,7 +1176,7 @@ async function invalidateDownstreamAfterStepRestart(step, options = {}) {
     await addLog(`${logLabel}，已重置后续步骤状态：${changedSteps.join(', ')}`, 'warn');
   }
 
-  const resets = getDownstreamStateResets(step);
+  const resets = getDownstreamStateResets(normalizedStep);
   if (Object.keys(resets).length) {
     await setState(resets);
     broadcastDataUpdate(resets);
@@ -1124,31 +1240,32 @@ async function ensureManualInteractionAllowed(actionLabel) {
 
 async function skipStep(step) {
   const state = await ensureManualInteractionAllowed('跳过步骤');
+  const normalizedStep = normalizeFlowStep(step);
 
-  if (!Number.isInteger(step) || step < 1 || step > 9) {
+  if (!Number.isInteger(normalizedStep) || normalizedStep < 1 || normalizedStep > MAX_FLOW_STEP) {
     throw new Error(`无效步骤：${step}`);
   }
 
-  const statuses = { ...(state.stepStatuses || {}) };
-  const currentStatus = statuses[step];
+  const statuses = normalizeStepStatuses(state.stepStatuses || {});
+  const currentStatus = statuses[normalizedStep];
   if (currentStatus === 'running') {
-    throw new Error(`步骤 ${step} 正在运行中，不能跳过。`);
+    throw new Error(`步骤 ${normalizedStep} 正在运行中，不能跳过。`);
   }
   if (isStepDoneStatus(currentStatus)) {
-    throw new Error(`步骤 ${step} 已完成，无需再跳过。`);
+    throw new Error(`步骤 ${normalizedStep} 已完成，无需再跳过。`);
   }
 
-  if (step > 1) {
-    const prevStatus = statuses[step - 1];
+  if (normalizedStep > 1) {
+    const prevStatus = statuses[normalizedStep - 1];
     if (!isStepDoneStatus(prevStatus)) {
-      throw new Error(`请先完成步骤 ${step - 1}，再跳过步骤 ${step}。`);
+      throw new Error(`请先完成步骤 ${normalizedStep - 1}，再跳过步骤 ${normalizedStep}。`);
     }
   }
 
-  await setStepStatus(step, 'skipped');
-  await addLog(`步骤 ${step} 已跳过`, 'warn');
+  await setStepStatus(normalizedStep, 'skipped');
+  await addLog(`步骤 ${normalizedStep} 已跳过`, 'warn');
 
-  if (step === 1) {
+  if (normalizedStep === 1) {
     const latestState = await getState();
     const step2Status = latestState.stepStatuses?.[2];
     if (!isStepDoneStatus(step2Status) && step2Status !== 'running') {
@@ -1157,7 +1274,7 @@ async function skipStep(step) {
     }
   }
 
-  return { ok: true, step, status: 'skipped' };
+  return { ok: true, step: normalizedStep, status: 'skipped' };
 }
 
 function throwIfStopped() {
@@ -1184,7 +1301,7 @@ async function clickWithDebugger(tabId, rect) {
     throw new Error('未找到用于调试点击的认证页面标签页。');
   }
   if (!rect || !Number.isFinite(rect.centerX) || !Number.isFinite(rect.centerY)) {
-    throw new Error('步骤 8 的调试器兜底点击需要有效的按钮坐标。');
+    throw new Error('步骤 6 的调试器兜底点击需要有效的按钮坐标。');
   }
 
   const target = { tabId };
@@ -1192,7 +1309,7 @@ async function clickWithDebugger(tabId, rect) {
     await chrome.debugger.attach(target, '1.3');
   } catch (err) {
     throw new Error(
-      `步骤 8 的调试器兜底点击附加失败：${err.message}。` +
+      `步骤 6 的调试器兜底点击附加失败：${err.message}。` +
       '如果认证页标签已打开 DevTools，请先关闭后重试。'
     );
   }
@@ -1344,15 +1461,16 @@ async function handleMessage(message, sender) {
         console.log(LOG_PREFIX, `Ignored stale STEP_COMPLETE for step ${message.step} from ${message.source}`, message);
         return { ok: true, ignored: true };
       }
+      const step = normalizeFlowStep(message.step);
       if (stopRequested) {
-        await setStepStatus(message.step, 'stopped');
-        notifyStepError(message.step, STOP_ERROR_MESSAGE);
+        await setStepStatus(step, 'stopped');
+        notifyStepError(step, STOP_ERROR_MESSAGE);
         return { ok: true };
       }
-      await setStepStatus(message.step, 'completed');
-      await addLog(`步骤 ${message.step} 已完成`, 'ok');
-      await handleStepData(message.step, message.payload);
-      notifyStepComplete(message.step, message.payload);
+      await setStepStatus(step, 'completed');
+      await addLog(`步骤 ${step} 已完成`, 'ok');
+      await handleStepData(step, message.payload);
+      notifyStepComplete(step, message.payload);
       return { ok: true };
     }
 
@@ -1361,14 +1479,15 @@ async function handleMessage(message, sender) {
         console.log(LOG_PREFIX, `Ignored stale STEP_ERROR for step ${message.step} from ${message.source}`, message);
         return { ok: true, ignored: true };
       }
+      const step = normalizeFlowStep(message.step);
       if (isStopError(message.error)) {
-        await setStepStatus(message.step, 'stopped');
-        await addLog(`步骤 ${message.step} 已被用户停止`, 'warn');
-        notifyStepError(message.step, message.error);
+        await setStepStatus(step, 'stopped');
+        await addLog(`步骤 ${step} 已被用户停止`, 'warn');
+        notifyStepError(step, message.error);
       } else {
-        await setStepStatus(message.step, 'failed');
-        await addLog(`步骤 ${message.step} 失败：${message.error}`, 'error');
-        notifyStepError(message.step, message.error);
+        await setStepStatus(step, 'failed');
+        await addLog(`步骤 ${step} 失败：${normalizeUserFacingStepText(message.error)}`, 'error');
+        notifyStepError(step, message.error);
       }
       return { ok: true };
     }
@@ -1389,7 +1508,7 @@ async function handleMessage(message, sender) {
       if (message.source === 'sidepanel') {
         await ensureManualInteractionAllowed('手动执行步骤');
       }
-      const step = message.payload.step;
+      const step = normalizeFlowStep(message.payload.step);
       if (message.source === 'sidepanel') {
         await invalidateDownstreamAfterStepRestart(step, { logLabel: `步骤 ${step} 重新执行` });
       }
@@ -1498,7 +1617,8 @@ async function handleMessage(message, sender) {
 // ============================================================
 
 async function handleStepData(step, payload) {
-  switch (step) {
+  const normalizedStep = normalizeFlowStep(step);
+  switch (normalizedStep) {
     case 1:
       if (payload.oauthUrl) {
         await setState({ oauthUrl: payload.oauthUrl });
@@ -1511,16 +1631,16 @@ async function handleStepData(step, payload) {
     case 4:
       if (payload.emailTimestamp) await setState({ lastEmailTimestamp: payload.emailTimestamp });
       break;
-    case 8:
+    case 6:
       if (payload.localhostUrl) {
         if (!isLocalhostOAuthCallbackUrl(payload.localhostUrl)) {
-          throw new Error('步骤 8 返回了无效的 localhost OAuth 回调地址。');
+          throw new Error('步骤 6 返回了无效的 localhost OAuth 回调地址。');
         }
         await setState({ localhostUrl: payload.localhostUrl });
         broadcastDataUpdate({ localhostUrl: payload.localhostUrl });
       }
       break;
-    case 9: {
+    case 7: {
       const localhostPrefix = buildLocalhostCleanupPrefix(payload.localhostUrl);
       if (localhostPrefix) {
         await closeTabsByUrlPrefix(localhostPrefix);
@@ -1538,51 +1658,55 @@ async function handleStepData(step, payload) {
 const stepWaiters = new Map();
 let resumeWaiter = null;
 const AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS = 120000;
-const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([4, 7, 8]);
+const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([4, 6]);
 
 function waitForStepComplete(step, timeoutMs = 120000) {
+  const normalizedStep = normalizeFlowStep(step);
   return new Promise((resolve, reject) => {
     throwIfStopped();
-    if (stepWaiters.has(step)) {
-      console.warn(LOG_PREFIX, `[waitForStepComplete] replacing existing waiter for step ${step}`);
+    if (stepWaiters.has(normalizedStep)) {
+      console.warn(LOG_PREFIX, `[waitForStepComplete] replacing existing waiter for step ${normalizedStep}`);
     }
-    console.log(LOG_PREFIX, `[waitForStepComplete] register step ${step}, timeout=${timeoutMs}ms`);
+    console.log(LOG_PREFIX, `[waitForStepComplete] register step ${normalizedStep}, timeout=${timeoutMs}ms`);
     const timer = setTimeout(() => {
-      stepWaiters.delete(step);
-      console.warn(LOG_PREFIX, `[waitForStepComplete] timeout for step ${step} after ${timeoutMs}ms`);
-      reject(new Error(`Step ${step} timed out after ${timeoutMs / 1000}s`));
+      stepWaiters.delete(normalizedStep);
+      console.warn(LOG_PREFIX, `[waitForStepComplete] timeout for step ${normalizedStep} after ${timeoutMs}ms`);
+      reject(new Error(`Step ${normalizedStep} timed out after ${timeoutMs / 1000}s`));
     }, timeoutMs);
 
-    stepWaiters.set(step, {
-      resolve: (data) => { clearTimeout(timer); stepWaiters.delete(step); resolve(data); },
-      reject: (err) => { clearTimeout(timer); stepWaiters.delete(step); reject(err); },
+    stepWaiters.set(normalizedStep, {
+      resolve: (data) => { clearTimeout(timer); stepWaiters.delete(normalizedStep); resolve(data); },
+      reject: (err) => { clearTimeout(timer); stepWaiters.delete(normalizedStep); reject(err); },
     });
   });
 }
 
 function notifyStepComplete(step, payload) {
-  const waiter = stepWaiters.get(step);
-  console.log(LOG_PREFIX, `[notifyStepComplete] step ${step}, hasWaiter=${Boolean(waiter)}`);
+  const normalizedStep = normalizeFlowStep(step);
+  const waiter = stepWaiters.get(normalizedStep);
+  console.log(LOG_PREFIX, `[notifyStepComplete] step ${normalizedStep}, hasWaiter=${Boolean(waiter)}`);
   if (waiter) waiter.resolve(payload);
 }
 
 function notifyStepError(step, error) {
-  const waiter = stepWaiters.get(step);
-  console.warn(LOG_PREFIX, `[notifyStepError] step ${step}, hasWaiter=${Boolean(waiter)}, error=${error}`);
-  if (waiter) waiter.reject(new Error(error));
+  const normalizedStep = normalizeFlowStep(step);
+  const waiter = stepWaiters.get(normalizedStep);
+  console.warn(LOG_PREFIX, `[notifyStepError] step ${normalizedStep}, hasWaiter=${Boolean(waiter)}, error=${error}`);
+  if (waiter) waiter.reject(new Error(normalizeUserFacingStepText(error)));
 }
 
 async function completeStepFromBackground(step, payload = {}) {
+  const normalizedStep = normalizeFlowStep(step);
   if (stopRequested) {
-    await setStepStatus(step, 'stopped');
-    notifyStepError(step, STOP_ERROR_MESSAGE);
+    await setStepStatus(normalizedStep, 'stopped');
+    notifyStepError(normalizedStep, STOP_ERROR_MESSAGE);
     return;
   }
 
-  await setStepStatus(step, 'completed');
-  await addLog(`步骤 ${step} 已完成`, 'ok');
-  await handleStepData(step, payload);
-  notifyStepComplete(step, payload);
+  await setStepStatus(normalizedStep, 'completed');
+  await addLog(`步骤 ${normalizedStep} 已完成`, 'ok');
+  await handleStepData(normalizedStep, payload);
+  notifyStepComplete(normalizedStep, payload);
 }
 
 async function markRunningStepsStopped() {
@@ -1635,42 +1759,41 @@ async function requestStop(options = {}) {
 // ============================================================
 
 async function executeStep(step) {
-  console.log(LOG_PREFIX, `Executing step ${step}`);
+  const normalizedStep = normalizeFlowStep(step);
+  console.log(LOG_PREFIX, `Executing step ${normalizedStep}`);
   throwIfStopped();
-  await setStepStatus(step, 'running');
-  await addLog(`步骤 ${step} 开始执行`);
+  await setStepStatus(normalizedStep, 'running');
+  await addLog(`步骤 ${normalizedStep} 开始执行`);
   await humanStepDelay();
 
   const state = await getState();
 
   // Set flow start time on first step
-  if (step === 1 && !state.flowStartTime) {
+  if (normalizedStep === 1 && !state.flowStartTime) {
     await setState({ flowStartTime: Date.now() });
   }
 
   try {
-    switch (step) {
+    switch (normalizedStep) {
       case 1: await executeStep1(state); break;
       case 2: await executeStep2(state); break;
       case 3: await executeStep3(state); break;
       case 4: await executeStep4(state); break;
       case 5: await executeStep5(state); break;
-      case 6: await executeStep6(state); break;
-      case 7: await executeStep7(state); break;
-      case 8: await executeStep8(state); break;
-      case 9: await executeStep9(state); break;
+      case 6: await executeStep8(state); break;
+      case 7: await executeStep9(state); break;
       default:
-        throw new Error(`未知步骤：${step}`);
+        throw new Error(`未知步骤：${normalizedStep}`);
     }
   } catch (err) {
     if (isStopError(err)) {
-      await setStepStatus(step, 'stopped');
-      await addLog(`步骤 ${step} 已被用户停止`, 'warn');
+      await setStepStatus(normalizedStep, 'stopped');
+      await addLog(`步骤 ${normalizedStep} 已被用户停止`, 'warn');
       throw err;
     }
-    await setStepStatus(step, 'failed');
-    await addLog(`步骤 ${step} 失败：${err.message}`, 'error');
-    throw err;
+    await setStepStatus(normalizedStep, 'failed');
+    await addLog(`步骤 ${normalizedStep} 失败：${normalizeUserFacingStepText(err.message)}`, 'error');
+    throw new Error(normalizeUserFacingStepText(err.message));
   }
 }
 
@@ -1762,10 +1885,8 @@ const AUTO_STEP_DELAYS = {
   3: 3000,
   4: 2000,
   5: 3000,
-  6: 3000,
-  7: 2000,
-  8: 2000,
-  9: 1000,
+  6: 2000,
+  7: 1000,
 };
 
 async function resumeAutoRunIfWaitingForEmail(options = {}) {
@@ -1848,20 +1969,20 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
     await chrome.tabs.update(signupTabId, { active: true });
   }
 
-  let step = Math.max(startStep, 4);
-  while (step <= 9) {
+  let step = Math.max(normalizeFlowStep(startStep), 4);
+  while (step <= MAX_FLOW_STEP) {
     try {
       await executeStepAndWait(step, AUTO_STEP_DELAYS[step]);
       step += 1;
     } catch (err) {
-      if (step === 9 && isStep9OAuthTimeoutError(err) && step9RestartAttempts < maxStep9RestartAttempts) {
+      if (step === 7 && isStep9OAuthTimeoutError(err) && step9RestartAttempts < maxStep9RestartAttempts) {
         step9RestartAttempts += 1;
         await addLog(
-          `步骤 9：检测到 OAuth callback 超时，正在回到步骤 6 重新开始授权流程（${step9RestartAttempts}/${maxStep9RestartAttempts}）...`,
+          `步骤 7：检测到 OAuth callback 超时，正在回到步骤 6 重新开始授权流程（${step9RestartAttempts}/${maxStep9RestartAttempts}）...`,
           'warn'
         );
         await invalidateDownstreamAfterStepRestart(6, {
-          logLabel: `步骤 9 超时后准备回到步骤 6 重试（${step9RestartAttempts}/${maxStep9RestartAttempts}）`,
+          logLabel: `步骤 7 超时后准备回到步骤 6 重试（${step9RestartAttempts}/${maxStep9RestartAttempts}）`,
         });
         step = 6;
         continue;
@@ -2438,6 +2559,7 @@ async function resolveVerificationStep(step, state, mail, options = {}) {
 
   const nextFilterAfterTimestamp = options.filterAfterTimestamp ?? null;
   const requestFreshCodeFirst = Boolean(options.requestFreshCodeFirst);
+  const reportCompletion = options.reportCompletion !== false;
   const maxSubmitAttempts = 3;
 
   if (requestFreshCodeFirst) {
@@ -2481,11 +2603,16 @@ async function resolveVerificationStep(step, state, mail, options = {}) {
       [stateKey]: result.code,
     });
 
-    await completeStepFromBackground(step, {
+    if (reportCompletion) {
+      await completeStepFromBackground(step, {
+        emailTimestamp: result.emailTimestamp,
+        code: result.code,
+      });
+    }
+    return {
       emailTimestamp: result.emailTimestamp,
       code: result.code,
-    });
-    return;
+    };
   }
 }
 
@@ -2580,254 +2707,7 @@ async function executeStep5(state) {
 }
 
 // ============================================================
-// Step 6: Login ChatGPT (Background opens tab, chatgpt.js handles login)
-// ============================================================
-
-async function refreshOAuthUrlBeforeStep6(state) {
-  if (!state.vpsUrl) {
-    throw new Error('尚未配置 CPA 地址，请先在侧边栏填写。');
-  }
-
-  await addLog('步骤 6：正在刷新登录用的 CPA OAuth 链接...');
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] preparing fresh OAuth via step 1');
-  const waitForFreshOAuth = waitForStepComplete(1, 120000);
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] executing step 1 for fresh OAuth');
-  await executeStep1(state);
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] step 1 execute returned, waiting for completion signal');
-  await waitForFreshOAuth;
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] step 1 completion signal received');
-
-  const latestState = await getState();
-  if (!latestState.oauthUrl) {
-    throw new Error('刷新 OAuth 链接后仍未拿到可用链接。');
-  }
-
-  return latestState.oauthUrl;
-}
-
-async function executeStep6(state) {
-  if (!state.email) {
-    throw new Error('缺少邮箱地址，请先完成步骤 3。');
-  }
-
-  const existingSignupTabId = await getTabId('signup-page');
-  if (existingSignupTabId) {
-    const existingSignupTab = await chrome.tabs.get(existingSignupTabId).catch(() => null);
-    if (isLocalhostOAuthCallbackUrl(existingSignupTab?.url)) {
-      await addLog('步骤 6：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-      await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
-      return;
-    }
-
-    const authState = await sendToContentScriptResilient('signup-page', {
-      type: 'INSPECT_AUTH_PAGE_STATE',
-      step: 6,
-      source: 'background',
-      payload: {},
-    }, {
-      timeoutMs: 15000,
-      retryDelayMs: 500,
-      logMessage: '步骤 6：认证页状态检测未就绪，正在重试...',
-    });
-
-    if (authState?.localhostUrl && isLocalhostOAuthCallbackUrl(authState.localhostUrl)) {
-      await addLog('步骤 6：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-      await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
-      return;
-    }
-
-    if (authState?.state === 'consent') {
-      await addLog('步骤 6：认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
-      await completeStepFromBackground(6, { needsOTP: false, skippedDirectToConsent: true });
-      return;
-    }
-
-    if (authState?.state === 'add_phone') {
-      await addLog('步骤 6：资料提交后进入手机号页面属于正常中间态，将按旧逻辑刷新 OAuth 链接继续登录。', 'info');
-    }
-  }
-
-  const oauthUrl = await refreshOAuthUrlBeforeStep6(state);
-
-  await addLog('步骤 6：正在打开最新 OAuth 链接并登录...');
-  // Reuse the signup-page tab — navigate it to the OAuth URL
-  const signupTabId = await reuseOrCreateTab('signup-page', oauthUrl);
-  const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
-  if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
-    await addLog('步骤 6：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
-    return;
-  }
-
-  const postOpenAuthState = await sendToContentScriptResilient('signup-page', {
-    type: 'INSPECT_AUTH_PAGE_STATE',
-    step: 6,
-    source: 'background',
-    payload: {},
-  }, {
-    timeoutMs: 15000,
-    retryDelayMs: 500,
-    logMessage: '步骤 6：正在等待刷新后的认证页就绪...',
-  });
-
-  if (postOpenAuthState?.localhostUrl && isLocalhostOAuthCallbackUrl(postOpenAuthState.localhostUrl)) {
-    await addLog('步骤 6：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
-    return;
-  }
-
-  if (postOpenAuthState?.state === 'consent') {
-    await addLog('步骤 6：刷新后的认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(6, { needsOTP: false, skippedDirectToConsent: true });
-    return;
-  }
-
-  if (postOpenAuthState?.state === 'add_phone') {
-    await addLog('步骤 6：刷新后的认证页仍显示手机号页面，继续沿用旧逻辑重新执行登录。', 'info');
-  }
-
-  // signup-page.js will inject (same auth.openai.com domain) and handle login
-  await sendToContentScript('signup-page', {
-    type: 'EXECUTE_STEP',
-    step: 6,
-    source: 'background',
-    payload: { email: state.email, password: state.password },
-  });
-}
-
-// ============================================================
-// Step 7: Get Login Verification Code (qq-mail.js polls, then fills in chatgpt.js)
-// ============================================================
-
-async function runStep7Attempt(state) {
-  const mail = getMailConfig(state);
-  if (mail.error) throw new Error(mail.error);
-  const stepStartedAt = Date.now();
-  const authTabId = await getTabId('signup-page');
-
-  if (authTabId) {
-    await chrome.tabs.update(authTabId, { active: true });
-  } else {
-    if (!state.oauthUrl) {
-      throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
-    }
-    await reuseOrCreateTab('signup-page', state.oauthUrl);
-  }
-
-  const currentAuthTab = authTabId ? await chrome.tabs.get(authTabId).catch(() => null) : null;
-  if (isLocalhostOAuthCallbackUrl(currentAuthTab?.url)) {
-    await addLog('步骤 7：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(7, { skippedDirectToCallback: true });
-    return;
-  }
-
-  const currentAuthState = await sendToContentScriptResilient('signup-page', {
-    type: 'INSPECT_AUTH_PAGE_STATE',
-    step: 7,
-    source: 'background',
-    payload: {},
-  }, {
-    timeoutMs: 15000,
-    retryDelayMs: 500,
-    logMessage: '步骤 7：认证页状态检测未就绪，正在重试...',
-  });
-
-  if (currentAuthState?.localhostUrl && isLocalhostOAuthCallbackUrl(currentAuthState.localhostUrl)) {
-    await addLog('步骤 7：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(7, { skippedDirectToCallback: true });
-    return;
-  }
-
-  if (currentAuthState?.state === 'consent') {
-    await addLog('步骤 7：认证页已直接进入 OAuth 同意页，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(7, { skippedDirectToConsent: true });
-    return;
-  }
-
-  if (currentAuthState?.state === 'add_phone') {
-    throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
-  }
-
-  await addLog('步骤 7：正在准备认证页，必要时切换到一次性验证码登录...');
-  const prepareResult = await sendToContentScript('signup-page', {
-    type: 'PREPARE_LOGIN_CODE',
-    step: 7,
-    source: 'background',
-    payload: {},
-  });
-
-  if (prepareResult && prepareResult.error) {
-    throw new Error(prepareResult.error);
-  }
-
-  await addLog(`步骤 7：正在打开${mail.label}...`);
-
-  const alive = await isTabAlive(mail.source);
-  if (alive) {
-    if (mail.navigateOnReuse) {
-      await reuseOrCreateTab(mail.source, mail.url, {
-        inject: mail.inject,
-        injectSource: mail.injectSource,
-      });
-    } else {
-      const tabId = await getTabId(mail.source);
-      await chrome.tabs.update(tabId, { active: true });
-    }
-  } else {
-    await reuseOrCreateTab(mail.source, mail.url, {
-      inject: mail.inject,
-      injectSource: mail.injectSource,
-    });
-  }
-
-  await resolveVerificationStep(7, state, mail, {
-    filterAfterTimestamp: stepStartedAt,
-    requestFreshCodeFirst: true,
-  });
-}
-
-async function rerunStep6ForStep7Recovery() {
-  const currentState = await getState();
-  const waitForStep6 = waitForStepComplete(6, 120000);
-  await addLog('步骤 7：正在回到步骤 6，重新发起登录验证码流程...', 'warn');
-  await executeStep6(currentState);
-  await waitForStep6;
-  await sleepWithStop(3000);
-}
-
-async function executeStep7(state) {
-  let lastError = null;
-
-  for (let round = 1; round <= STEP7_RESTART_MAX_ROUNDS; round++) {
-    const currentState = round === 1 ? state : await getState();
-
-    try {
-      if (round > 1) {
-        await addLog(`步骤 7：正在进行第 ${round}/${STEP7_RESTART_MAX_ROUNDS} 轮登录验证码恢复尝试。`, 'warn');
-      }
-      await runStep7Attempt(currentState);
-      return;
-    } catch (err) {
-      lastError = err;
-
-      if (!isVerificationMailPollingError(err)) {
-        throw err;
-      }
-
-      if (round >= STEP7_RESTART_MAX_ROUNDS) {
-        break;
-      }
-
-      await addLog(`步骤 7：检测到邮箱轮询类失败，准备从步骤 6 重新开始（${round + 1}/${STEP7_RESTART_MAX_ROUNDS}）...`, 'warn');
-      await rerunStep6ForStep7Recovery();
-    }
-  }
-
-  throw lastError || new Error(`步骤 7：登录验证码流程在 ${STEP7_RESTART_MAX_ROUNDS} 轮后仍未成功。`);
-}
-
-// ============================================================
-// Step 8: 完成 OAuth（自动点击 + localhost 回调监听）
+// Step 6: 完成 OAuth（自动点击 + localhost 回调监听）
 // ============================================================
 
 let webNavListener = null;
@@ -2868,7 +2748,7 @@ async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS)
     throwIfStopped();
     const pageState = await getStep8PageState(tabId);
     if (pageState?.addPhonePage) {
-      throw new Error('步骤 8：认证页进入了手机号页面，当前不是 OAuth 同意页，无法继续自动授权。');
+      throw new Error('步骤 6：认证页进入了手机号页面，当前不是 OAuth 同意页，无法继续自动授权。');
     }
     if (pageState?.consentReady) {
       return pageState;
@@ -2876,7 +2756,7 @@ async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS)
     await sleepWithStop(250);
   }
 
-  throw new Error('步骤 8：长时间未进入 OAuth 同意页，无法定位“继续”按钮。');
+  throw new Error('步骤 6：长时间未进入 OAuth 同意页，无法定位“继续”按钮。');
 }
 
 async function prepareStep8DebuggerClick() {
@@ -2887,7 +2767,7 @@ async function prepareStep8DebuggerClick() {
   }, {
     timeoutMs: 15000,
     retryDelayMs: 600,
-    logMessage: '步骤 8：认证页正在切换，等待 OAuth 同意页按钮重新就绪...',
+    logMessage: '步骤 6：认证页正在切换，等待 OAuth 同意页按钮重新就绪...',
   });
 
   if (result?.error) {
@@ -2909,7 +2789,7 @@ async function triggerStep8ContentStrategy(strategy) {
   }, {
     timeoutMs: 15000,
     retryDelayMs: 600,
-    logMessage: '步骤 8：认证页正在切换，等待“继续”按钮重新就绪...',
+    logMessage: '步骤 6：认证页正在切换，等待“继续”按钮重新就绪...',
   });
 
   if (result?.error) {
@@ -2927,7 +2807,7 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
 
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) {
-      throw new Error('步骤 8：认证页面标签页已关闭，无法继续自动授权。');
+      throw new Error('步骤 6：认证页面标签页已关闭，无法继续自动授权。');
     }
 
     if (baselineUrl && typeof tab.url === 'string' && tab.url !== baselineUrl) {
@@ -2936,7 +2816,7 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
 
     const pageState = await getStep8PageState(tabId);
     if (pageState?.addPhonePage) {
-      throw new Error('步骤 8：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
+      throw new Error('步骤 6：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
     }
     if (pageState === null) {
       return { progressed: true, reason: 'page_reloading' };
@@ -2969,7 +2849,87 @@ async function executeStep8(state) {
     throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
   }
 
-  await addLog('步骤 8：正在监听 localhost 回调地址...');
+  const signupTabId = await getTabId('signup-page');
+  if (!signupTabId) {
+    throw new Error('认证页面标签页已关闭，无法继续步骤 6。');
+  }
+
+  await chrome.tabs.update(signupTabId, { active: true });
+
+  const authState = await sendToContentScriptResilient('signup-page', {
+    type: 'INSPECT_AUTH_PAGE_STATE',
+    step: 6,
+    source: 'background',
+    payload: {},
+  }, {
+    timeoutMs: 15000,
+    retryDelayMs: 500,
+    logMessage: '步骤 6：认证页状态检测未就绪，正在重试...',
+  });
+
+  if (authState?.localhostUrl && isLocalhostOAuthCallbackUrl(authState.localhostUrl)) {
+    await addLog('步骤 6：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(6, { localhostUrl: authState.localhostUrl, alreadyAtCallback: true });
+    return;
+  }
+
+  if (authState?.state === 'verification' || authState?.state === 'password' || authState?.state === 'email') {
+    const verificationMail = getMailConfig(state);
+    if (verificationMail.error) {
+      throw new Error(verificationMail.error);
+    }
+
+    await addLog('步骤 6：认证页仍处于登录校验阶段，正在补做登录验证码流程...', 'warn');
+    const loginVerificationResult = await resolveVerificationStep(7, state, verificationMail, {
+      filterAfterTimestamp: state.lastEmailTimestamp || state.flowStartTime || Date.now(),
+      requestFreshCodeFirst: true,
+      reportCompletion: false,
+    });
+
+    const refreshedState = await getState();
+    const latestSignupTabId = await getTabId('signup-page');
+    if (!latestSignupTabId) {
+      throw new Error('认证页面标签页已关闭，无法继续步骤 6。');
+    }
+
+    const postVerificationAuthState = await sendToContentScriptResilient('signup-page', {
+      type: 'INSPECT_AUTH_PAGE_STATE',
+      step: 6,
+      source: 'background',
+      payload: {},
+    }, {
+      timeoutMs: 15000,
+      retryDelayMs: 500,
+      logMessage: '步骤 6：登录验证码已提交，正在等待认证页切换...',
+    });
+
+    if (postVerificationAuthState?.localhostUrl && isLocalhostOAuthCallbackUrl(postVerificationAuthState.localhostUrl)) {
+      await addLog('步骤 6：登录验证码通过后已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+      await completeStepFromBackground(6, {
+        localhostUrl: postVerificationAuthState.localhostUrl,
+        alreadyAtCallback: true,
+        emailTimestamp: loginVerificationResult?.emailTimestamp,
+        code: loginVerificationResult?.code,
+      });
+      return;
+    }
+
+    if (postVerificationAuthState?.state === 'add_phone') {
+      throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
+    }
+
+    if (postVerificationAuthState?.state === 'verification' || postVerificationAuthState?.state === 'password' || postVerificationAuthState?.state === 'email') {
+      throw new Error('登录验证码流程结束后仍未进入 OAuth 同意页，请重新开始新一轮。');
+    }
+
+    return executeStep8(refreshedState);
+  }
+
+  if (authState?.state === 'add_phone') {
+    throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
+  }
+
+  await addLog('步骤 6：正在监听 localhost 回调地址...');
 
   async function completeIfCurrentTabAlreadyAtCallback(tabId, logMessage) {
     if (!tabId) return false;
@@ -2988,7 +2948,7 @@ async function executeStep8(state) {
     if (logMessage) {
       await addLog(logMessage, 'ok');
     }
-    await completeStepFromBackground(8, { localhostUrl: tab.url });
+    await completeStepFromBackground(6, { localhostUrl: tab.url });
     return true;
   }
 
@@ -3012,7 +2972,7 @@ async function executeStep8(state) {
     };
 
     const timeout = setTimeout(() => {
-      failStep8(new Error('120 秒内未捕获到 localhost 回调跳转，步骤 8 已持续重试点击“继续”但页面仍未完成授权。'));
+      failStep8(new Error('120 秒内未捕获到 localhost 回调跳转，步骤 6 已持续重试点击“继续”但页面仍未完成授权。'));
     }, 120000);
 
     webNavListener = (details) => {
@@ -3024,8 +2984,8 @@ async function executeStep8(state) {
         resolved = true;
         cleanupListener();
         clearTimeout(timeout);
-        addLog(`步骤 8：已捕获 localhost 地址：${details.url}`, 'ok').then(() => {
-          return completeStepFromBackground(8, { localhostUrl: details.url });
+        addLog(`步骤 6：已捕获 localhost 地址：${details.url}`, 'ok').then(() => {
+          return completeStepFromBackground(6, { localhostUrl: details.url });
         }).then(() => {
           resolve();
         }).catch((err) => {
@@ -3038,7 +2998,7 @@ async function executeStep8(state) {
       try {
         signupTabId = await getTabId('signup-page');
         if (signupTabId) {
-          if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 8：检测到认证页已停留在 localhost 回调地址，直接完成当前步骤。')) {
+          if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 6：检测到认证页已停留在 localhost 回调地址，直接完成当前步骤。')) {
             resolved = true;
             clearTimeout(timeout);
             cleanupListener();
@@ -3047,13 +3007,13 @@ async function executeStep8(state) {
           }
 
           await chrome.tabs.update(signupTabId, { active: true });
-          await addLog('步骤 8：已切回认证页，准备循环确认“继续”按钮直到页面真正跳转...');
+          await addLog('步骤 6：已切回认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         } else {
           signupTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
-          await addLog('步骤 8：已重新打开认证页，准备循环确认“继续”按钮直到页面真正跳转...');
+          await addLog('步骤 6：已重新打开认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         }
 
-        if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 8：检测到认证页已跳到 localhost 回调地址，直接完成当前步骤。')) {
+        if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 6：检测到认证页已跳到 localhost 回调地址，直接完成当前步骤。')) {
           resolved = true;
           clearTimeout(timeout);
           cleanupListener();
@@ -3075,7 +3035,7 @@ async function executeStep8(state) {
           const round = attempt + 1;
           attempt += 1;
 
-          await addLog(`步骤 8：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
+          await addLog(`步骤 6：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
 
           if (strategy.mode === 'debugger') {
             const clickTarget = await prepareStep8DebuggerClick();
@@ -3083,8 +3043,8 @@ async function executeStep8(state) {
               resolved = true;
               cleanupListener();
               clearTimeout(timeout);
-              await addLog(`步骤 8：内容脚本确认当前页面已是 localhost 回调地址：${clickTarget.url}`, 'ok');
-              await completeStepFromBackground(8, { localhostUrl: clickTarget.url });
+              await addLog(`步骤 6：内容脚本确认当前页面已是 localhost 回调地址：${clickTarget.url}`, 'ok');
+              await completeStepFromBackground(6, { localhostUrl: clickTarget.url });
               resolve();
               return;
             }
@@ -3105,11 +3065,11 @@ async function executeStep8(state) {
           }
 
           if (effect.progressed) {
-            await addLog(`步骤 8：检测到本次点击已生效，${getStep8EffectLabel(effect)}，继续等待 localhost 回调...`, 'info');
+            await addLog(`步骤 6：检测到本次点击已生效，${getStep8EffectLabel(effect)}，继续等待 localhost 回调...`, 'info');
             break;
           }
 
-          await addLog(`步骤 8：${strategy.label} 本次未触发页面离开同意页，准备继续重试。`, 'warn');
+          await addLog(`步骤 6：${strategy.label} 本次未触发页面离开同意页，准备继续重试。`, 'warn');
           await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
         }
       } catch (err) {
@@ -3120,21 +3080,21 @@ async function executeStep8(state) {
 }
 
 // ============================================================
-// Step 9: CPA 回调验证（通过 vps-panel.js）
+// Step 7: CPA 回调验证（通过 vps-panel.js）
 // ============================================================
 
 async function executeStep9(state) {
   if (state.localhostUrl && !isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
-    throw new Error('步骤 8 捕获到的 localhost OAuth 回调地址无效，请重新执行步骤 8。');
+    throw new Error('步骤 6 捕获到的 localhost OAuth 回调地址无效，请重新执行步骤 6。');
   }
   if (!state.localhostUrl) {
-    throw new Error('缺少 localhost 回调地址，请先完成步骤 8。');
+    throw new Error('缺少 localhost 回调地址，请先完成步骤 6。');
   }
   if (!state.vpsUrl) {
     throw new Error('尚未填写 CPA 地址，请先在侧边栏输入。');
   }
 
-  await addLog('步骤 9：正在打开 CPA 面板...');
+  await addLog('步骤 7：正在打开 CPA 面板...');
 
   const injectFiles = ['content/utils.js', 'content/vps-panel.js'];
   let tabId = await getTabId('vps-panel');
@@ -3155,16 +3115,16 @@ async function executeStep9(state) {
     inject: injectFiles,
   });
 
-  await addLog('步骤 9：正在填写回调地址...');
+  await addLog('步骤 7：正在填写回调地址...');
   const result = await sendToContentScriptResilient('vps-panel', {
     type: 'EXECUTE_STEP',
-    step: 9,
+    step: 7,
     source: 'background',
     payload: { localhostUrl: state.localhostUrl, vpsPassword: state.vpsPassword },
   }, {
     timeoutMs: 30000,
     retryDelayMs: 700,
-    logMessage: '步骤 9：CPA 面板通信未就绪，正在等待页面恢复...',
+    logMessage: '步骤 7：CPA 面板通信未就绪，正在等待页面恢复...',
   });
 
   if (result?.error) {
