@@ -3,7 +3,7 @@
 console.log('[MultiPage:duck-mail] Content script loaded on', location.href);
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type !== 'FETCH_DUCK_EMAIL') return;
+  if (message.type !== 'FETCH_DUCK_EMAIL' && message.type !== 'FETCH_GENERATED_EMAIL') return;
 
   setCurrentCommandContext(message);
   resetStopState();
@@ -25,6 +25,7 @@ async function fetchDuckEmail(payload = {}) {
   const { generateNew = true } = payload;
 
   log(`Duck 邮箱：正在${generateNew ? '生成' : '读取'}私有地址...`);
+  debugLog('Duck fetch start', { url: location.href, generateNew });
 
   await waitForElement(
     'input.AutofillSettingsPanel__PrivateDuckAddressValue, button.AutofillSettingsPanel__GeneratorButton',
@@ -39,6 +40,13 @@ async function fetchDuckEmail(payload = {}) {
     return value.includes('@duck.com') ? value : '';
   };
 
+  debugLog('Duck DOM snapshot', {
+    inputPresent: Boolean(getAddressInput()),
+    currentInputValue: getAddressInput()?.value?.trim() || '',
+    generatorPresent: Boolean(getGeneratorButton()),
+    buttons: collectButtonDebugInfo(),
+  });
+
   const waitForEmailValue = async (previousValue = '') => {
     for (let i = 0; i < 100; i++) {
       const nextValue = readEmail();
@@ -51,6 +59,7 @@ async function fetchDuckEmail(payload = {}) {
   };
 
   const currentEmail = readEmail();
+  debugLog('Duck current email snapshot', { currentEmail, generateNew });
   if (currentEmail && !generateNew) {
     log(`Duck 邮箱：已发现现有地址 ${currentEmail}`);
     return { email: currentEmail, generated: false };
@@ -59,6 +68,10 @@ async function fetchDuckEmail(payload = {}) {
   await humanPause(500, 1300);
   const generatorButton = getGeneratorButton();
   if (!generatorButton) {
+    debugLog('Duck generator button missing', {
+      currentEmail,
+      buttons: collectButtonDebugInfo(),
+    });
     if (currentEmail) {
       log(`Duck 邮箱：正在复用现有地址 ${currentEmail}`, 'warn');
       return { email: currentEmail, generated: false };
@@ -66,10 +79,21 @@ async function fetchDuckEmail(payload = {}) {
     throw new Error('未找到“生成 Duck 私有地址”按钮。');
   }
 
+  debugLog('Duck generator button found', {
+    text: (generatorButton.textContent || '').trim(),
+    aria: generatorButton.getAttribute('aria-label') || '',
+    title: generatorButton.title || '',
+    className: generatorButton.className || '',
+  });
   generatorButton.click();
   log('Duck 邮箱：已点击“生成 Duck 私有地址”按钮');
 
   const nextEmail = await waitForEmailValue(currentEmail);
+  debugLog('Duck next email snapshot', {
+    previousEmail: currentEmail,
+    nextEmail,
+    inputValue: getAddressInput()?.value?.trim() || '',
+  });
   log(`Duck 邮箱：地址已就绪 ${nextEmail}`, 'ok');
   return { email: nextEmail, generated: true };
 }

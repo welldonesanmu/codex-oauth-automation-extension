@@ -31,6 +31,7 @@ const btnClearLog = document.getElementById('btn-clear-log');
 const inputVpsUrl = document.getElementById('input-vps-url');
 const inputVpsPassword = document.getElementById('input-vps-password');
 const selectMailProvider = document.getElementById('select-mail-provider');
+const selectEmailGenerationService = document.getElementById('select-email-generation-service');
 const rowInbucketHost = document.getElementById('row-inbucket-host');
 const inputInbucketHost = document.getElementById('input-inbucket-host');
 const rowInbucketMailbox = document.getElementById('row-inbucket-mailbox');
@@ -70,6 +71,39 @@ let settingsSaveInFlight = false;
 let settingsAutoSaveTimer = null;
 let modalChoiceResolver = null;
 let currentModalActions = [];
+let currentWindowId = null;
+let currentWindowIdPromise = null;
+
+async function ensureWindowId() {
+  if (Number.isInteger(currentWindowId)) {
+    return currentWindowId;
+  }
+  if (!currentWindowIdPromise) {
+    currentWindowIdPromise = chrome.windows.getCurrent()
+      .then((win) => {
+        if (!Number.isInteger(win?.id)) {
+          throw new Error('无法获取当前窗口 ID。');
+        }
+        currentWindowId = win.id;
+        return currentWindowId;
+      })
+      .catch((err) => {
+        currentWindowIdPromise = null;
+        throw err;
+      });
+  }
+  return currentWindowIdPromise;
+}
+
+async function sendRuntimeMessage(message) {
+  const windowId = await ensureWindowId();
+  return chrome.runtime.sendMessage({
+    ...message,
+    windowId,
+  });
+}
+
+ensureWindowId().catch(() => { });
 
 const EYE_OPEN_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
 const EYE_CLOSED_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19C5 19 1 12 1 12a21.77 21.77 0 0 1 5.06-6.94"/><path d="M9.9 4.24A10.94 10.94 0 0 1 12 5c7 0 11 7 11 7a21.86 21.86 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/></svg>';
@@ -338,6 +372,7 @@ function collectSettingsPayload() {
     vpsPassword: inputVpsPassword.value,
     customPassword: inputPassword.value,
     mailProvider: selectMailProvider.value,
+    emailGenerationService: selectEmailGenerationService.value,
     inbucketHost: inputInbucketHost.value.trim(),
     inbucketMailbox: inputInbucketMailbox.value.trim(),
     autoRunSkipFailures: inputAutoSkipFailures.checked,
@@ -374,7 +409,7 @@ async function saveSettings(options = {}) {
   updateSaveButtonState();
 
   try {
-    const response = await chrome.runtime.sendMessage({
+    const response = await sendRuntimeMessage({
       type: 'SAVE_SETTING',
       source: 'sidepanel',
       payload,
@@ -477,7 +512,7 @@ function initializeManualStepActions() {
 
 async function restoreState() {
   try {
-    const state = await chrome.runtime.sendMessage({ type: 'GET_STATE', source: 'sidepanel' });
+    const state = await sendRuntimeMessage({ type: 'GET_STATE', source: 'sidepanel' });
     syncLatestState(state);
     syncAutoRunState(state);
 
@@ -501,6 +536,9 @@ async function restoreState() {
     }
     if (state.mailProvider) {
       selectMailProvider.value = state.mailProvider;
+    }
+    if (state.emailGenerationService) {
+      selectEmailGenerationService.value = state.emailGenerationService;
     }
     if (state.inbucketHost) {
       inputInbucketHost.value = state.inbucketHost;
@@ -537,10 +575,33 @@ function syncPasswordField(state) {
   inputPassword.value = state.customPassword || state.password || '';
 }
 
+function getSelectedEmailGenerationService() {
+  return (selectEmailGenerationService?.value || 'duckmail').trim().toLowerCase() || 'duckmail';
+}
+
+function getEmailGenerationServiceLabel(service = getSelectedEmailGenerationService()) {
+  if (service === 'simplelogin') return 'SimpleLogin';
+  if (service === 'addy') return 'Addy.io';
+  return 'Duck Mail';
+}
+
+function updateEmailInputPlaceholder() {
+  if (!inputEmail) return;
+  inputEmail.placeholder = `粘贴或获取 ${getEmailGenerationServiceLabel()} 邮箱`;
+}
+
+function updateAutoContinueHint() {
+  const hint = autoContinueBar?.querySelector('.auto-hint');
+  if (!hint) return;
+  hint.textContent = `先自动获取 ${getEmailGenerationServiceLabel()} 邮箱，或手动粘贴邮箱后再继续`;
+}
+
 function updateMailProviderUI() {
   const useInbucket = selectMailProvider.value === 'inbucket';
   rowInbucketHost.style.display = useInbucket ? '' : 'none';
   rowInbucketMailbox.style.display = useInbucket ? '' : 'none';
+  updateEmailInputPlaceholder();
+  updateAutoContinueHint();
 }
 
 // ============================================================
@@ -712,24 +773,28 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-async function fetchDuckEmail(options = {}) {
+async function fetchGeneratedEmail(options = {}) {
   const { showFailureToast = true } = options;
   const defaultLabel = '获取';
+  const serviceLabel = getEmailGenerationServiceLabel();
   btnFetchEmail.disabled = true;
   btnFetchEmail.textContent = '...';
 
   try {
-    const response = await chrome.runtime.sendMessage({
-      type: 'FETCH_DUCK_EMAIL',
+    const response = await sendRuntimeMessage({
+      type: 'FETCH_GENERATED_EMAIL',
       source: 'sidepanel',
-      payload: { generateNew: true },
+      payload: {
+        generateNew: true,
+        service: getSelectedEmailGenerationService(),
+      },
     });
 
     if (response?.error) {
       throw new Error(response.error);
     }
     if (!response?.email) {
-      throw new Error('未返回 Duck 邮箱。');
+      throw new Error(`未返回 ${serviceLabel} 邮箱。`);
     }
 
     inputEmail.value = response.email;
@@ -784,13 +849,13 @@ async function maybeTakeoverAutoRun(actionLabel) {
     return false;
   }
 
-  await chrome.runtime.sendMessage({ type: 'TAKEOVER_AUTO_RUN', source: 'sidepanel', payload: {} });
+  await sendRuntimeMessage({ type: 'TAKEOVER_AUTO_RUN', source: 'sidepanel', payload: {} });
   return true;
 }
 
 async function handleSkipStep(step) {
   if (isAutoRunPausedPhase()) {
-    const takeoverResponse = await chrome.runtime.sendMessage({
+    const takeoverResponse = await sendRuntimeMessage({
       type: 'TAKEOVER_AUTO_RUN',
       source: 'sidepanel',
       payload: {},
@@ -800,7 +865,7 @@ async function handleSkipStep(step) {
     }
   }
 
-  const response = await chrome.runtime.sendMessage({
+  const response = await sendRuntimeMessage({
     type: 'SKIP_STEP',
     source: 'sidepanel',
     payload: { step },
@@ -826,7 +891,7 @@ document.querySelectorAll('.step-btn').forEach(btn => {
       }
       if (step === 3) {
         if (inputPassword.value !== (latestState?.customPassword || '')) {
-          await chrome.runtime.sendMessage({
+          await sendRuntimeMessage({
             type: 'SAVE_SETTING',
             source: 'sidepanel',
             payload: { customPassword: inputPassword.value },
@@ -836,18 +901,22 @@ document.querySelectorAll('.step-btn').forEach(btn => {
         let email = inputEmail.value.trim();
         if (!email) {
           try {
-            email = await fetchDuckEmail({ showFailureToast: false });
+            email = await fetchGeneratedEmail({ showFailureToast: false });
           } catch (err) {
             showToast(`自动获取失败：${err.message}，请手动粘贴邮箱后重试。`, 'warn');
             return;
           }
         }
-        const response = await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, email } });
+        if (!email) {
+          showToast(`请先获取或粘贴 ${getEmailGenerationServiceLabel()} 邮箱。`, 'warn');
+          return;
+        }
+        const response = await sendRuntimeMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, email } });
         if (response?.error) {
           throw new Error(response.error);
         }
       } else {
-        const response = await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step } });
+        const response = await sendRuntimeMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step } });
         if (response?.error) {
           throw new Error(response.error);
         }
@@ -859,7 +928,7 @@ document.querySelectorAll('.step-btn').forEach(btn => {
 });
 
 btnFetchEmail.addEventListener('click', async () => {
-  await fetchDuckEmail().catch(() => { });
+  await fetchGeneratedEmail().catch(() => { });
 });
 
 btnTogglePassword.addEventListener('click', () => {
@@ -882,7 +951,8 @@ btnSaveSettings.addEventListener('click', async () => {
 
 btnStop.addEventListener('click', async () => {
   btnStop.disabled = true;
-  await chrome.runtime.sendMessage({ type: 'STOP_FLOW', source: 'sidepanel', payload: {} });
+  await sendRuntimeMessage({ type: 'STOP_FLOW', source: 'sidepanel', payload: {} });
+  updateButtonStates();
   showToast('正在停止当前流程...', 'warn', 2000);
 });
 
@@ -911,7 +981,7 @@ btnAutoRun.addEventListener('click', async () => {
     btnAutoRun.disabled = true;
     inputRunCount.disabled = true;
     btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> 运行中...';
-    const response = await chrome.runtime.sendMessage({
+    const response = await sendRuntimeMessage({
       type: 'AUTO_RUN',
       source: 'sidepanel',
       payload: {
@@ -933,11 +1003,11 @@ btnAutoRun.addEventListener('click', async () => {
 btnAutoContinue.addEventListener('click', async () => {
   const email = inputEmail.value.trim();
   if (!email) {
-    showToast('请先获取或粘贴 DuckDuckGo 邮箱。', 'warn');
+    showToast(`请先获取或粘贴 ${getEmailGenerationServiceLabel()} 邮箱。`, 'warn');
     return;
   }
   autoContinueBar.style.display = 'none';
-  await chrome.runtime.sendMessage({ type: 'RESUME_AUTO_RUN', source: 'sidepanel', payload: { email } });
+  await sendRuntimeMessage({ type: 'RESUME_AUTO_RUN', source: 'sidepanel', payload: { email } });
 });
 
 // Reset
@@ -952,8 +1022,8 @@ btnReset.addEventListener('click', async () => {
     return;
   }
 
-  await chrome.runtime.sendMessage({ type: 'RESET', source: 'sidepanel' });
-  syncLatestState({ stepStatuses: STEP_DEFAULT_STATUSES });
+  await sendRuntimeMessage({ type: 'RESET', source: 'sidepanel' });
+  syncLatestState({ stepStatuses: STEP_DEFAULT_STATUSES, email: null });
   syncAutoRunState({ autoRunning: false, autoRunPhase: 'idle', autoRunCurrentRun: 0, autoRunTotalRuns: 1, autoRunAttemptRun: 0 });
   displayOauthUrl.textContent = '等待中...';
   displayOauthUrl.classList.remove('has-value');
@@ -982,7 +1052,7 @@ btnClearLog.addEventListener('click', () => {
 inputEmail.addEventListener('change', async () => {
   const email = inputEmail.value.trim();
   if (email) {
-    await chrome.runtime.sendMessage({ type: 'SAVE_EMAIL', source: 'sidepanel', payload: { email } });
+    await sendRuntimeMessage({ type: 'SAVE_EMAIL', source: 'sidepanel', payload: { email } });
   }
 });
 inputEmail.addEventListener('input', updateButtonStates);
@@ -1017,6 +1087,12 @@ selectMailProvider.addEventListener('change', () => {
   saveSettings({ silent: true }).catch(() => { });
 });
 
+selectEmailGenerationService.addEventListener('change', () => {
+  updateMailProviderUI();
+  markSettingsDirty(true);
+  saveSettings({ silent: true }).catch(() => { });
+});
+
 inputInbucketMailbox.addEventListener('input', () => {
   markSettingsDirty(true);
   scheduleSettingsAutoSave();
@@ -1043,6 +1119,15 @@ inputAutoSkipFailures.addEventListener('change', () => {
 // ============================================================
 
 chrome.runtime.onMessage.addListener((message) => {
+  if (Number.isInteger(message.windowId)) {
+    if (!Number.isInteger(currentWindowId)) {
+      return;
+    }
+    if (message.windowId !== currentWindowId) {
+      return;
+    }
+  }
+
   switch (message.type) {
     case 'LOG_ENTRY':
       appendLog(message.payload);
@@ -1055,7 +1140,7 @@ chrome.runtime.onMessage.addListener((message) => {
       const step = normalizeFlowStep(message.payload.step);
       const { status } = message.payload;
       updateStepUI(step, status);
-      chrome.runtime.sendMessage({ type: 'GET_STATE', source: 'sidepanel' }).then(state => {
+      sendRuntimeMessage({ type: 'GET_STATE', source: 'sidepanel' }).then(state => {
         syncLatestState(state);
         syncAutoRunState(state);
         updateStatusDisplay(latestState);
@@ -1105,8 +1190,8 @@ chrome.runtime.onMessage.addListener((message) => {
 
     case 'DATA_UPDATED': {
       syncLatestState(message.payload);
-      if (message.payload.email) {
-        inputEmail.value = message.payload.email;
+      if (message.payload.email !== undefined) {
+        inputEmail.value = message.payload.email || '';
       }
       if (message.payload.password !== undefined) {
         inputPassword.value = message.payload.password || '';

@@ -8,6 +8,8 @@ const SCRIPT_SOURCE = (() => {
   if (hostname === 'mail.qq.com' || hostname === 'wx.mail.qq.com') return 'qq-mail';
   if (hostname === 'mail.163.com' || hostname.endsWith('.mail.163.com') || hostname === 'webmail.vip.163.com') return 'mail-163';
   if (url.includes('duckduckgo.com/email/settings/autofill')) return 'duck-mail';
+  if (hostname === 'app.simplelogin.io') return 'simplelogin-mail';
+  if (hostname === 'app.addy.io') return 'addy-mail';
   if (url.includes('chatgpt.com')) return 'chatgpt';
   // VPS panel — detected dynamically since URL is configurable
   return 'vps-panel';
@@ -267,6 +269,77 @@ function log(message, level = 'info') {
     payload: { message, level, timestamp: Date.now() },
     error: null,
   }));
+}
+
+function formatDebugLogValue(value, maxLength = 700) {
+  if (value === undefined) return '';
+
+  try {
+    const seen = new WeakSet();
+    const json = JSON.stringify(value, (_key, current) => {
+      if (typeof current === 'string') {
+        return current.length > 160 ? `${current.slice(0, 157)}...` : current;
+      }
+      if (typeof current === 'object' && current !== null) {
+        if (seen.has(current)) return '[Circular]';
+        seen.add(current);
+      }
+      return current;
+    });
+    if (!json) return '';
+    return json.length > maxLength ? `${json.slice(0, maxLength - 3)}...` : json;
+  } catch (err) {
+    return String(err?.message || err || value).slice(0, maxLength);
+  }
+}
+
+function debugLog(message, details) {
+  if (details === undefined) {
+    console.log(LOG_PREFIX, `[DEBUG] ${message}`);
+    log(`[调试] ${message}`);
+    return;
+  }
+
+  console.log(LOG_PREFIX, `[DEBUG] ${message}`, details);
+  const formatted = formatDebugLogValue(details);
+  log(`[调试] ${message}${formatted ? `｜${formatted}` : ''}`);
+}
+
+function collectButtonDebugInfo(limit = 10) {
+  return Array.from(document.querySelectorAll('button, a, [role="button"]'))
+    .map((el, index) => ({
+      index,
+      tag: el.tagName,
+      text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
+      aria: (el.getAttribute('aria-label') || '').trim().slice(0, 80),
+      title: (el.getAttribute('title') || '').trim().slice(0, 80),
+      className: typeof el.className === 'string' ? el.className.slice(0, 120) : '',
+    }))
+    .filter((item) => item.text || item.aria || item.title)
+    .slice(0, limit);
+}
+
+function collectTextEmailDebugInfo(limit = 10) {
+  const text = document.body?.innerText || '';
+  const matches = text.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/ig) || [];
+  return [...new Set(matches.map((value) => String(value || '').trim().toLowerCase()))].slice(0, limit);
+}
+
+function collectFieldDebugInfo(limit = 10) {
+  return Array.from(document.querySelectorAll('input, textarea, [data-email], [data-address], [data-testid]'))
+    .map((el, index) => ({
+      index,
+      tag: el.tagName,
+      type: el.getAttribute('type') || '',
+      name: el.getAttribute('name') || '',
+      id: el.getAttribute('id') || '',
+      value: String(el.value || el.getAttribute('value') || '').trim().slice(0, 120),
+      dataEmail: String(el.getAttribute('data-email') || '').trim().slice(0, 120),
+      dataAddress: String(el.getAttribute('data-address') || '').trim().slice(0, 120),
+      testid: String(el.getAttribute('data-testid') || '').trim().slice(0, 120),
+    }))
+    .filter((item) => item.value || item.dataEmail || item.dataAddress || item.testid)
+    .slice(0, limit);
 }
 
 /**

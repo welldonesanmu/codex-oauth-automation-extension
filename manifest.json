@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "多页面自动化",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "description": "用于自动执行多步骤 OAuth 注册流程",
   "permissions": [
     "sidePanel",
@@ -55,6 +55,20 @@
         "https://duckduckgo.com/email/settings/autofill*"
       ],
       "js": ["content/utils.js", "content/duck-mail.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://app.simplelogin.io/*"
+      ],
+      "js": ["content/utils.js", "content/simplelogin-mail.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://app.addy.io/*"
+      ],
+      "js": ["content/utils.js", "content/addy-mail.js"],
       "run_at": "document_idle"
     }
   ],
