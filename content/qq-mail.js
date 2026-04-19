@@ -51,12 +51,55 @@ function getCurrentMailIds() {
   return ids;
 }
 
+function getQqSnapshotStorageKey(payload = {}) {
+  const step = Number(payload.step) || 0;
+  const filterAfterTimestamp = Number(payload.filterAfterTimestamp || 0) || 0;
+  return `qqMailSnapshot:${step}:${filterAfterTimestamp}`;
+}
+
+async function loadPersistedMailSnapshot(payload = {}) {
+  const key = getQqSnapshotStorageKey(payload);
+  try {
+    const data = await chrome.storage.session.get(key);
+    const rawIds = Array.isArray(data[key]) ? data[key] : [];
+    return new Set(rawIds.filter(Boolean));
+  } catch (err) {
+    console.warn(QQ_MAIL_PREFIX, 'Failed to load persisted mail snapshot:', err?.message || err);
+    return new Set();
+  }
+}
+
+async function persistMailSnapshot(payload = {}, mailIds) {
+  const key = getQqSnapshotStorageKey(payload);
+  try {
+    await chrome.storage.session.set({ [key]: [...new Set(mailIds || [])] });
+  } catch (err) {
+    console.warn(QQ_MAIL_PREFIX, 'Failed to persist mail snapshot:', err?.message || err);
+  }
+}
+
+async function clearPersistedMailSnapshot(payload = {}) {
+  const key = getQqSnapshotStorageKey(payload);
+  try {
+    await chrome.storage.session.remove(key);
+  } catch (err) {
+    console.warn(QQ_MAIL_PREFIX, 'Failed to clear persisted mail snapshot:', err?.message || err);
+  }
+}
+
 // ============================================================
 // Email Polling
 // ============================================================
 
 async function handlePollEmail(step, payload) {
-  const { senderFilters, subjectFilters, maxAttempts, intervalMs, excludeCodes = [] } = payload;
+  const {
+    senderFilters,
+    subjectFilters,
+    maxAttempts,
+    intervalMs,
+    excludeCodes = [],
+    filterAfterTimestamp = 0,
+  } = payload;
   const excludedCodeSet = new Set(excludeCodes.filter(Boolean));
 
   log(`步骤 ${step}：开始轮询邮箱（最多 ${maxAttempts} 次，每 ${intervalMs / 1000} 秒一次）`);
@@ -70,8 +113,14 @@ async function handlePollEmail(step, payload) {
   }
 
   // Step 1: Snapshot existing mail IDs BEFORE we start waiting for new email
-  const existingMailIds = getCurrentMailIds();
-  log(`步骤 ${step}：已将当前 ${existingMailIds.size} 封邮件标记为旧邮件快照`);
+  let existingMailIds = await loadPersistedMailSnapshot({ step, filterAfterTimestamp });
+  if (existingMailIds.size > 0) {
+    log(`步骤 ${step}：已恢复 ${existingMailIds.size} 封旧邮件快照（跨刷新保持）。`);
+  } else {
+    existingMailIds = getCurrentMailIds();
+    await persistMailSnapshot({ step, filterAfterTimestamp }, existingMailIds);
+    log(`步骤 ${step}：已将当前 ${existingMailIds.size} 封邮件标记为旧邮件快照`);
+  }
 
   // Fallback after just 3 attempts (~10s). In practice, the email is usually
   // already in the list but has the same mailid (page was already open).
@@ -82,7 +131,10 @@ async function handlePollEmail(step, payload) {
 
     // Refresh inbox (skip on first attempt, list is fresh)
     if (attempt > 1) {
-      await refreshInbox();
+      const refreshed = await refreshInbox(step);
+      if (refreshed === 'reload-required') {
+        return { ok: false, reloadRequired: true };
+      }
       await sleep(800);
     }
 
@@ -112,6 +164,7 @@ async function handlePollEmail(step, payload) {
           }
           const source = useFallback && existingMailIds.has(mailId) ? '回退首封匹配邮件' : '新邮件';
           log(`步骤 ${step}：已找到验证码：${code}（来源：${source}，主题：${subject.slice(0, 40)}）`, 'ok');
+          await clearPersistedMailSnapshot({ step, filterAfterTimestamp });
           return { ok: true, code, emailTimestamp: Date.now(), mailId };
         }
       }
@@ -126,6 +179,7 @@ async function handlePollEmail(step, payload) {
     }
   }
 
+  await clearPersistedMailSnapshot({ step, filterAfterTimestamp });
   throw new Error(
     `${(maxAttempts * intervalMs / 1000).toFixed(0)} 秒后仍未找到新的匹配邮件。` +
     '请手动检查 QQ 邮箱，邮件可能延迟到达或进入垃圾箱。'
@@ -136,34 +190,18 @@ async function handlePollEmail(step, payload) {
 // Inbox Refresh
 // ============================================================
 
-async function refreshInbox() {
-  // Try multiple strategies to refresh the mail list
-
+async function refreshInbox(step) {
   // Strategy 1: Click any visible refresh button
   const refreshBtn = document.querySelector('[class*="refresh"], [title*="刷新"]');
   if (refreshBtn) {
     simulateClick(refreshBtn);
     console.log(QQ_MAIL_PREFIX, 'Clicked refresh button');
     await sleep(500);
-    return;
+    return 'refreshed';
   }
 
-  // Strategy 2: Click inbox in sidebar to reload list
-  const sidebarInbox = document.querySelector('a[href*="inbox"], [class*="folder-item"][class*="inbox"], [title="收件箱"]');
-  if (sidebarInbox) {
-    simulateClick(sidebarInbox);
-    console.log(QQ_MAIL_PREFIX, 'Clicked sidebar inbox');
-    await sleep(500);
-    return;
-  }
-
-  // Strategy 3: Click the folder name in toolbar
-  const folderName = document.querySelector('.toolbar-folder-name');
-  if (folderName) {
-    simulateClick(folderName);
-    console.log(QQ_MAIL_PREFIX, 'Clicked toolbar folder name');
-    await sleep(500);
-  }
+  log(`步骤 ${step}：点击收件箱不会真正刷新邮件，改由后台直接刷新 QQ 页面。`, 'warn');
+  return 'reload-required';
 }
 
 // ============================================================

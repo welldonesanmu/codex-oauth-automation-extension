@@ -3373,50 +3373,64 @@ async function pollFreshVerificationCode(windowId, step, state, mail, pollOverri
       await requestVerificationCodeResend(windowId, step);
     }
 
-    const payload = getVerificationPollPayload(step, state, {
-      ...pollOverrides,
-      filterAfterTimestamp,
-      excludeCodes: [...rejectedCodes],
-    });
+    while (true) {
+      const payload = getVerificationPollPayload(step, state, {
+        ...pollOverrides,
+        filterAfterTimestamp,
+        excludeCodes: [...rejectedCodes],
+      });
 
-    try {
-      const result = await sendToMailContentScriptResilient(
-        windowId,
-        mail,
-        {
-          type: 'POLL_EMAIL',
-          step,
-          source: 'background',
-          payload,
-        },
-        {
-          timeoutMs: getContentScriptResponseTimeoutMs({
+      try {
+        const result = await sendToMailContentScriptResilient(
+          windowId,
+          mail,
+          {
             type: 'POLL_EMAIL',
+            step,
+            source: 'background',
             payload,
-          }) + VERIFICATION_MAIL_RECOVERY_GRACE_MS,
-          maxRecoveryAttempts: 2,
+          },
+          {
+            timeoutMs: getContentScriptResponseTimeoutMs({
+              type: 'POLL_EMAIL',
+              payload,
+            }) + VERIFICATION_MAIL_RECOVERY_GRACE_MS,
+            maxRecoveryAttempts: 2,
+          }
+        );
+
+        if (result?.reloadRequired && mail.source === 'qq-mail') {
+          await addLog(windowId, `步骤 ${step}：QQ 邮箱页内刷新无效，正在直接刷新页面后继续轮询...`, 'warn');
+          await reuseOrCreateTab(windowId, mail.source, mail.url, {
+            inject: mail.inject,
+            injectSource: mail.injectSource,
+            reloadIfSameUrl: true,
+          });
+          continue;
         }
-      );
 
-      if (result && result.error) {
-        throw new Error(result.error);
-      }
+        if (result && result.error) {
+          throw new Error(result.error);
+        }
 
-      if (!result || !result.code) {
-        throw new Error(`步骤 ${step}：邮箱轮询结束，但未获取到验证码。`);
-      }
+        if (!result || !result.code) {
+          throw new Error(`步骤 ${step}：邮箱轮询结束，但未获取到验证码。`);
+        }
 
-      if (rejectedCodes.has(result.code)) {
-        throw new Error(`步骤 ${step}：再次收到了相同的${getVerificationCodeLabel(step)}验证码：${result.code}`);
-      }
+        if (rejectedCodes.has(result.code)) {
+          throw new Error(`步骤 ${step}：再次收到了相同的${getVerificationCodeLabel(step)}验证码：${result.code}`);
+        }
 
-      return result;
-    } catch (err) {
-      lastError = err;
-      await addLog(windowId, `步骤 ${step}：${err.message}`, 'warn');
-      if (round < maxRounds) {
-        await addLog(windowId, `步骤 ${step}：将重新发送验证码后重试（${round + 1}/${maxRounds}）...`, 'warn');
+        return result;
+      } catch (err) {
+        lastError = err;
+        break;
       }
+    }
+
+    await addLog(windowId, `步骤 ${step}：${lastError.message}`, 'warn');
+    if (round < maxRounds) {
+      await addLog(windowId, `步骤 ${step}：将重新发送验证码后重试（${round + 1}/${maxRounds}）...`, 'warn');
     }
   }
 
