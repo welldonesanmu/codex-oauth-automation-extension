@@ -3314,6 +3314,8 @@ function getVerificationPollPayload(step, state, overrides = {}) {
       senderFilters: ['openai', 'noreply', 'verify', 'auth', 'duckduckgo', 'forward'],
       subjectFilters: ['verify', 'verification', 'code', '楠岃瘉', 'confirm'],
       targetEmail: state.email,
+      disableFallbackToOldMail: true,
+      firstAttemptDelayMs: 3000,
       maxAttempts: 5,
       intervalMs: 3000,
       ...overrides,
