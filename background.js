@@ -1786,9 +1786,15 @@ function isVerificationMailPollingError(error) {
   return /未在 .*邮箱中找到新的匹配邮件|邮箱轮询结束，但未获取到验证码|无法获取新的(?:注册|登录)验证码|页面未能重新就绪|页面通信异常|did not respond in \d+s/i.test(message);
 }
 
+function isStep8ContinueStuckError(error) {
+  const message = getErrorMessage(error);
+  return /连续 \d+ 次点击“继续”仍未触发页面离开 OAuth 同意页/.test(message);
+}
+
 function isRestartCurrentAttemptError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
-  return /当前邮箱已存在，需要重新开始新一轮|当前流程已进入手机号页面，需要重新开始新一轮|Duck 邮箱自动获取失败，需要重新开始新一轮|认证页进入了手机号页面|点击“继续”后页面跳到了手机号页面|当前页面已进入手机号页面，不是 OAuth 授权同意页/.test(message);
+  return /当前邮箱已存在，需要重新开始新一轮|当前流程已进入手机号页面，需要重新开始新一轮|Duck 邮箱自动获取失败，需要重新开始新一轮|认证页进入了手机号页面|点击“继续”后页面跳到了手机号页面|当前页面已进入手机号页面，不是 OAuth 授权同意页/.test(message)
+    || isStep8ContinueStuckError(message);
 }
 
 function isStep9OAuthTimeoutError(error) {
@@ -2601,7 +2607,11 @@ async function executeStep(windowId, step) {
   throwIfStopped(windowId);
   await setStepStatus(windowId, normalizedStep, 'running');
   await addLog(windowId, `步骤 ${normalizedStep} 开始执行`);
-  await humanStepDelay(windowId);
+  if (normalizedStep === 6) {
+    await sleepWithStop(windowId, 900);
+  } else {
+    await humanStepDelay(windowId);
+  }
 
   const state = await getState(windowId);
 
@@ -2784,7 +2794,7 @@ const AUTO_STEP_DELAYS = {
   2: 2000,
   3: 3000,
   4: 2000,
-  5: 3000,
+  5: 0,
   6: 2000,
   7: 1000,
 };
@@ -3021,7 +3031,9 @@ async function autoRunLoop(windowId, totalRuns, options = {}) {
           ? '目标流程进入手机号页面'
           : (errorMessage.includes('Duck 邮箱自动获取失败')
             ? 'Duck 邮箱自动获取连续失败'
-            : '检测到当前邮箱已存在');
+            : (isStep8ContinueStuckError(errorMessage)
+              ? '步骤 6 连续点击“继续”无效'
+              : '检测到当前邮箱已存在'));
         await addLog(windowId, `目标 ${targetRun}/${totalRuns} 轮${restartReason}，当前线程已放弃，将重新开始新一轮。`, 'warn');
         const mailSource = getMailConfig(await getState(windowId)).source;
         await abandonCurrentAutoRunAttempt(windowId, {
@@ -3179,6 +3191,7 @@ async function executeStep1(windowId, state) {
 
   const tabId = await reuseOrCreateTab(windowId, 'vps-panel', state.vpsUrl, {
     activate: false,
+    reloadIfSameUrl: true,
   });
 
   await addLog(windowId, '步骤 1：CPA 面板已打开，正在等待页面进入目标地址...');
@@ -3645,6 +3658,8 @@ async function executeStep5(windowId, state) {
 const STEP8_CLICK_EFFECT_TIMEOUT_MS = 3500;
 const STEP8_CLICK_RETRY_DELAY_MS = 500;
 const STEP8_READY_WAIT_TIMEOUT_MS = 30000;
+const STEP8_READY_SETTLE_MS = 1000;
+const STEP8_MAX_NO_EFFECT_ATTEMPTS = 4;
 const STEP8_STRATEGIES = [
   { mode: 'content', strategy: 'requestSubmit', label: 'form.requestSubmit' },
   { mode: 'debugger', label: 'debugger click' },
@@ -3674,6 +3689,8 @@ async function getStep8PageState(windowId, tabId, responseTimeoutMs = 1500) {
 
 async function waitForStep8Ready(windowId, tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS) {
   const start = Date.now();
+  let settledSince = 0;
+  let latestReadyState = null;
 
   while (Date.now() - start < timeoutMs) {
     throwIfStopped(windowId);
@@ -3682,7 +3699,18 @@ async function waitForStep8Ready(windowId, tabId, timeoutMs = STEP8_READY_WAIT_T
       throw new Error('步骤 6：认证页进入了手机号页面，当前不是 OAuth 同意页，无法继续自动授权。');
     }
     if (pageState?.consentReady) {
-      return pageState;
+      if (!settledSince) {
+        settledSince = Date.now();
+        latestReadyState = pageState;
+      } else {
+        latestReadyState = pageState;
+        if (Date.now() - settledSince >= STEP8_READY_SETTLE_MS) {
+          return latestReadyState;
+        }
+      }
+    } else {
+      settledSince = 0;
+      latestReadyState = null;
     }
     await sleepWithStop(windowId, 250);
   }
@@ -3955,6 +3983,7 @@ async function executeStep8(windowId, state) {
         chrome.webNavigation.onBeforeNavigate.addListener(listener);
 
         let attempt = 0;
+        let noEffectAttempts = 0;
         while (!resolved) {
           const pageState = await waitForStep8Ready(windowId, activeSignupTabId);
           if (!pageState?.consentReady) {
@@ -3996,11 +4025,17 @@ async function executeStep8(windowId, state) {
           }
 
           if (effect.progressed) {
+            noEffectAttempts = 0;
             await addLog(windowId, `步骤 6：检测到本次点击已生效，${getStep8EffectLabel(effect)}，继续等待 localhost 回调...`, 'info');
             break;
           }
 
-          await addLog(windowId, `步骤 6：${strategy.label} 本次未触发页面离开同意页，准备继续重试。`, 'warn');
+          noEffectAttempts += 1;
+          if (noEffectAttempts >= STEP8_MAX_NO_EFFECT_ATTEMPTS) {
+            throw new Error(`步骤 6：连续 ${noEffectAttempts} 次点击“继续”仍未触发页面离开 OAuth 同意页，需要重新开始新一轮。`);
+          }
+
+          await addLog(windowId, `步骤 6：${strategy.label} 本次未触发页面离开同意页，准备继续重试（${noEffectAttempts}/${STEP8_MAX_NO_EFFECT_ATTEMPTS}）。`, 'warn');
           await sleepWithStop(windowId, STEP8_CLICK_RETRY_DELAY_MS);
         }
       } catch (err) {

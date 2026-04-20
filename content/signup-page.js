@@ -1022,7 +1022,7 @@ async function prepareStep8ContinueButton(options = {}) {
   const continueBtn = await findContinueButton(findTimeoutMs);
   await waitForButtonEnabled(continueBtn, enabledTimeoutMs);
 
-  await humanPause(250, 700);
+  await humanPause(350, 650);
   continueBtn.scrollIntoView({ behavior: 'auto', block: 'center' });
   continueBtn.focus();
   await waitForStableButtonRect(continueBtn);
