@@ -4046,6 +4046,18 @@ async function executeStep8(windowId, state) {
               resolve();
               return;
             }
+
+            const callbackWaitDeadline = Date.now() + 12000;
+            while (!resolved && Date.now() < callbackWaitDeadline) {
+              if (await completeIfCurrentTabAlreadyAtCallback(activeSignupTabId, '步骤 6：检测到认证页在跳转链路中已进入 localhost 回调地址，直接完成当前步骤。')) {
+                resolved = true;
+                clearTimeout(timeout);
+                cleanupListener();
+                resolve();
+                return;
+              }
+              await sleepWithStop(windowId, 300);
+            }
             break;
           }
 
