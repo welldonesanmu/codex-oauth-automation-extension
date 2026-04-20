@@ -1409,6 +1409,7 @@ function cancelPendingCommands(windowId, reason = STOP_ERROR_MESSAGE) {
 // ============================================================
 
 async function reuseOrCreateTab(windowId, source, url, options = {}) {
+  const shouldActivate = options.activate !== false;
   const alive = await isTabAlive(windowId, source);
   if (alive) {
     const tabId = await getTabId(windowId, source);
@@ -1419,7 +1420,9 @@ async function reuseOrCreateTab(windowId, source, url, options = {}) {
 
     const registry = await getTabRegistry(windowId);
     if (sameUrl) {
-      await chrome.tabs.update(tabId, { active: true });
+      if (shouldActivate) {
+        await chrome.tabs.update(tabId, { active: true });
+      }
       console.log(LOG_PREFIX, `Reused window=${windowId} tab ${source} (${tabId}) on same URL`);
 
       if (shouldReloadOnReuse) {
@@ -1466,7 +1469,11 @@ async function reuseOrCreateTab(windowId, source, url, options = {}) {
     if (registry[source]) registry[source].ready = false;
     await setState(windowId, { tabRegistry: registry });
 
-    await chrome.tabs.update(tabId, { url, active: true });
+    if (shouldActivate) {
+      await chrome.tabs.update(tabId, { url, active: true });
+    } else {
+      await chrome.tabs.update(tabId, { url });
+    }
     console.log(LOG_PREFIX, `Reused window=${windowId} tab ${source} (${tabId}), navigated to ${url.slice(0, 60)}`);
 
     await new Promise((resolve) => {
@@ -1504,7 +1511,7 @@ async function reuseOrCreateTab(windowId, source, url, options = {}) {
   }
 
   await closeConflictingTabsForSource(windowId, source, url);
-  const tab = await chrome.tabs.create({ url, active: true, windowId });
+  const tab = await chrome.tabs.create({ url, active: shouldActivate, windowId });
   console.log(LOG_PREFIX, `Created new window=${windowId} tab ${source} (${tab.id})`);
 
   if (options.inject) {
@@ -1564,7 +1571,12 @@ async function sendToContentScript(windowId, source, message, options = {}) {
 }
 
 async function sendToContentScriptResilient(windowId, source, message, options = {}) {
-  const { timeoutMs = 30000, retryDelayMs = 600, logMessage = '' } = options;
+  const {
+    timeoutMs = 30000,
+    retryDelayMs = 600,
+    logMessage = '',
+    responseTimeoutMs = undefined,
+  } = options;
   const start = Date.now();
   let lastError = null;
   let logged = false;
@@ -1585,7 +1597,7 @@ async function sendToContentScriptResilient(windowId, source, message, options =
         LOG_PREFIX,
         `[sendToContentScriptResilient] attempt ${attempt} -> ${debugLabel}, elapsed=${Date.now() - start}ms`
       );
-      const result = await sendToContentScript(windowId, source, message);
+      const result = await sendToContentScript(windowId, source, message, { responseTimeoutMs });
       console.log(
         LOG_PREFIX,
         `[sendToContentScriptResilient] success ${debugLabel} on attempt ${attempt} after ${Date.now() - start}ms`
@@ -3165,11 +3177,9 @@ async function executeStep1(windowId, state) {
 
   const injectFiles = ['content/utils.js', 'content/vps-panel.js'];
 
-  await closeConflictingTabsForSource(windowId, 'vps-panel', state.vpsUrl);
-
-  const tab = await chrome.tabs.create({ url: state.vpsUrl, active: true, windowId });
-  const tabId = tab.id;
-  await rememberSourceLastUrl(windowId, 'vps-panel', state.vpsUrl);
+  const tabId = await reuseOrCreateTab(windowId, 'vps-panel', state.vpsUrl, {
+    activate: false,
+  });
 
   await addLog(windowId, '步骤 1：CPA 面板已打开，正在等待页面进入目标地址...');
   const matchedTab = await waitForTabUrlFamily('vps-panel', tabId, state.vpsUrl, {
@@ -3212,7 +3222,9 @@ async function executeStep2(windowId, state) {
     throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
   }
   await addLog(windowId, '步骤 2：正在打开认证链接...');
-  await reuseOrCreateTab(windowId, 'signup-page', state.oauthUrl);
+  await reuseOrCreateTab(windowId, 'signup-page', state.oauthUrl, {
+    activate: false,
+  });
 
   await sendToContentScript(windowId, 'signup-page', {
     type: 'EXECUTE_STEP',
@@ -3239,12 +3251,23 @@ async function executeStep3(windowId, state) {
   accounts.push({ email: state.email, password, createdAt: new Date().toISOString() });
   await setState(windowId, { accounts });
 
+  const signupTabId = await getTabId(windowId, 'signup-page');
+  if (!signupTabId) {
+    throw new Error('认证页面标签页已关闭，无法继续步骤 3。');
+  }
+
+  await chrome.tabs.update(signupTabId, { active: true });
   await addLog(windowId, `步骤 3：正在填写邮箱 ${state.email}，密码为${state.customPassword ? '自定义' : '自动生成'}（${password.length} 位）`);
-  await sendToContentScript(windowId, 'signup-page', {
+  await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'EXECUTE_STEP',
     step: 3,
     source: 'background',
     payload: { email: state.email, password },
+  }, {
+    timeoutMs: 45000,
+    responseTimeoutMs: 30000,
+    retryDelayMs: 800,
+    logMessage: '步骤 3：认证页通信异常，正在等待页面恢复后重试...',
   });
 }
 
