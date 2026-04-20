@@ -4026,7 +4026,26 @@ async function executeStep8(windowId, state) {
 
           if (effect.progressed) {
             noEffectAttempts = 0;
-            await addLog(windowId, `步骤 6：检测到本次点击已生效，${getStep8EffectLabel(effect)}，继续等待 localhost 回调...`, 'info');
+            const effectLabel = getStep8EffectLabel(effect);
+
+            if (effect.url && isLocalhostOAuthCallbackUrl(effect.url)) {
+              resolved = true;
+              clearTimeout(timeout);
+              cleanupListener();
+              await addLog(windowId, `步骤 6：检测到本次点击已生效，${effectLabel}，并且当前已是 localhost 回调地址，直接完成当前步骤。`, 'ok');
+              await completeStepFromBackground(windowId, 6, { localhostUrl: effect.url });
+              resolve();
+              return;
+            }
+
+            await addLog(windowId, `步骤 6：检测到本次点击已生效，${effectLabel}，继续等待 localhost 回调...`, 'info');
+            if (await completeIfCurrentTabAlreadyAtCallback(activeSignupTabId, '步骤 6：检测到认证页已停留在 localhost 回调地址，直接完成当前步骤。')) {
+              resolved = true;
+              clearTimeout(timeout);
+              cleanupListener();
+              resolve();
+              return;
+            }
             break;
           }
 
