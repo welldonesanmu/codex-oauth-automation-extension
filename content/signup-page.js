@@ -349,6 +349,7 @@ async function step3_fillEmailPassword(payload) {
   await humanPause(500, 1400);
   fillInput(emailInput, email);
   log('步骤 3：邮箱已填写');
+  await humanPause(400, 1100);
 
   // Check if password field is on the same page
   let passwordInput = document.querySelector('input[type="password"]');

@@ -470,9 +470,20 @@ async function fetchAddyAlias(payload = {}) {
   await clickAddyConfirmCreateAliasButton(confirmButton);
 
   const successState = await waitForAddySuccessCopyState(20000);
-  await clickAddyButton(successState.button, 'Addy success dialog copy button found');
-  const clipboardAlias = await waitForAddyClipboardAlias(successState.alias, currentAlias, 5000);
-  const nextAlias = clipboardAlias || successState.alias || await waitForAliasChange(currentAlias);
+  let clipboardAlias = '';
+  let nextAlias = successState.alias || '';
+
+  if (!nextAlias) {
+    await clickAddyButton(successState.button, 'Addy success dialog copy button found');
+    clipboardAlias = await waitForAddyClipboardAlias('', currentAlias, 5000);
+    nextAlias = clipboardAlias || await waitForAliasChange(currentAlias);
+  } else {
+    debugLog('Addy alias read directly from success dialog', {
+      previousAlias: currentAlias,
+      modalAlias: nextAlias,
+    });
+  }
+
   await maybeCloseAddySuccessDialog(successState.container);
 
   debugLog('Addy final snapshot', {
