@@ -54,14 +54,16 @@ const PERSISTED_SETTING_DEFAULTS = {
   emailGenerationService: EMAIL_GENERATION_SERVICE_DEFAULT,
 };
 
-const PERSISTED_SETTING_KEYS = Object.keys(PERSISTED_SETTING_DEFAULTS);
+const WINDOW_SCOPED_SETTING_KEYS = Object.keys(WINDOW_SCOPED_SETTING_DEFAULTS);
 
 const DEFAULT_STATE = {
+  flowVersion: FLOW_VERSION,
   currentStep: 0, // 当前流程执行到的步骤编号。
   stepStatuses: { ...STEP_DEFAULT_STATUSES },
   oauthUrl: null, // 运行时抓取到的 OAuth 地址，不要手动预填。
   oauthSourceTabId: null, // 产生当前 OAuth 链路的 CPA 标签页。
   email: null, // 运行时邮箱，由程序自动获取并写入，不能手动预填。
+  poolBinding: null, // 当前窗口绑定的邮箱池条目：{ provider, itemId }。
   password: null, // 运行时实际密码，由 customPassword 或程序自动生成后写入。
   accounts: [], // 已生成账号记录：{ email, password, createdAt }。
   lastEmailTimestamp: null, // 最近一次获取到邮箱数据的运行时时间戳。
@@ -73,7 +75,7 @@ const DEFAULT_STATE = {
   tabRegistry: {}, // 程序维护的标签页注册表。
   sourceLastUrls: {}, // 各来源页面最近一次打开的地址记录。
   logs: [], // 侧边栏展示的运行日志。
-  ...PERSISTED_SETTING_DEFAULTS, // 合并 chrome.storage.local 中持久化保存的用户配置。
+  ...WINDOW_SCOPED_SETTING_DEFAULTS, // 当前窗口自己的侧边栏配置默认值。
   autoRunning: false, // 当前是否处于自动运行中。
   autoRunPhase: 'idle', // 当前自动运行阶段。
   autoRunCurrentRun: 0, // 自动运行当前执行到第几轮。
@@ -81,21 +83,223 @@ const DEFAULT_STATE = {
   autoRunAttemptRun: 0, // 当前轮次的重试序号。
 };
 
-async function getPersistedSettings() {
-  const stored = await chrome.storage.local.get(PERSISTED_SETTING_KEYS);
+const WINDOW_STATE_KEY_PREFIX = 'windowState:';
+const pendingCommandsByWindow = new Map();
+const stepWaitersByWindow = new Map();
+const resumeWaitersByWindow = new Map();
+const stopRequestedByWindow = new Set();
+const autoRunRuntimeByWindow = new Map();
+const step8ListenersByWindow = new Map();
+const emailPoolLocksByProvider = new Map();
+
+function getWindowStateKey(windowId) {
+  return `${WINDOW_STATE_KEY_PREFIX}${windowId}`;
+}
+
+function requireWindowId(message, sender) {
+  const candidates = [sender?.tab?.windowId, message?.windowId, message?.payload?.windowId];
+  for (const candidate of candidates) {
+    const value = Number(candidate);
+    if (Number.isInteger(value) && value >= 0) {
+      return value;
+    }
+  }
+  throw new Error('缺少 windowId，无法确定当前浏览器窗口。');
+}
+
+function getPendingCommands(windowId) {
+  if (!pendingCommandsByWindow.has(windowId)) {
+    pendingCommandsByWindow.set(windowId, new Map());
+  }
+  return pendingCommandsByWindow.get(windowId);
+}
+
+async function withEmailPoolProviderLock(provider, task) {
+  const normalizedProvider = normalizeMailProvider(provider);
+  const previous = emailPoolLocksByProvider.get(normalizedProvider) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current);
+  emailPoolLocksByProvider.set(normalizedProvider, tail);
+
+  await previous;
+  try {
+    return await task(normalizedProvider);
+  } finally {
+    release();
+    if (emailPoolLocksByProvider.get(normalizedProvider) === tail) {
+      emailPoolLocksByProvider.delete(normalizedProvider);
+    }
+  }
+}
+
+function getStepWaiters(windowId) {
+  if (!stepWaitersByWindow.has(windowId)) {
+    stepWaitersByWindow.set(windowId, new Map());
+  }
+  return stepWaitersByWindow.get(windowId);
+}
+
+function getResumeWaiter(windowId) {
+  return resumeWaitersByWindow.get(windowId) || null;
+}
+
+function setResumeWaiter(windowId, waiter) {
+  if (waiter) {
+    resumeWaitersByWindow.set(windowId, waiter);
+  } else {
+    resumeWaitersByWindow.delete(windowId);
+  }
+}
+
+function isStopRequested(windowId) {
+  return stopRequestedByWindow.has(windowId);
+}
+
+function clearStep8Listener(windowId) {
+  const listener = step8ListenersByWindow.get(windowId);
+  if (listener) {
+    chrome.webNavigation.onBeforeNavigate.removeListener(listener);
+    step8ListenersByWindow.delete(windowId);
+  }
+}
+
+function getAutoRunRuntime(windowId) {
+  if (!autoRunRuntimeByWindow.has(windowId)) {
+    autoRunRuntimeByWindow.set(windowId, {
+      active: false,
+      currentRun: 0,
+      totalRuns: 1,
+      attemptRun: 0,
+      sessionId: 0,
+      attemptSessionId: 0,
+      activeAttemptSessionId: null,
+    });
+  }
+  return autoRunRuntimeByWindow.get(windowId);
+}
+
+async function sendWindowMessage(windowId, type, payload) {
+  await chrome.runtime.sendMessage({ type, windowId, payload }).catch(() => { });
+}
+
+function pickWindowScopedSettings(state = {}) {
+  const picked = {};
+  for (const key of WINDOW_SCOPED_SETTING_KEYS) {
+    if (state[key] !== undefined) {
+      picked[key] = state[key];
+    }
+  }
+  if (picked.autoRunSkipFailures !== undefined) {
+    picked.autoRunSkipFailures = Boolean(picked.autoRunSkipFailures);
+  }
+  if (picked.mailProvider !== undefined) {
+    picked.mailProvider = normalizeMailProvider(picked.mailProvider);
+  }
+  if (picked.emailGenerationService !== undefined) {
+    picked.emailGenerationService = normalizeEmailGenerationService(picked.emailGenerationService);
+  }
+  return picked;
+}
+
+function normalizeFlowStep(step) {
+  const numericStep = Number(step) || 0;
+  if (numericStep === 8) return 6;
+  if (numericStep === 9) return 7;
+  return numericStep;
+}
+
+function isLegacyFlowState(rawState = {}) {
+  const storedVersion = Number(rawState.flowVersion || 0);
+  if (storedVersion >= FLOW_VERSION) {
+    return false;
+  }
+
+  const statuses = rawState.stepStatuses || {};
+  return Boolean(
+    Number(rawState.currentStep)
+    || statuses[6] !== undefined
+    || statuses[7] !== undefined
+    || statuses[8] !== undefined
+    || statuses[9] !== undefined
+    || rawState.localhostUrl
+    || rawState.lastLoginCode
+  );
+}
+
+function normalizeStepStatuses(statuses = {}, options = {}) {
+  const { legacy = false, localhostUrl = null } = options;
+  const normalized = { ...DEFAULT_STATE.stepStatuses };
+
+  for (let step = 1; step <= 5; step++) {
+    if (statuses[step] !== undefined) {
+      normalized[step] = statuses[step];
+    }
+  }
+
+  if (legacy) {
+    if (statuses[8] !== undefined) {
+      normalized[6] = statuses[8];
+    }
+    if (statuses[9] !== undefined) {
+      normalized[7] = statuses[9];
+    }
+  } else {
+    if (statuses[6] !== undefined) {
+      normalized[6] = statuses[6];
+    }
+    if (statuses[7] !== undefined) {
+      normalized[7] = statuses[7];
+    }
+  }
+
+  if (localhostUrl) {
+    normalized[6] = isStepDoneStatus(normalized[6]) ? normalized[6] : 'completed';
+  }
+  if (isStepDoneStatus(normalized[7]) && !isStepDoneStatus(normalized[6])) {
+    normalized[6] = 'completed';
+  }
+  return normalized;
+}
+
+function normalizeCurrentStep(currentStep, rawStepStatuses = {}, stepStatuses = normalizeStepStatuses(rawStepStatuses), options = {}) {
+  const { legacy = false } = options;
+  const numericStep = Number(currentStep) || 0;
+  if (numericStep <= 0) return 0;
+  if (numericStep > MAX_FLOW_STEP) {
+    return normalizeFlowStep(numericStep);
+  }
+  if (legacy && numericStep >= 6) {
+    return getFirstUnfinishedStep(stepStatuses) || 0;
+  }
+  return numericStep;
+}
+
+function normalizeState(rawState = {}) {
+  const rawStepStatuses = rawState.stepStatuses || {};
+  const legacy = isLegacyFlowState(rawState);
+  const stepStatuses = normalizeStepStatuses(rawStepStatuses, {
+    legacy,
+    localhostUrl: rawState.localhostUrl,
+  });
   return {
-    ...PERSISTED_SETTING_DEFAULTS,
-    ...stored,
-    autoRunSkipFailures: Boolean(stored.autoRunSkipFailures ?? PERSISTED_SETTING_DEFAULTS.autoRunSkipFailures),
+    ...rawState,
+    flowVersion: FLOW_VERSION,
+    stepStatuses,
+    currentStep: normalizeCurrentStep(rawState.currentStep, rawStepStatuses, stepStatuses, { legacy }),
   };
 }
 
-async function getState() {
-  const [state, persistedSettings] = await Promise.all([
-    chrome.storage.session.get(null),
-    getPersistedSettings(),
-  ]);
-  return { ...DEFAULT_STATE, ...persistedSettings, ...state };
+async function getWindowSessionState(windowId) {
+  const stored = await chrome.storage.session.get(getWindowStateKey(windowId));
+  return normalizeState(stored[getWindowStateKey(windowId)] || {});
+}
+
+async function getState(windowId) {
+  const state = await getWindowSessionState(windowId);
+  return { ...DEFAULT_STATE, ...state };
 }
 
 async function initializeSessionStorageAccess() {
@@ -204,35 +408,35 @@ function generatePassword() {
 // Tab Registry
 // ============================================================
 
-async function getTabRegistry() {
-  const state = await getState();
+async function getTabRegistry(windowId) {
+  const state = await getState(windowId);
   return state.tabRegistry || {};
 }
 
-async function registerTab(source, tabId) {
-  const registry = await getTabRegistry();
+async function registerTab(windowId, source, tabId) {
+  const registry = await getTabRegistry(windowId);
   registry[source] = { tabId, ready: true };
-  await setState({ tabRegistry: registry });
-  console.log(LOG_PREFIX, `Tab registered: ${source} -> ${tabId}`);
+  await setState(windowId, { tabRegistry: registry });
+  console.log(LOG_PREFIX, `Tab registered: window=${windowId} ${source} -> ${tabId}`);
 }
 
-async function isTabAlive(source) {
-  const registry = await getTabRegistry();
+async function isTabAlive(windowId, source) {
+  const registry = await getTabRegistry(windowId);
   const entry = registry[source];
   if (!entry) return false;
   try {
-    await chrome.tabs.get(entry.tabId);
-    return true;
+    const tab = await chrome.tabs.get(entry.tabId);
+    return tab?.windowId === windowId;
   } catch {
     // Tab no longer exists — clean up registry
     registry[source] = null;
-    await setState({ tabRegistry: registry });
+    await setState(windowId, { tabRegistry: registry });
     return false;
   }
 }
 
-async function getTabId(source) {
-  const registry = await getTabRegistry();
+async function getTabId(windowId, source) {
+  const registry = await getTabRegistry(windowId);
   return registry[source]?.tabId || null;
 }
 
@@ -346,24 +550,24 @@ function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
   }
 }
 
-async function rememberSourceLastUrl(source, url) {
+async function rememberSourceLastUrl(windowId, source, url) {
   if (!source || !url) return;
-  const state = await getState();
+  const state = await getState(windowId);
   const sourceLastUrls = { ...(state.sourceLastUrls || {}) };
   sourceLastUrls[source] = url;
-  await setState({ sourceLastUrls });
+  await setState(windowId, { sourceLastUrls });
 }
 
-async function closeConflictingTabsForSource(source, currentUrl, options = {}) {
+async function closeConflictingTabsForSource(windowId, source, currentUrl, options = {}) {
   const { excludeTabIds = [] } = options;
   const excluded = new Set(excludeTabIds.filter(id => Number.isInteger(id)));
-  const state = await getState();
+  const state = await getState(windowId);
   const lastUrl = state.sourceLastUrls?.[source];
   const referenceUrls = [currentUrl, lastUrl].filter(Boolean);
 
   if (!referenceUrls.length) return;
 
-  const tabs = await chrome.tabs.query({});
+  const tabs = await chrome.tabs.query({ windowId });
   const matchedIds = tabs
     .filter((tab) => Number.isInteger(tab.id) && !excluded.has(tab.id))
     .filter((tab) => referenceUrls.some((refUrl) => matchesSourceUrlFamily(source, tab.url, refUrl)))
@@ -373,21 +577,21 @@ async function closeConflictingTabsForSource(source, currentUrl, options = {}) {
 
   await chrome.tabs.remove(matchedIds).catch(() => { });
 
-  const registry = await getTabRegistry();
+  const registry = await getTabRegistry(windowId);
   if (registry[source]?.tabId && matchedIds.includes(registry[source].tabId)) {
     registry[source] = null;
-    await setState({ tabRegistry: registry });
+    await setState(windowId, { tabRegistry: registry });
   }
 
-  await addLog(`已关闭 ${matchedIds.length} 个旧的${getSourceLabel(source)}标签页。`, 'info');
+  await addLog(windowId, `已关闭 ${matchedIds.length} 个旧的${getSourceLabel(source)}标签页。`, 'info');
 }
 
-async function closeTabsByUrlPrefix(prefix, options = {}) {
+async function closeTabsByUrlPrefix(windowId, prefix, options = {}) {
   if (!prefix) return 0;
 
   const { excludeTabIds = [] } = options;
   const excluded = new Set(excludeTabIds.filter(id => Number.isInteger(id)));
-  const tabs = await chrome.tabs.query({});
+  const tabs = await chrome.tabs.query({ windowId });
   const matchedIds = tabs
     .filter((tab) => Number.isInteger(tab.id) && !excluded.has(tab.id))
     .filter((tab) => typeof tab.url === 'string' && tab.url.startsWith(prefix))
@@ -396,7 +600,7 @@ async function closeTabsByUrlPrefix(prefix, options = {}) {
   if (!matchedIds.length) return 0;
 
   await chrome.tabs.remove(matchedIds).catch(() => { });
-  await addLog(`已关闭 ${matchedIds.length} 个匹配 ${prefix} 的 localhost 残留标签页。`, 'info');
+  await addLog(windowId, `已关闭 ${matchedIds.length} 个匹配 ${prefix} 的 localhost 残留标签页。`, 'info');
   return matchedIds.length;
 }
 
@@ -434,7 +638,7 @@ async function waitForTabUrlFamily(source, tabId, referenceUrl, options = {}) {
   return null;
 }
 
-async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
+async function ensureContentScriptReadyOnTab(windowId, source, tabId, options = {}) {
   const {
     inject = null,
     injectSource = null,
@@ -450,7 +654,7 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
 
   console.log(
     LOG_PREFIX,
-    `[ensureContentScriptReadyOnTab] start ${source} tab=${tabId}, timeout=${timeoutMs}ms, inject=${Array.isArray(inject) ? inject.join(',') : 'none'}`
+    `[ensureContentScriptReadyOnTab] start window=${windowId} ${source} tab=${tabId}, timeout=${timeoutMs}ms, inject=${Array.isArray(inject) ? inject.join(',') : 'none'}`
   );
 
   while (Date.now() - start < timeoutMs) {
@@ -459,9 +663,9 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
     if (pong?.ok && (!pong.source || pong.source === source)) {
       console.log(
         LOG_PREFIX,
-        `[ensureContentScriptReadyOnTab] ready ${source} tab=${tabId} on attempt ${attempt} after ${Date.now() - start}ms`
+        `[ensureContentScriptReadyOnTab] ready window=${windowId} ${source} tab=${tabId} on attempt ${attempt} after ${Date.now() - start}ms`
       );
-      await registerTab(source, tabId);
+      await registerTab(windowId, source, tabId);
       return;
     }
 
@@ -479,10 +683,10 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
       continue;
     }
 
-    const registry = await getTabRegistry();
+    const registry = await getTabRegistry(windowId);
     if (registry[source]) {
       registry[source].ready = false;
-      await setState({ tabRegistry: registry });
+      await setState(windowId, { tabRegistry: registry });
     }
 
     try {
@@ -504,7 +708,7 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
       lastError = err;
       console.warn(
         LOG_PREFIX,
-        `[ensureContentScriptReadyOnTab] inject attempt ${attempt} failed for ${source} tab=${tabId}: ${err?.message || err}`
+        `[ensureContentScriptReadyOnTab] inject attempt ${attempt} failed for window=${windowId} ${source} tab=${tabId}: ${err?.message || err}`
       );
     }
 
@@ -512,18 +716,18 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
     if (pongAfterInject?.ok && (!pongAfterInject.source || pongAfterInject.source === source)) {
       console.log(
         LOG_PREFIX,
-        `[ensureContentScriptReadyOnTab] ready after inject ${source} tab=${tabId} on attempt ${attempt} after ${Date.now() - start}ms`
+        `[ensureContentScriptReadyOnTab] ready after inject window=${windowId} ${source} tab=${tabId} on attempt ${attempt} after ${Date.now() - start}ms`
       );
-      await registerTab(source, tabId);
+      await registerTab(windowId, source, tabId);
       return;
     }
 
     if (logMessage && !logged) {
       console.warn(
         LOG_PREFIX,
-        `[ensureContentScriptReadyOnTab] ${source} tab=${tabId} still not ready after ${Date.now() - start}ms`
+        `[ensureContentScriptReadyOnTab] window=${windowId} ${source} tab=${tabId} still not ready after ${Date.now() - start}ms`
       );
-      await addLog(logMessage, 'warn');
+      await addLog(windowId, logMessage, 'warn');
       logged = true;
     }
 
@@ -537,7 +741,6 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
 // Command Queue (for content scripts not yet ready)
 // ============================================================
 
-const pendingCommands = new Map(); // source -> { message, resolve, reject, timer }
 
 function getContentScriptResponseTimeoutMs(message) {
   if (!message || typeof message !== 'object') {
@@ -652,35 +855,38 @@ function sendTabMessageWithTimeout(tabId, source, message, responseTimeoutMs = g
   });
 }
 
-function queueCommand(source, message, timeout = 15000) {
+function queueCommand(windowId, source, message, timeout = 15000) {
   return new Promise((resolve, reject) => {
+    const pendingCommands = getPendingCommands(windowId);
     const timer = setTimeout(() => {
       pendingCommands.delete(source);
       const err = `Content script on ${source} did not respond in ${timeout / 1000}s. Try refreshing the tab and retry.`;
-      console.error(LOG_PREFIX, err);
+      console.error(LOG_PREFIX, `window=${windowId}`, err);
       reject(new Error(err));
     }, timeout);
     pendingCommands.set(source, { message, resolve, reject, timer });
-    console.log(LOG_PREFIX, `Command queued for ${source} (waiting for ready)`);
+    console.log(LOG_PREFIX, `Command queued for window=${windowId} ${source} (waiting for ready)`);
   });
 }
 
-function flushCommand(source, tabId) {
+function flushCommand(windowId, source, tabId) {
+  const pendingCommands = getPendingCommands(windowId);
   const pending = pendingCommands.get(source);
   if (pending) {
     clearTimeout(pending.timer);
     pendingCommands.delete(source);
     sendTabMessageWithTimeout(tabId, source, pending.message).then(pending.resolve).catch(pending.reject);
-    console.log(LOG_PREFIX, `Flushed queued command to ${source} (tab ${tabId})`);
+    console.log(LOG_PREFIX, `Flushed queued command to window=${windowId} ${source} (tab ${tabId})`);
   }
 }
 
-function cancelPendingCommands(reason = STOP_ERROR_MESSAGE) {
+function cancelPendingCommands(windowId, reason = STOP_ERROR_MESSAGE) {
+  const pendingCommands = getPendingCommands(windowId);
   for (const [source, pending] of pendingCommands.entries()) {
     clearTimeout(pending.timer);
     pending.reject(new Error(reason));
     pendingCommands.delete(source);
-    console.log(LOG_PREFIX, `Cancelled queued command for ${source}`);
+    console.log(LOG_PREFIX, `Cancelled queued command for window=${windowId} ${source}`);
   }
 }
 
@@ -692,13 +898,13 @@ async function reuseOrCreateTab(source, url, options = {}) {
   const shouldActivate = options.activate !== false;
   const alive = await isTabAlive(source);
   if (alive) {
-    const tabId = await getTabId(source);
-    await closeConflictingTabsForSource(source, url, { excludeTabIds: [tabId] });
+    const tabId = await getTabId(windowId, source);
+    await closeConflictingTabsForSource(windowId, source, url, { excludeTabIds: [tabId] });
     const currentTab = await chrome.tabs.get(tabId);
     const sameUrl = currentTab.url === url;
     const shouldReloadOnReuse = sameUrl && options.reloadIfSameUrl;
 
-    const registry = await getTabRegistry();
+    const registry = await getTabRegistry(windowId);
     if (sameUrl) {
       if (shouldActivate) {
         await chrome.tabs.update(tabId, { active: true });
@@ -707,7 +913,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
 
       if (shouldReloadOnReuse) {
         if (registry[source]) registry[source].ready = false;
-        await setState({ tabRegistry: registry });
+        await setState(windowId, { tabRegistry: registry });
         await chrome.tabs.reload(tabId);
 
         await new Promise((resolve) => {
@@ -723,10 +929,9 @@ async function reuseOrCreateTab(source, url, options = {}) {
         });
       }
 
-      // For dynamically injected pages like the VPS panel, re-inject immediately.
       if (options.inject) {
         if (registry[source]) registry[source].ready = false;
-        await setState({ tabRegistry: registry });
+        await setState(windowId, { tabRegistry: registry });
         if (options.injectSource) {
           await chrome.scripting.executeScript({
             target: { tabId },
@@ -743,19 +948,17 @@ async function reuseOrCreateTab(source, url, options = {}) {
         await new Promise(r => setTimeout(r, 500));
       }
 
-      await rememberSourceLastUrl(source, url);
+      await rememberSourceLastUrl(windowId, source, url);
       return tabId;
     }
 
-    // Mark as not ready BEFORE navigating — so READY signal from new page is captured correctly
     if (registry[source]) registry[source].ready = false;
-    await setState({ tabRegistry: registry });
+    await setState(windowId, { tabRegistry: registry });
 
     // Navigate existing tab to new URL
     await chrome.tabs.update(tabId, shouldActivate ? { url, active: true } : { url });
     console.log(LOG_PREFIX, `Reused tab ${source} (${tabId}), navigated to ${url.slice(0, 60)}`);
 
-    // Wait for page load complete (with 30s timeout)
     await new Promise((resolve) => {
       const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 30000);
       const listener = (tid, info) => {
@@ -768,7 +971,6 @@ async function reuseOrCreateTab(source, url, options = {}) {
       chrome.tabs.onUpdated.addListener(listener);
     });
 
-    // If dynamic injection needed (VPS panel), re-inject after navigation
     if (options.inject) {
       if (options.injectSource) {
         await chrome.scripting.executeScript({
@@ -785,10 +987,9 @@ async function reuseOrCreateTab(source, url, options = {}) {
       });
     }
 
-    // Wait a bit for content script to inject and send READY
     await new Promise(r => setTimeout(r, 500));
 
-    await rememberSourceLastUrl(source, url);
+    await rememberSourceLastUrl(windowId, source, url);
     return tabId;
   }
 
@@ -797,7 +998,6 @@ async function reuseOrCreateTab(source, url, options = {}) {
   const tab = await chrome.tabs.create({ url, active: shouldActivate });
   console.log(LOG_PREFIX, `Created new tab ${source} (${tab.id})`);
 
-  // If dynamic injection needed (VPS panel), inject scripts after load
   if (options.inject) {
     await new Promise((resolve) => {
       const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 30000);
@@ -825,7 +1025,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
     });
   }
 
-  await rememberSourceLastUrl(source, url);
+  await rememberSourceLastUrl(windowId, source, url);
   return tab.id;
 }
 
@@ -833,10 +1033,10 @@ async function reuseOrCreateTab(source, url, options = {}) {
 // Send command to content script (with readiness check)
 // ============================================================
 
-async function sendToContentScript(source, message, options = {}) {
-  const messageWithSession = withActiveAutoRunAttemptSession(message);
+async function sendToContentScript(windowId, source, message, options = {}) {
+  const messageWithSession = withActiveAutoRunAttemptSession(windowId, message);
   const { responseTimeoutMs = getContentScriptResponseTimeoutMs(messageWithSession) } = options;
-  const registry = await getTabRegistry();
+  const registry = await getTabRegistry(windowId);
   const entry = registry[source];
 
   if (!entry || !entry.ready) {
@@ -844,15 +1044,14 @@ async function sendToContentScript(source, message, options = {}) {
     return queueCommand(source, messageWithSession, Math.max(15000, responseTimeoutMs));
   }
 
-  // Verify tab is still alive
-  const alive = await isTabAlive(source);
+  const alive = await isTabAlive(windowId, source);
   if (!alive) {
     // Tab was closed — queue the command, it will be sent when tab is reopened
     console.log(LOG_PREFIX, `${source} tab was closed, queuing command`);
     return queueCommand(source, messageWithSession, Math.max(15000, responseTimeoutMs));
   }
 
-  console.log(LOG_PREFIX, `Sending to ${source} (tab ${entry.tabId}):`, messageWithSession.type);
+  console.log(LOG_PREFIX, `Sending to window=${windowId} ${source} (tab ${entry.tabId}):`, messageWithSession.type);
   return sendTabMessageWithTimeout(entry.tabId, source, messageWithSession, responseTimeoutMs);
 }
 
@@ -868,7 +1067,7 @@ async function sendToContentScriptResilient(source, message, options = {}) {
   let lastError = null;
   let logged = false;
   let attempt = 0;
-  const debugLabel = getMessageDebugLabel(source, message);
+  const debugLabel = `window=${windowId} ${getMessageDebugLabel(source, message)}`;
 
   console.log(
     LOG_PREFIX,
@@ -876,7 +1075,7 @@ async function sendToContentScriptResilient(source, message, options = {}) {
   );
 
   while (Date.now() - start < timeoutMs) {
-    throwIfStopped();
+    throwIfStopped(windowId);
     attempt += 1;
 
     try {
@@ -906,7 +1105,7 @@ async function sendToContentScriptResilient(source, message, options = {}) {
 
       lastError = err;
       if (logMessage && !logged) {
-        await addLog(logMessage, 'warn');
+        await addLog(windowId, logMessage, 'warn');
         logged = true;
       }
 
@@ -933,7 +1132,7 @@ async function sendToContentScriptResilient(source, message, options = {}) {
   throw lastError || new Error(`等待 ${getSourceLabel(source)} 重新就绪超时。`);
 }
 
-async function sendToMailContentScriptResilient(mail, message, options = {}) {
+async function sendToMailContentScriptResilient(windowId, mail, message, options = {}) {
   const defaultResponseTimeoutMs = getContentScriptResponseTimeoutMs(message);
   const responseTimeoutMs = Math.max(1000, Number(options.responseTimeoutMs) || defaultResponseTimeoutMs);
   const timeoutMs = Math.max(
@@ -947,10 +1146,10 @@ async function sendToMailContentScriptResilient(mail, message, options = {}) {
   let logged = false;
 
   while (Date.now() - start < timeoutMs) {
-    throwIfStopped();
+    throwIfStopped(windowId);
 
     try {
-      return await sendToContentScript(mail.source, message, { responseTimeoutMs });
+      return await sendToContentScript(windowId, mail.source, message, { responseTimeoutMs });
     } catch (err) {
       if (!isRetryableContentScriptTransportError(err)) {
         throw err;
@@ -958,7 +1157,7 @@ async function sendToMailContentScriptResilient(mail, message, options = {}) {
 
       lastError = err;
       if (!logged) {
-        await addLog(`步骤 ${message.step}：${mail.label} 页面通信异常，正在尝试让邮箱页重新就绪...`, 'warn');
+        await addLog(windowId, `步骤 ${message.step}：${mail.label} 页面通信异常，正在尝试让邮箱页重新就绪...`, 'warn');
         logged = true;
       }
 
@@ -967,7 +1166,7 @@ async function sendToMailContentScriptResilient(mail, message, options = {}) {
       }
 
       recoveries += 1;
-      await reuseOrCreateTab(mail.source, mail.url, {
+      await reuseOrCreateTab(windowId, mail.source, mail.url, {
         inject: mail.inject,
         injectSource: mail.injectSource,
         reloadIfSameUrl: true,
@@ -983,56 +1182,58 @@ async function sendToMailContentScriptResilient(mail, message, options = {}) {
 // Logging
 // ============================================================
 
-function bumpAutoRunSessionId() {
-  autoRunSessionId += 1;
-  return autoRunSessionId;
+function bumpAutoRunSessionId(windowId) {
+  const runtime = getAutoRunRuntime(windowId);
+  runtime.sessionId += 1;
+  return runtime.sessionId;
 }
 
-function isCurrentAutoRunSession(sessionId) {
-  return sessionId === autoRunSessionId;
+function isCurrentAutoRunSession(windowId, sessionId) {
+  return sessionId === getAutoRunRuntime(windowId).sessionId;
 }
 
-function bumpAutoRunAttemptSessionId() {
-  autoRunAttemptSessionId += 1;
-  activeAutoRunAttemptSessionId = autoRunAttemptSessionId;
-  return activeAutoRunAttemptSessionId;
+function bumpAutoRunAttemptSessionId(windowId) {
+  const runtime = getAutoRunRuntime(windowId);
+  runtime.attemptSessionId += 1;
+  runtime.activeAttemptSessionId = runtime.attemptSessionId;
+  return runtime.activeAttemptSessionId;
 }
 
-function clearActiveAutoRunAttemptSession() {
-  activeAutoRunAttemptSessionId = null;
+function clearActiveAutoRunAttemptSession(windowId) {
+  getAutoRunRuntime(windowId).activeAttemptSessionId = null;
 }
 
-function isCurrentAutoRunAttemptSession(sessionId) {
+function isCurrentAutoRunAttemptSession(windowId, sessionId) {
+  const runtime = getAutoRunRuntime(windowId);
   return Number.isInteger(sessionId)
-    && Number.isInteger(activeAutoRunAttemptSessionId)
-    && sessionId === activeAutoRunAttemptSessionId;
+    && Number.isInteger(runtime.activeAttemptSessionId)
+    && sessionId === runtime.activeAttemptSessionId;
 }
 
-function shouldIgnoreAutoRunAttemptMessage(message) {
+function shouldIgnoreAutoRunAttemptMessage(windowId, message) {
   return Number.isInteger(message?.autoRunAttemptId)
-    && !isCurrentAutoRunAttemptSession(message.autoRunAttemptId);
+    && !isCurrentAutoRunAttemptSession(windowId, message.autoRunAttemptId);
 }
 
-function withActiveAutoRunAttemptSession(message) {
-  if (!Number.isInteger(activeAutoRunAttemptSessionId)) {
+function withActiveAutoRunAttemptSession(windowId, message) {
+  const runtime = getAutoRunRuntime(windowId);
+  if (!Number.isInteger(runtime.activeAttemptSessionId)) {
     return message;
   }
   return {
     ...message,
-    autoRunAttemptId: activeAutoRunAttemptSessionId,
+    autoRunAttemptId: runtime.activeAttemptSessionId,
   };
 }
 
-async function addLog(message, level = 'info') {
-  const state = await getState();
+async function addLog(windowId, message, level = 'info') {
+  const state = await getState(windowId);
   const logs = state.logs || [];
-  const entry = { message, level, timestamp: Date.now() };
+  const entry = { message: normalizeUserFacingStepText(message), level, timestamp: Date.now() };
   logs.push(entry);
-  // Keep last 500 logs
   if (logs.length > 500) logs.splice(0, logs.length - 500);
-  await setState({ logs });
-  // Broadcast to side panel
-  chrome.runtime.sendMessage({ type: 'LOG_ENTRY', payload: entry }).catch(() => { });
+  await setState(windowId, { logs });
+  await sendWindowMessage(windowId, 'LOG_ENTRY', entry);
 }
 
 function getSourceLabel(source) {
@@ -1053,16 +1254,13 @@ function getSourceLabel(source) {
 // Step Status Management
 // ============================================================
 
-async function setStepStatus(step, status) {
-  const state = await getState();
+async function setStepStatus(windowId, step, status) {
+  const normalizedStep = normalizeFlowStep(step);
+  const state = await getState(windowId);
   const statuses = { ...state.stepStatuses };
-  statuses[step] = status;
-  await setState({ stepStatuses: statuses, currentStep: step });
-  // Broadcast to side panel
-  chrome.runtime.sendMessage({
-    type: 'STEP_STATUS_CHANGED',
-    payload: { step, status },
-  }).catch(() => { });
+  statuses[normalizedStep] = status;
+  await setState(windowId, { stepStatuses: statuses, currentStep: normalizedStep });
+  await sendWindowMessage(windowId, 'STEP_STATUS_CHANGED', { step: normalizedStep, status });
 }
 
 function isStopError(error) {
@@ -1075,6 +1273,15 @@ function isRetryableContentScriptTransportError(error) {
   return /back\/forward cache|message channel is closed|Receiving end does not exist|port closed before a response was received|A listener indicated an asynchronous response|did not respond in \d+s/i.test(message);
 }
 
+function normalizeUserFacingStepText(text) {
+  return String(text || '')
+    .replace(/STEP9_OAUTH_TIMEOUT::/g, 'STEP7_OAUTH_TIMEOUT::')
+    .replace(/步骤\s*8/g, '步骤 6')
+    .replace(/步骤\s*9/g, '步骤 7')
+    .replace(/\b[Ss]tep\s*8\b/g, 'Step 6')
+    .replace(/\b[Ss]tep\s*9\b/g, 'Step 7');
+}
+
 function getErrorMessage(error) {
   return String(typeof error === 'string' ? error : error?.message || '');
 }
@@ -1082,6 +1289,11 @@ function getErrorMessage(error) {
 function isVerificationMailPollingError(error) {
   const message = getErrorMessage(error);
   return /未在 .*邮箱中找到新的匹配邮件|邮箱轮询结束，但未获取到验证码|无法获取新的(?:注册|登录)验证码|页面未能重新就绪|页面通信异常|did not respond in \d+s/i.test(message);
+}
+
+function isStep8ContinueStuckError(error) {
+  const message = getErrorMessage(error);
+  return /连续 \d+ 次点击“继续”仍未触发页面离开 OAuth 同意页/.test(message);
 }
 
 function isRestartCurrentAttemptError(error) {
@@ -1164,10 +1376,11 @@ function getDownstreamStateResets(step) {
   return {};
 }
 
-async function invalidateDownstreamAfterStepRestart(step, options = {}) {
-  const { logLabel = `步骤 ${step} 重新执行` } = options;
-  const state = await getState();
-  const statuses = { ...(state.stepStatuses || {}) };
+async function invalidateDownstreamAfterStepRestart(windowId, step, options = {}) {
+  const normalizedStep = normalizeFlowStep(step);
+  const { logLabel = `步骤 ${normalizedStep} 重新执行` } = options;
+  const state = await getState(windowId);
+  const statuses = normalizeStepStatuses(state.stepStatuses || {});
   const changedSteps = [];
 
   for (let downstream = step + 1; downstream <= MAX_FLOW_STEP; downstream++) {
@@ -1178,32 +1391,44 @@ async function invalidateDownstreamAfterStepRestart(step, options = {}) {
   }
 
   if (changedSteps.length) {
-    await setState({ stepStatuses: statuses });
+    await setState(windowId, { stepStatuses: statuses });
     for (const downstream of changedSteps) {
-      chrome.runtime.sendMessage({
-        type: 'STEP_STATUS_CHANGED',
-        payload: { step: downstream, status: 'pending' },
-      }).catch(() => { });
+      await sendWindowMessage(windowId, 'STEP_STATUS_CHANGED', { step: downstream, status: 'pending' });
     }
-    await addLog(`${logLabel}，已重置后续步骤状态：${changedSteps.join(', ')}`, 'warn');
+    await addLog(windowId, `${logLabel}，已重置后续步骤状态：${changedSteps.join(', ')}`, 'warn');
   }
 
-  const resets = getDownstreamStateResets(step);
+  const resets = getDownstreamStateResets(normalizedStep);
   if (Object.keys(resets).length) {
-    await setState(resets);
-    broadcastDataUpdate(resets);
+    await setState(windowId, resets);
+    await broadcastDataUpdate(windowId, resets);
   }
 }
 
-function clearStopRequest() {
-  stopRequested = false;
+function clearStopRequest(windowId) {
+  stopRequestedByWindow.delete(windowId);
 }
 
-function getAutoRunStatusPayload(phase, payload = {}) {
-  const currentRun = payload.currentRun ?? autoRunCurrentRun;
-  const totalRuns = payload.totalRuns ?? autoRunTotalRuns;
-  const attemptRun = payload.attemptRun ?? autoRunAttemptRun;
+function cleanupWindowRuntime(windowId) {
+  pendingCommandsByWindow.delete(windowId);
+  stepWaitersByWindow.delete(windowId);
+  resumeWaitersByWindow.delete(windowId);
+  stopRequestedByWindow.delete(windowId);
+  autoRunRuntimeByWindow.delete(windowId);
+  clearStep8Listener(windowId);
+}
+
+function getAutoRunStatusPayload(windowId, phase, payload = {}) {
+  const runtime = getAutoRunRuntime(windowId);
+  const currentRun = payload.currentRun ?? runtime.currentRun;
+  const totalRuns = payload.totalRuns ?? runtime.totalRuns;
+  const attemptRun = payload.attemptRun ?? runtime.attemptRun;
   const autoRunning = phase === 'running' || phase === 'waiting_email' || phase === 'retrying';
+
+  runtime.currentRun = currentRun;
+  runtime.totalRuns = totalRuns;
+  runtime.attemptRun = attemptRun;
+  runtime.active = autoRunning;
 
   return {
     autoRunning,
@@ -1214,19 +1439,17 @@ function getAutoRunStatusPayload(phase, payload = {}) {
   };
 }
 
-async function broadcastAutoRunStatus(phase, payload = {}) {
+async function broadcastAutoRunStatus(windowId, phase, payload = {}) {
+  const runtime = getAutoRunRuntime(windowId);
   const statusPayload = {
     phase,
-    currentRun: payload.currentRun ?? autoRunCurrentRun,
-    totalRuns: payload.totalRuns ?? autoRunTotalRuns,
-    attemptRun: payload.attemptRun ?? autoRunAttemptRun,
+    currentRun: payload.currentRun ?? runtime.currentRun,
+    totalRuns: payload.totalRuns ?? runtime.totalRuns,
+    attemptRun: payload.attemptRun ?? runtime.attemptRun,
   };
 
-  await setState(getAutoRunStatusPayload(phase, statusPayload));
-  chrome.runtime.sendMessage({
-    type: 'AUTO_RUN_STATUS',
-    payload: statusPayload,
-  }).catch(() => { });
+  await setState(windowId, getAutoRunStatusPayload(windowId, phase, statusPayload));
+  await sendWindowMessage(windowId, 'AUTO_RUN_STATUS', statusPayload);
 }
 
 function isAutoRunLockedState(state) {
@@ -1237,8 +1460,8 @@ function isAutoRunPausedState(state) {
   return Boolean(state.autoRunning) && state.autoRunPhase === 'waiting_email';
 }
 
-async function ensureManualInteractionAllowed(actionLabel) {
-  const state = await getState();
+async function ensureManualInteractionAllowed(windowId, actionLabel) {
+  const state = await getState(windowId);
 
   if (isAutoRunLockedState(state)) {
     throw new Error(`自动流程运行中，请先停止后再${actionLabel}。`);
@@ -1250,52 +1473,53 @@ async function ensureManualInteractionAllowed(actionLabel) {
   return state;
 }
 
-async function skipStep(step) {
-  const state = await ensureManualInteractionAllowed('跳过步骤');
+async function skipStep(windowId, step) {
+  const state = await ensureManualInteractionAllowed(windowId, '跳过步骤');
+  const normalizedStep = normalizeFlowStep(step);
 
-  if (!Number.isInteger(step) || step < 1 || step > 9) {
+  if (!Number.isInteger(normalizedStep) || normalizedStep < 1 || normalizedStep > MAX_FLOW_STEP) {
     throw new Error(`无效步骤：${step}`);
   }
 
-  const statuses = { ...(state.stepStatuses || {}) };
-  const currentStatus = statuses[step];
+  const statuses = normalizeStepStatuses(state.stepStatuses || {});
+  const currentStatus = statuses[normalizedStep];
   if (currentStatus === 'running') {
-    throw new Error(`步骤 ${step} 正在运行中，不能跳过。`);
+    throw new Error(`步骤 ${normalizedStep} 正在运行中，不能跳过。`);
   }
   if (isStepDoneStatus(currentStatus)) {
-    throw new Error(`步骤 ${step} 已完成，无需再跳过。`);
+    throw new Error(`步骤 ${normalizedStep} 已完成，无需再跳过。`);
   }
 
-  if (step > 1) {
-    const prevStatus = statuses[step - 1];
+  if (normalizedStep > 1) {
+    const prevStatus = statuses[normalizedStep - 1];
     if (!isStepDoneStatus(prevStatus)) {
-      throw new Error(`请先完成步骤 ${step - 1}，再跳过步骤 ${step}。`);
+      throw new Error(`请先完成步骤 ${normalizedStep - 1}，再跳过步骤 ${normalizedStep}。`);
     }
   }
 
-  await setStepStatus(step, 'skipped');
-  await addLog(`步骤 ${step} 已跳过`, 'warn');
+  await setStepStatus(windowId, normalizedStep, 'skipped');
+  await addLog(windowId, `步骤 ${normalizedStep} 已跳过`, 'warn');
 
   return { ok: true, step, status: 'skipped' };
 }
 
-function throwIfStopped() {
-  if (stopRequested) {
+function throwIfStopped(windowId) {
+  if (isStopRequested(windowId)) {
     throw new Error(STOP_ERROR_MESSAGE);
   }
 }
 
-async function sleepWithStop(ms) {
+async function sleepWithStop(windowId, ms) {
   const start = Date.now();
   while (Date.now() - start < ms) {
-    throwIfStopped();
+    throwIfStopped(windowId);
     await new Promise(r => setTimeout(r, Math.min(100, ms - (Date.now() - start))));
   }
 }
 
-async function humanStepDelay(min = HUMAN_STEP_DELAY_MIN, max = HUMAN_STEP_DELAY_MAX) {
+async function humanStepDelay(windowId, min = HUMAN_STEP_DELAY_MIN, max = HUMAN_STEP_DELAY_MAX) {
   const duration = Math.floor(Math.random() * (max - min + 1)) + min;
-  await sleepWithStop(duration);
+  await sleepWithStop(windowId, duration);
 }
 
 async function clickWithDebugger(tabId, rect) {
@@ -1350,12 +1574,14 @@ async function clickWithDebugger(tabId, rect) {
   }
 }
 
-async function broadcastStopToContentScripts() {
-  const registry = await getTabRegistry();
+async function broadcastStopToContentScripts(windowId) {
+  const registry = await getTabRegistry(windowId);
   for (const entry of Object.values(registry)) {
     if (!entry?.tabId) continue;
     try {
-      await chrome.tabs.sendMessage(entry.tabId, withActiveAutoRunAttemptSession({
+      const tab = await chrome.tabs.get(entry.tabId);
+      if (!tab || tab.windowId !== windowId) continue;
+      await chrome.tabs.sendMessage(entry.tabId, withActiveAutoRunAttemptSession(windowId, {
         type: 'STOP_FLOW',
         source: 'background',
         payload: {},
@@ -1364,10 +1590,10 @@ async function broadcastStopToContentScripts() {
   }
 }
 
-async function clearTabRegistrySources(sources = []) {
+async function clearTabRegistrySources(windowId, sources = []) {
   const uniqueSources = [...new Set(sources.filter(Boolean))];
   if (!uniqueSources.length) return;
-  const registry = await getTabRegistry();
+  const registry = await getTabRegistry(windowId);
   let changed = false;
   for (const source of uniqueSources) {
     if (registry[source]) {
@@ -1376,48 +1602,52 @@ async function clearTabRegistrySources(sources = []) {
     }
   }
   if (changed) {
-    await setState({ tabRegistry: registry });
+    await setState(windowId, { tabRegistry: registry });
   }
 }
 
-async function abandonCurrentAutoRunAttempt({ targetRun, totalRuns, attemptRun, reason, mailSource }) {
-  cancelPendingCommands(reason || '当前尝试已放弃。');
-  await broadcastStopToContentScripts();
-  await markRunningStepsStopped();
+async function abandonCurrentAutoRunAttempt(windowId, { targetRun, totalRuns, attemptRun, reason, mailSource }) {
+  const boundItem = await getBoundPoolItem(windowId);
+  if (boundItem) {
+    await abandonBoundPoolItem(windowId, reason || '当前尝试已放弃。');
+  }
 
-  const state = await getState();
+  cancelPendingCommands(windowId, reason || '当前尝试已放弃。');
+  await broadcastStopToContentScripts(windowId);
+  await markRunningStepsStopped(windowId);
+
+  const state = await getState(windowId);
   const sourcesToClose = ['signup-page'];
   if (mailSource) {
     sourcesToClose.push(mailSource);
   }
 
   for (const source of sourcesToClose) {
-    const tabId = await getTabId(source);
+    const tabId = await getTabId(windowId, source);
     if (tabId) {
       await chrome.tabs.remove(tabId).catch(() => { });
     }
   }
 
   const signupReferenceUrl = state.oauthUrl || state.sourceLastUrls?.['signup-page'] || 'https://auth.openai.com/';
-  await closeConflictingTabsForSource('signup-page', signupReferenceUrl).catch(() => { });
+  await closeConflictingTabsForSource(windowId, 'signup-page', signupReferenceUrl).catch(() => { });
 
   if (mailSource) {
     const mail = getMailConfig(state);
     if (!mail.error && mail.source === mailSource && mail.url) {
-      await closeConflictingTabsForSource(mailSource, mail.url).catch(() => { });
+      await closeConflictingTabsForSource(windowId, mailSource, mail.url).catch(() => { });
     }
   }
 
-  await clearTabRegistrySources(sourcesToClose);
-  clearActiveAutoRunAttemptSession();
-  await broadcastAutoRunStatus('retrying', {
+  await clearTabRegistrySources(windowId, sourcesToClose);
+  clearActiveAutoRunAttemptSession(windowId);
+  await broadcastAutoRunStatus(windowId, 'retrying', {
     currentRun: targetRun,
     totalRuns,
     attemptRun,
   });
 }
 
-let stopRequested = false;
 
 // ============================================================
 // Message Handler (central router)
@@ -1436,25 +1666,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true; // async response
 });
 
+chrome.windows.onRemoved.addListener((windowId) => {
+  cleanupWindowRuntime(windowId);
+});
+
 async function handleMessage(message, sender) {
+  const windowId = requireWindowId(message, sender);
   switch (message.type) {
     case 'CONTENT_SCRIPT_READY': {
       const tabId = sender.tab?.id;
       if (tabId && message.source) {
-        await registerTab(message.source, tabId);
-        flushCommand(message.source, tabId);
-        await addLog(`内容脚本已就绪：${getSourceLabel(message.source)}（标签页 ${tabId}）`);
+        await registerTab(windowId, message.source, tabId);
+        flushCommand(windowId, message.source, tabId);
+        await addLog(windowId, `内容脚本已就绪：${getSourceLabel(message.source)}（标签页 ${tabId}）`);
       }
       return { ok: true };
     }
 
     case 'LOG': {
-      if (shouldIgnoreAutoRunAttemptMessage(message)) {
-        console.log(LOG_PREFIX, `Ignored stale LOG from ${message.source}`, message);
+      if (shouldIgnoreAutoRunAttemptMessage(windowId, message)) {
+        console.log(LOG_PREFIX, `Ignored stale LOG from window=${windowId} ${message.source}`, message);
         return { ok: true, ignored: true };
       }
       const { message: msg, level } = message.payload;
-      await addLog(`[${getSourceLabel(message.source)}] ${msg}`, level);
+      await addLog(windowId, `[${getSourceLabel(message.source)}] ${msg}`, level);
       return { ok: true };
     }
 
@@ -1478,69 +1713,93 @@ async function handleMessage(message, sender) {
     }
 
     case 'STEP_COMPLETE': {
-      if (shouldIgnoreAutoRunAttemptMessage(message)) {
-        console.log(LOG_PREFIX, `Ignored stale STEP_COMPLETE for step ${message.step} from ${message.source}`, message);
+      if (shouldIgnoreAutoRunAttemptMessage(windowId, message)) {
+        console.log(LOG_PREFIX, `Ignored stale STEP_COMPLETE for window=${windowId} step ${message.step} from ${message.source}`, message);
         return { ok: true, ignored: true };
       }
-      if (stopRequested) {
-        await setStepStatus(message.step, 'stopped');
-        notifyStepError(message.step, STOP_ERROR_MESSAGE);
+      const step = normalizeFlowStep(message.step);
+      if (isStopRequested(windowId)) {
+        await setStepStatus(windowId, step, 'stopped');
+        notifyStepError(windowId, step, STOP_ERROR_MESSAGE);
         return { ok: true };
       }
-      await setStepStatus(message.step, 'completed');
-      await addLog(`步骤 ${message.step} 已完成`, 'ok');
-      await handleStepData(message.step, message.payload);
-      notifyStepComplete(message.step, message.payload);
+      await setStepStatus(windowId, step, 'completed');
+      await addLog(windowId, `步骤 ${step} 已完成`, 'ok');
+      await handleStepData(windowId, step, message.payload);
+      if (step === MAX_FLOW_STEP) {
+        const state = await getState(windowId);
+        const boundItem = await getBoundPoolItem(windowId);
+        if (boundItem) {
+          await markBoundPoolItemSuccess(windowId, {
+            email: boundItem.email,
+            localhostUrl: state.localhostUrl,
+            completedAt: new Date().toISOString(),
+          });
+          await setEmailState(windowId, null);
+        }
+      }
+      notifyStepComplete(windowId, step, message.payload);
       return { ok: true };
     }
 
     case 'STEP_ERROR': {
-      if (shouldIgnoreAutoRunAttemptMessage(message)) {
-        console.log(LOG_PREFIX, `Ignored stale STEP_ERROR for step ${message.step} from ${message.source}`, message);
+      if (shouldIgnoreAutoRunAttemptMessage(windowId, message)) {
+        console.log(LOG_PREFIX, `Ignored stale STEP_ERROR for window=${windowId} step ${message.step} from ${message.source}`, message);
         return { ok: true, ignored: true };
       }
+      const step = normalizeFlowStep(message.step);
       if (isStopError(message.error)) {
-        await setStepStatus(message.step, 'stopped');
-        await addLog(`步骤 ${message.step} 已被用户停止`, 'warn');
-        notifyStepError(message.step, message.error);
+        await setStepStatus(windowId, step, 'stopped');
+        await addLog(windowId, `步骤 ${step} 已被用户停止`, 'warn');
+        notifyStepError(windowId, step, message.error);
       } else {
-        await setStepStatus(message.step, 'failed');
-        await addLog(`步骤 ${message.step} 失败：${message.error}`, 'error');
-        notifyStepError(message.step, message.error);
+        if (await getBoundPoolItem(windowId)) {
+          await markBoundPoolItemFailed(windowId, message.error);
+          await setEmailState(windowId, null);
+        }
+        await setStepStatus(windowId, step, 'failed');
+        await addLog(windowId, `步骤 ${step} 失败：${normalizeUserFacingStepText(message.error)}`, 'error');
+        notifyStepError(windowId, step, message.error);
       }
       return { ok: true };
     }
 
     case 'GET_STATE': {
-      return await getState();
+      return await buildStateResponse(windowId);
     }
 
     case 'RESET': {
-      clearStopRequest();
-      await resetState();
-      await addLog('流程已重置', 'info');
+      clearStopRequest(windowId);
+      clearStep8Listener(windowId);
+      await resetState(windowId);
+      await addLog(windowId, '流程已重置', 'info');
       return { ok: true };
     }
 
     case 'EXECUTE_STEP': {
-      clearStopRequest();
+      clearStopRequest(windowId);
       if (message.source === 'sidepanel') {
-        await ensureManualInteractionAllowed('手动执行步骤');
+        await ensureManualInteractionAllowed(windowId, '手动执行步骤');
       }
-      const step = message.payload.step;
+      const step = normalizeFlowStep(message.payload.step);
       if (message.source === 'sidepanel') {
-        await invalidateDownstreamAfterStepRestart(step, { logLabel: `步骤 ${step} 重新执行` });
+        await invalidateDownstreamAfterStepRestart(windowId, step, { logLabel: `步骤 ${step} 重新执行` });
       }
-      // Save email if provided (from side panel step 3)
       if (message.payload.email) {
-        await setEmailState(message.payload.email);
+        await bindManualEmailToState(windowId, message.payload.email, {
+          reason: '当前池条目已被手动执行邮箱覆盖。',
+          keepBoundItem: step === 3,
+        });
       }
-      await executeStep(step);
+      if (step === 3) {
+        await setState(windowId, { emailGenerationService: normalizeEmailGenerationService((await getState(windowId)).emailGenerationService) });
+      }
+      await executeStep(windowId, step);
       return { ok: true };
     }
 
     case 'AUTO_RUN': {
-      clearStopRequest();
+      clearStopRequest(windowId);
       const totalRuns = message.payload?.totalRuns || 1;
       const autoRunSkipFailures = Boolean(message.payload?.autoRunSkipFailures);
       const mode = message.payload?.mode === 'continue' ? 'continue' : 'restart';
@@ -1552,23 +1811,23 @@ async function handleMessage(message, sender) {
     }
 
     case 'RESUME_AUTO_RUN': {
-      clearStopRequest();
+      clearStopRequest(windowId);
       if (message.payload.email) {
-        await setEmailState(message.payload.email);
+        await setEmailState(windowId, message.payload.email);
       }
-      resumeAutoRun();  // fire-and-forget
+      resumeAutoRun(windowId);
       return { ok: true };
     }
 
     case 'TAKEOVER_AUTO_RUN': {
-      await requestStop({ logMessage: '已确认手动接管，正在停止自动流程并切换为手动控制...' });
-      await addLog('自动流程已切换为手动控制。', 'warn');
+      await requestStop(windowId, { logMessage: '已确认手动接管，正在停止自动流程并切换为手动控制...' });
+      await addLog(windowId, '自动流程已切换为手动控制。', 'warn');
       return { ok: true };
     }
 
     case 'SKIP_STEP': {
       const step = Number(message.payload?.step);
-      return await skipStep(step);
+      return await skipStep(windowId, step);
     }
 
     case 'SAVE_SETTING': {
@@ -1584,15 +1843,16 @@ async function handleMessage(message, sender) {
       return { ok: true };
     }
 
-    // Side panel data updates
     case 'SAVE_EMAIL': {
-      const state = await getState();
+      const state = await getState(windowId);
       if (isAutoRunLockedState(state)) {
         throw new Error('自动流程运行中，当前不能手动修改邮箱。');
       }
-      await setEmailState(message.payload.email);
-      await resumeAutoRun();
-      return { ok: true, email: message.payload.email };
+      const email = await bindManualEmailToState(windowId, message.payload.email, {
+        reason: '当前池条目已被手动邮箱覆盖。',
+      });
+      await resumeAutoRun(windowId);
+      return { ok: true, email };
     }
 
     case 'DEBUGGER_CLICK_CURRENT_TAB': {
@@ -1612,8 +1872,8 @@ async function handleMessage(message, sender) {
 
     case 'FETCH_GENERATED_EMAIL':
     case 'FETCH_DUCK_EMAIL': {
-      clearStopRequest();
-      const state = await getState();
+      clearStopRequest(windowId);
+      const state = await getState(windowId);
       if (isAutoRunLockedState(state)) {
         throw new Error('自动流程运行中，当前不能手动获取邮箱。');
       }
@@ -1622,8 +1882,78 @@ async function handleMessage(message, sender) {
       return { ok: true, email };
     }
 
+    case 'GET_EMAIL_POOL_SUMMARY': {
+      const state = await getState(windowId);
+      const provider = normalizeMailProvider(message.payload?.provider || state.mailProvider);
+      const [summary, summaries, boundPoolItem] = await Promise.all([
+        getEmailPoolSummary(provider),
+        getAllEmailPoolSummaries(),
+        getBoundPoolItem(windowId),
+      ]);
+      return { ok: true, provider, summary, summaries, boundPoolItem };
+    }
+
+    case 'IMPORT_EMAIL_POOL': {
+      const state = await getState(windowId);
+      const result = await importEmailPoolData(message.payload?.data, message.payload?.provider || state.mailProvider);
+      await broadcastPoolState(windowId, message.payload?.provider || state.mailProvider);
+      return { ok: true, ...result };
+    }
+
+    case 'EXPORT_EMAIL_POOL': {
+      const state = await getState(windowId);
+      const provider = normalizeMailProvider(message.payload?.provider || state.mailProvider);
+      const pool = await getEmailPool(provider);
+      return { ok: true, provider, pool };
+    }
+
+    case 'GENERATE_POOL_EMAILS': {
+      clearStopRequest(windowId);
+      const state = await getState(windowId);
+      if (isAutoRunLockedState(state)) {
+        throw new Error('自动流程运行中，当前不能批量生成邮箱池。');
+      }
+      const result = await generateEmailPoolItems(windowId, message.payload || {});
+      return { ok: true, ...result };
+    }
+
+    case 'CLAIM_NEXT_POOL_ITEM': {
+      const state = await getState(windowId);
+      if (isAutoRunLockedState(state)) {
+        throw new Error('自动流程运行中，当前不能手动领取邮箱池条目。');
+      }
+      const provider = normalizeMailProvider(message.payload?.provider || state.mailProvider);
+      const item = await claimNextEmailPoolItem(windowId, provider);
+      const summaries = await getAllEmailPoolSummaries();
+      if (!item) {
+        return {
+          ok: true,
+          provider,
+          item: null,
+          summary: await getEmailPoolSummary(provider),
+          summaries,
+        };
+      }
+      return {
+        ok: true,
+        provider,
+        item,
+        summary: await getEmailPoolSummary(provider),
+        summaries,
+      };
+    }
+
+    case 'ABANDON_CURRENT_POOL_ITEM': {
+      const state = await getState(windowId);
+      if (isAutoRunLockedState(state)) {
+        throw new Error('自动流程运行中，当前不能手动放弃邮箱池条目。');
+      }
+      const item = await abandonBoundPoolItem(windowId, message.payload?.reason || '已手动放弃当前邮箱池条目。');
+      return { ok: true, item };
+    }
+
     case 'STOP_FLOW': {
-      await requestStop();
+      await requestStop(windowId);
       return { ok: true };
     }
 
@@ -1637,20 +1967,21 @@ async function handleMessage(message, sender) {
 // Step Data Handlers
 // ============================================================
 
-async function handleStepData(step, payload) {
-  switch (step) {
+async function handleStepData(windowId, step, payload) {
+  const normalizedStep = normalizeFlowStep(step);
+  switch (normalizedStep) {
     case 1:
       if (payload.oauthUrl) {
-        await setState({ oauthUrl: payload.oauthUrl });
-        broadcastDataUpdate({ oauthUrl: payload.oauthUrl });
+        await setState(windowId, { oauthUrl: payload.oauthUrl });
+        await broadcastDataUpdate(windowId, { oauthUrl: payload.oauthUrl });
       }
       break;
     case 2:
     case 3:
-      if (payload.email) await setEmailState(payload.email);
+      if (payload.email) await setEmailState(windowId, payload.email);
       break;
     case 4:
-      if (payload.emailTimestamp) await setState({ lastEmailTimestamp: payload.emailTimestamp });
+      if (payload.emailTimestamp) await setState(windowId, { lastEmailTimestamp: payload.emailTimestamp });
       break;
     case 5:
     case 7:
@@ -1688,7 +2019,7 @@ async function handleStepData(step, payload) {
     case 10: {
       const localhostPrefix = buildLocalhostCleanupPrefix(payload.localhostUrl);
       if (localhostPrefix) {
-        await closeTabsByUrlPrefix(localhostPrefix);
+        await closeTabsByUrlPrefix(windowId, localhostPrefix);
       }
       break;
     }
@@ -1699,99 +2030,112 @@ async function handleStepData(step, payload) {
 // Step Completion Waiting
 // ============================================================
 
-// Map of step -> { resolve, reject } for waiting on step completion
-const stepWaiters = new Map();
-let resumeWaiter = null;
 const AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS = 120000;
 const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([4, 6, 8, 9]);
 
-function waitForStepComplete(step, timeoutMs = 120000) {
+function waitForStepComplete(windowId, step, timeoutMs = 120000) {
+  const normalizedStep = normalizeFlowStep(step);
+  const stepWaiters = getStepWaiters(windowId);
   return new Promise((resolve, reject) => {
-    throwIfStopped();
-    if (stepWaiters.has(step)) {
-      console.warn(LOG_PREFIX, `[waitForStepComplete] replacing existing waiter for step ${step}`);
+    throwIfStopped(windowId);
+    if (stepWaiters.has(normalizedStep)) {
+      console.warn(LOG_PREFIX, `[waitForStepComplete] replacing existing waiter for window=${windowId} step ${normalizedStep}`);
     }
-    console.log(LOG_PREFIX, `[waitForStepComplete] register step ${step}, timeout=${timeoutMs}ms`);
+    console.log(LOG_PREFIX, `[waitForStepComplete] register window=${windowId} step ${normalizedStep}, timeout=${timeoutMs}ms`);
     const timer = setTimeout(() => {
-      stepWaiters.delete(step);
-      console.warn(LOG_PREFIX, `[waitForStepComplete] timeout for step ${step} after ${timeoutMs}ms`);
-      reject(new Error(`Step ${step} timed out after ${timeoutMs / 1000}s`));
+      stepWaiters.delete(normalizedStep);
+      console.warn(LOG_PREFIX, `[waitForStepComplete] timeout for window=${windowId} step ${normalizedStep} after ${timeoutMs}ms`);
+      reject(new Error(`Step ${normalizedStep} timed out after ${timeoutMs / 1000}s`));
     }, timeoutMs);
 
-    stepWaiters.set(step, {
-      resolve: (data) => { clearTimeout(timer); stepWaiters.delete(step); resolve(data); },
-      reject: (err) => { clearTimeout(timer); stepWaiters.delete(step); reject(err); },
+    stepWaiters.set(normalizedStep, {
+      resolve: (data) => { clearTimeout(timer); stepWaiters.delete(normalizedStep); resolve(data); },
+      reject: (err) => { clearTimeout(timer); stepWaiters.delete(normalizedStep); reject(err); },
     });
   });
 }
 
-function notifyStepComplete(step, payload) {
-  const waiter = stepWaiters.get(step);
-  console.log(LOG_PREFIX, `[notifyStepComplete] step ${step}, hasWaiter=${Boolean(waiter)}`);
+function notifyStepComplete(windowId, step, payload) {
+  const normalizedStep = normalizeFlowStep(step);
+  const waiter = getStepWaiters(windowId).get(normalizedStep);
+  console.log(LOG_PREFIX, `[notifyStepComplete] window=${windowId} step ${normalizedStep}, hasWaiter=${Boolean(waiter)}`);
   if (waiter) waiter.resolve(payload);
 }
 
-function notifyStepError(step, error) {
-  const waiter = stepWaiters.get(step);
-  console.warn(LOG_PREFIX, `[notifyStepError] step ${step}, hasWaiter=${Boolean(waiter)}, error=${error}`);
-  if (waiter) waiter.reject(new Error(error));
+function notifyStepError(windowId, step, error) {
+  const normalizedStep = normalizeFlowStep(step);
+  const waiter = getStepWaiters(windowId).get(normalizedStep);
+  console.warn(LOG_PREFIX, `[notifyStepError] window=${windowId} step ${normalizedStep}, hasWaiter=${Boolean(waiter)}, error=${error}`);
+  if (waiter) waiter.reject(new Error(normalizeUserFacingStepText(error)));
 }
 
-async function completeStepFromBackground(step, payload = {}) {
-  if (stopRequested) {
-    await setStepStatus(step, 'stopped');
-    notifyStepError(step, STOP_ERROR_MESSAGE);
+async function completeStepFromBackground(windowId, step, payload = {}) {
+  const normalizedStep = normalizeFlowStep(step);
+  if (isStopRequested(windowId)) {
+    await setStepStatus(windowId, normalizedStep, 'stopped');
+    notifyStepError(windowId, normalizedStep, STOP_ERROR_MESSAGE);
     return;
   }
 
-  await setStepStatus(step, 'completed');
-  await addLog(`步骤 ${step} 已完成`, 'ok');
-  await handleStepData(step, payload);
-  notifyStepComplete(step, payload);
+  await setStepStatus(windowId, normalizedStep, 'completed');
+  await addLog(windowId, `步骤 ${normalizedStep} 已完成`, 'ok');
+  await handleStepData(windowId, normalizedStep, payload);
+  if (normalizedStep === MAX_FLOW_STEP) {
+    const state = await getState(windowId);
+    const boundItem = await getBoundPoolItem(windowId);
+    if (boundItem) {
+      await markBoundPoolItemSuccess(windowId, {
+        email: boundItem.email,
+        localhostUrl: state.localhostUrl,
+        completedAt: new Date().toISOString(),
+      });
+      await setEmailState(windowId, null);
+    }
+  }
+  notifyStepComplete(windowId, normalizedStep, payload);
 }
 
-async function markRunningStepsStopped() {
-  const state = await getState();
+async function markRunningStepsStopped(windowId) {
+  const state = await getState(windowId);
   const runningSteps = Object.entries(state.stepStatuses || {})
     .filter(([, status]) => status === 'running')
     .map(([step]) => Number(step));
 
   for (const step of runningSteps) {
-    await setStepStatus(step, 'stopped');
+    await setStepStatus(windowId, step, 'stopped');
   }
 }
 
-async function requestStop(options = {}) {
+async function requestStop(windowId, options = {}) {
   const { logMessage = '已收到停止请求，正在取消当前操作...' } = options;
-  if (stopRequested) return;
+  if (isStopRequested(windowId)) return;
 
-  stopRequested = true;
-  cancelPendingCommands();
-  if (webNavListener) {
-    chrome.webNavigation.onBeforeNavigate.removeListener(webNavListener);
-    webNavListener = null;
-  }
+  stopRequestedByWindow.add(windowId);
+  cancelPendingCommands(windowId);
+  clearStep8Listener(windowId);
 
-  await addLog(logMessage, 'warn');
-  await broadcastStopToContentScripts();
+  await addLog(windowId, logMessage, 'warn');
+  await broadcastStopToContentScripts(windowId);
 
+  const stepWaiters = getStepWaiters(windowId);
   for (const waiter of stepWaiters.values()) {
     waiter.reject(new Error(STOP_ERROR_MESSAGE));
   }
   stepWaiters.clear();
 
+  const resumeWaiter = getResumeWaiter(windowId);
   if (resumeWaiter) {
     resumeWaiter.reject(new Error(STOP_ERROR_MESSAGE));
-    resumeWaiter = null;
+    setResumeWaiter(windowId, null);
   }
 
-  await markRunningStepsStopped();
-  clearActiveAutoRunAttemptSession();
-  autoRunActive = false;
-  await broadcastAutoRunStatus('stopped', {
-    currentRun: autoRunCurrentRun,
-    totalRuns: autoRunTotalRuns,
-    attemptRun: autoRunAttemptRun,
+  await markRunningStepsStopped(windowId);
+  clearActiveAutoRunAttemptSession(windowId);
+  getAutoRunRuntime(windowId).active = false;
+  await broadcastAutoRunStatus(windowId, 'stopped', {
+    currentRun: getAutoRunRuntime(windowId).currentRun,
+    totalRuns: getAutoRunRuntime(windowId).totalRuns,
+    attemptRun: getAutoRunRuntime(windowId).attemptRun,
   });
 }
 
@@ -1799,14 +2143,19 @@ async function requestStop(options = {}) {
 // Step Execution
 // ============================================================
 
-async function executeStep(step) {
-  console.log(LOG_PREFIX, `Executing step ${step}`);
-  throwIfStopped();
-  await setStepStatus(step, 'running');
-  await addLog(`步骤 ${step} 开始执行`);
-  await humanStepDelay();
+async function executeStep(windowId, step) {
+  const normalizedStep = normalizeFlowStep(step);
+  console.log(LOG_PREFIX, `Executing window=${windowId} step ${normalizedStep}`);
+  throwIfStopped(windowId);
+  await setStepStatus(windowId, normalizedStep, 'running');
+  await addLog(windowId, `步骤 ${normalizedStep} 开始执行`);
+  if (normalizedStep === 6) {
+    await sleepWithStop(windowId, 900);
+  } else {
+    await humanStepDelay(windowId);
+  }
 
-  const state = await getState();
+  const state = await getState(windowId);
 
   if (step === 1 && !state.flowStartTime) {
     await setState({ flowStartTime: Date.now() });
@@ -1825,17 +2174,21 @@ async function executeStep(step) {
       case 9: await executeStep9(state); break;
       case 10: await executeStep10(state); break;
       default:
-        throw new Error(`未知步骤：${step}`);
+        throw new Error(`未知步骤：${normalizedStep}`);
     }
   } catch (err) {
     if (isStopError(err)) {
-      await setStepStatus(step, 'stopped');
-      await addLog(`步骤 ${step} 已被用户停止`, 'warn');
+      await setStepStatus(windowId, normalizedStep, 'stopped');
+      await addLog(windowId, `步骤 ${normalizedStep} 已被用户停止`, 'warn');
       throw err;
     }
-    await setStepStatus(step, 'failed');
-    await addLog(`步骤 ${step} 失败：${err.message}`, 'error');
-    throw err;
+    if (await getBoundPoolItem(windowId)) {
+      await markBoundPoolItemFailed(windowId, err);
+      await setEmailState(windowId, null);
+    }
+    await setStepStatus(windowId, normalizedStep, 'failed');
+    await addLog(windowId, `步骤 ${normalizedStep} 失败：${normalizeUserFacingStepText(err.message)}`, 'error');
+    throw new Error(normalizeUserFacingStepText(err.message));
   }
 }
 
@@ -1844,25 +2197,25 @@ async function executeStep(step) {
  * @param {number} step
  * @param {number} delayAfter - ms to wait after completion (for page transitions)
  */
-async function executeStepAndWait(step, delayAfter = 2000) {
-  throwIfStopped();
+async function executeStepAndWait(windowId, step, delayAfter = 2000) {
+  throwIfStopped(windowId);
 
   if (AUTO_RUN_BACKGROUND_COMPLETED_STEPS.has(step)) {
-    await addLog(`自动运行：步骤 ${step} 由后台流程负责收尾，执行函数返回后将直接进入下一步。`, 'info');
-    await executeStep(step);
-    const latestState = await getState();
-    await addLog(`自动运行：步骤 ${step} 已执行返回，当前状态为 ${latestState.stepStatuses?.[step] || 'pending'}，准备继续后续步骤。`, 'info');
+    await addLog(windowId, `自动运行：步骤 ${step} 由后台流程负责收尾，执行函数返回后将直接进入下一步。`, 'info');
+    await executeStep(windowId, step);
+    const latestState = await getState(windowId);
+    await addLog(windowId, `自动运行：步骤 ${step} 已执行返回，当前状态为 ${latestState.stepStatuses?.[step] || 'pending'}，准备继续后续步骤。`, 'info');
   } else {
-    await addLog(`自动运行：步骤 ${step} 已发起，正在等待完成信号（超时 ${AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS / 1000} 秒）。`, 'info');
-    const completionResultPromise = waitForStepComplete(step, AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS).then(
+    await addLog(windowId, `自动运行：步骤 ${step} 已发起，正在等待完成信号（超时 ${AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS / 1000} 秒）。`, 'info');
+    const completionResultPromise = waitForStepComplete(windowId, step, AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS).then(
       payload => ({ ok: true, payload }),
       error => ({ ok: false, error }),
     );
 
     try {
-      await executeStep(step);
+      await executeStep(windowId, step);
     } catch (err) {
-      notifyStepError(step, getErrorMessage(err));
+      notifyStepError(windowId, step, getErrorMessage(err));
       await completionResultPromise;
       throw err;
     }
@@ -1872,12 +2225,11 @@ async function executeStepAndWait(step, delayAfter = 2000) {
       throw completionResult.error;
     }
 
-    await addLog(`自动运行：步骤 ${step} 已收到完成信号，准备继续后续步骤。`, 'info');
+    await addLog(windowId, `自动运行：步骤 ${step} 已收到完成信号，准备继续后续步骤。`, 'info');
   }
 
-  // Extra delay for page transitions / DOM updates
   if (delayAfter > 0) {
-    await sleepWithStop(delayAfter + Math.floor(Math.random() * 1200));
+    await sleepWithStop(windowId, delayAfter + Math.floor(Math.random() * 1200));
   }
 }
 
@@ -1928,6 +2280,7 @@ async function fetchGeneratedEmail(options = {}) {
   });
 
   if (result?.error) {
+    await addLog(windowId, `[调试] Duck fetch error｜${JSON.stringify({ windowId, error: result.error })}`, 'warn');
     throw new Error(result.error);
   }
   if (!result?.email) {
@@ -1943,14 +2296,7 @@ async function fetchGeneratedEmail(options = {}) {
 // Auto Run Flow
 // ============================================================
 
-let autoRunActive = false;
-let autoRunCurrentRun = 0;
-let autoRunTotalRuns = 1;
-let autoRunAttemptRun = 0;
-let autoRunSessionId = 0;
-let autoRunAttemptSessionId = 0;
-let activeAutoRunAttemptSessionId = null;
-const DUCK_EMAIL_MAX_ATTEMPTS = 5;
+const GENERATED_EMAIL_MAX_ATTEMPTS = 5;
 const VERIFICATION_POLL_MAX_ROUNDS = 5;
 const VERIFICATION_MAIL_RECOVERY_GRACE_MS = 30000;
 const GENERATED_EMAIL_RESTART_ERROR_MESSAGE = '邮箱自动获取失败，需要重新开始新一轮。';
@@ -1967,27 +2313,28 @@ const AUTO_STEP_DELAYS = {
   10: 1000,
 };
 
-async function resumeAutoRunIfWaitingForEmail(options = {}) {
+async function resumeAutoRunIfWaitingForEmail(windowId, options = {}) {
   const { silent = false } = options;
-  const state = await getState();
+  const state = await getState(windowId);
   if (!state.email || !isAutoRunPausedState(state)) {
     return false;
   }
 
+  const resumeWaiter = getResumeWaiter(windowId);
   if (resumeWaiter) {
     if (!silent) {
-      await addLog('邮箱已就绪，自动继续后续步骤...', 'info');
+      await addLog(windowId, '邮箱已就绪，自动继续后续步骤...', 'info');
     }
     resumeWaiter.resolve();
-    resumeWaiter = null;
+    setResumeWaiter(windowId, null);
     return true;
   }
 
   return false;
 }
 
-async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
-  const currentState = await getState();
+async function ensureAutoEmailReady(windowId, targetRun, totalRuns, attemptRuns) {
+  const currentState = await getState(windowId);
   if (currentState.email) {
     return currentState.email;
   }
@@ -2012,13 +2359,13 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
   throw new Error(GENERATED_EMAIL_RESTART_ERROR_MESSAGE);
 }
 
-async function runAutoSequenceFromStep(startStep, context = {}) {
+async function runAutoSequenceFromStep(windowId, startStep, context = {}) {
   const { targetRun, totalRuns, attemptRuns, continued = false } = context;
   const maxStep10RestartAttempts = 5;
   let step10RestartAttempts = 0;
 
   if (continued) {
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续当前进度，从步骤 ${startStep} 开始（第 ${attemptRuns} 次尝试）===`, 'info');
+    await addLog(windowId, `=== 目标 ${targetRun}/${totalRuns} 轮：继续当前进度，从步骤 ${startStep} 开始（第 ${attemptRuns} 次尝试）===`, 'info');
   } else {
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：第 ${attemptRuns} 次尝试，阶段 1，打开 ChatGPT 官网并准备注册 ===`, 'info');
   }
@@ -2045,12 +2392,12 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
       totalRuns,
       attemptRun: attemptRuns,
     });
-    await executeStepAndWait(3, AUTO_STEP_DELAYS[3]);
+    await executeStepAndWait(windowId, 3, AUTO_STEP_DELAYS[3]);
   } else {
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续执行剩余流程（第 ${attemptRuns} 次尝试）===`, 'info');
+    await addLog(windowId, `=== 目标 ${targetRun}/${totalRuns} 轮：继续执行剩余流程（第 ${attemptRuns} 次尝试）===`, 'info');
   }
 
-  const signupTabId = await getTabId('signup-page');
+  const signupTabId = await getTabId(windowId, 'signup-page');
   if (signupTabId) {
     await chrome.tabs.update(signupTabId, { active: true });
   }
@@ -2058,7 +2405,7 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
   let step = Math.max(startStep, 4);
   while (step <= MAX_FLOW_STEP) {
     try {
-      await executeStepAndWait(step, AUTO_STEP_DELAYS[step]);
+      await executeStepAndWait(windowId, step, AUTO_STEP_DELAYS[step]);
       step += 1;
     } catch (err) {
       if (step === 10 && isStep10OAuthTimeoutError(err) && step10RestartAttempts < maxStep10RestartAttempts) {
@@ -2079,18 +2426,19 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
 }
 
 // Outer loop: keep retrying until the target number of successful runs is reached.
-async function autoRunLoop(totalRuns, options = {}) {
-  if (autoRunActive) {
-    await addLog('自动运行已在进行中', 'warn');
+async function autoRunLoop(windowId, totalRuns, options = {}) {
+  const runtime = getAutoRunRuntime(windowId);
+  if (runtime.active) {
+    await addLog(windowId, '自动运行已在进行中', 'warn');
     return;
   }
 
-  const sessionId = bumpAutoRunSessionId();
-  clearStopRequest();
-  autoRunActive = true;
-  autoRunTotalRuns = totalRuns;
-  autoRunCurrentRun = 0;
-  autoRunAttemptRun = 0;
+  const sessionId = bumpAutoRunSessionId(windowId);
+  clearStopRequest(windowId);
+  runtime.active = true;
+  runtime.totalRuns = totalRuns;
+  runtime.currentRun = 0;
+  runtime.attemptRun = 0;
   const autoRunSkipFailures = Boolean(options.autoRunSkipFailures);
   const initialMode = options.mode === 'continue' ? 'continue' : 'restart';
   const resumeCurrentRun = Number.isInteger(options.resumeCurrentRun) ? options.resumeCurrentRun : 0;
@@ -2103,9 +2451,9 @@ async function autoRunLoop(totalRuns, options = {}) {
   let forceFreshTabsNextRun = false;
   let continueCurrentOnFirstAttempt = initialMode === 'continue';
 
-  await setState({
+  await setState(windowId, {
     autoRunSkipFailures,
-    ...getAutoRunStatusPayload('running', {
+    ...getAutoRunStatusPayload(windowId, 'running', {
       currentRun: resumeCurrentRun,
       totalRuns,
       attemptRun: resumeAttemptRunsProcessed,
@@ -2113,26 +2461,26 @@ async function autoRunLoop(totalRuns, options = {}) {
   });
 
   while (successfulRuns < totalRuns && attemptRuns < maxAttempts) {
-    if (!isCurrentAutoRunSession(sessionId)) {
+    if (!isCurrentAutoRunSession(windowId, sessionId)) {
       return;
     }
 
     attemptRuns += 1;
     const targetRun = successfulRuns + 1;
-    autoRunCurrentRun = targetRun;
-    autoRunAttemptRun = attemptRuns;
-    const attemptSessionId = bumpAutoRunAttemptSessionId();
+    runtime.currentRun = targetRun;
+    runtime.attemptRun = attemptRuns;
+    const attemptSessionId = bumpAutoRunAttemptSessionId(windowId);
     let startStep = 1;
     let useExistingProgress = false;
 
     if (continueCurrentOnFirstAttempt) {
-      const currentState = await getState();
+      const currentState = await getState(windowId);
       const resumeStep = getFirstUnfinishedStep(currentState.stepStatuses);
       if (resumeStep && hasSavedProgress(currentState.stepStatuses)) {
         startStep = resumeStep;
         useExistingProgress = true;
       } else if (hasSavedProgress(currentState.stepStatuses)) {
-        await addLog('当前流程已全部处理，将按“重新开始”新开一轮自动运行。', 'info');
+        await addLog(windowId, '当前流程已全部处理，将按“重新开始”新开一轮自动运行。', 'info');
       }
       continueCurrentOnFirstAttempt = false;
     }
@@ -2149,32 +2497,30 @@ async function autoRunLoop(totalRuns, options = {}) {
         emailGenerationService: prevState.emailGenerationService,
         ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
         ...(forceFreshTabsNextRun ? { tabRegistry: {} } : {}),
-      };
-      await resetState();
-      await setState(keepSettings);
-      chrome.runtime.sendMessage({ type: 'AUTO_RUN_RESET' }).catch(() => { });
-      await sleepWithStop(500);
+      });
+      await sendWindowMessage(windowId, 'AUTO_RUN_RESET', {});
+      await sleepWithStop(windowId, 500);
     } else {
-      await setState({
+      await setState(windowId, {
         autoRunSkipFailures,
-        ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
+        ...getAutoRunStatusPayload(windowId, 'running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
       });
     }
 
     if (forceFreshTabsNextRun) {
-      await addLog(`兜底模式：上一轮已放弃，当前开始第 ${attemptRuns} 次尝试，将使用新线程继续补足第 ${targetRun}/${totalRuns} 轮。`, 'warn');
+      await addLog(windowId, `兜底模式：上一轮已放弃，当前开始第 ${attemptRuns} 次尝试，将使用新线程继续补足第 ${targetRun}/${totalRuns} 轮。`, 'warn');
       forceFreshTabsNextRun = false;
     }
 
     try {
-      throwIfStopped();
-      await broadcastAutoRunStatus('running', {
+      throwIfStopped(windowId);
+      await broadcastAutoRunStatus(windowId, 'running', {
         currentRun: targetRun,
         totalRuns,
         attemptRun: attemptRuns,
       });
 
-      await runAutoSequenceFromStep(startStep, {
+      await runAutoSequenceFromStep(windowId, startStep, {
         targetRun,
         totalRuns,
         attemptRuns,
@@ -2182,18 +2528,18 @@ async function autoRunLoop(totalRuns, options = {}) {
       });
 
       successfulRuns += 1;
-      autoRunCurrentRun = successfulRuns;
-      clearActiveAutoRunAttemptSession();
-      await addLog(`=== 目标 ${successfulRuns}/${totalRuns} 轮已完成（第 ${attemptRuns} 次尝试成功）===`, 'ok');
+      runtime.currentRun = successfulRuns;
+      clearActiveAutoRunAttemptSession(windowId);
+      await addLog(windowId, `=== 目标 ${successfulRuns}/${totalRuns} 轮已完成（第 ${attemptRuns} 次尝试成功）===`, 'ok');
       continue;
     } catch (err) {
-      if (!isCurrentAutoRunSession(sessionId)) {
+      if (!isCurrentAutoRunSession(windowId, sessionId)) {
         return;
       }
 
       if (isStopError(err)) {
-        await addLog(`目标 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
-        await broadcastAutoRunStatus('stopped', {
+        await addLog(windowId, `目标 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
+        await broadcastAutoRunStatus(windowId, 'stopped', {
           currentRun: targetRun,
           totalRuns,
           attemptRun: attemptRuns,
@@ -2202,7 +2548,7 @@ async function autoRunLoop(totalRuns, options = {}) {
       }
 
       if (isRestartCurrentAttemptError(err)) {
-        if (attemptSessionId !== activeAutoRunAttemptSessionId) {
+        if (!isCurrentAutoRunAttemptSession(windowId, attemptSessionId)) {
           return;
         }
         const errorMessage = getErrorMessage(err);
@@ -2226,8 +2572,8 @@ async function autoRunLoop(totalRuns, options = {}) {
       }
 
       if (!autoRunSkipFailures) {
-        await addLog(`目标 ${targetRun}/${totalRuns} 轮失败：${err.message}`, 'error');
-        await broadcastAutoRunStatus('stopped', {
+        await addLog(windowId, `目标 ${targetRun}/${totalRuns} 轮失败：${err.message}`, 'error');
+        await broadcastAutoRunStatus(windowId, 'stopped', {
           currentRun: targetRun,
           totalRuns,
           attemptRun: attemptRuns,
@@ -2235,13 +2581,13 @@ async function autoRunLoop(totalRuns, options = {}) {
         break;
       }
 
-      if (attemptSessionId !== activeAutoRunAttemptSessionId) {
+      if (!isCurrentAutoRunAttemptSession(windowId, attemptSessionId)) {
         return;
       }
-      await addLog(`目标 ${targetRun}/${totalRuns} 轮的第 ${attemptRuns} 次尝试失败：${err.message}`, 'error');
-      await addLog('兜底开关已开启：将放弃当前线程，重新开一轮继续补足目标次数。', 'warn');
-      const mailSource = getMailConfig(await getState()).source;
-      await abandonCurrentAutoRunAttempt({
+      await addLog(windowId, `目标 ${targetRun}/${totalRuns} 轮的第 ${attemptRuns} 次尝试失败：${err.message}`, 'error');
+      await addLog(windowId, '兜底开关已开启：将放弃当前线程，重新开一轮继续补足目标次数。', 'warn');
+      const mailSource = getMailConfig(await getState(windowId)).source;
+      await abandonCurrentAutoRunAttempt(windowId, {
         targetRun,
         totalRuns,
         attemptRun: attemptRuns,
@@ -2252,73 +2598,80 @@ async function autoRunLoop(totalRuns, options = {}) {
     }
   }
 
-  if (!isCurrentAutoRunSession(sessionId)) {
+  if (!isCurrentAutoRunSession(windowId, sessionId)) {
     return;
   }
 
-  clearActiveAutoRunAttemptSession();
+  clearActiveAutoRunAttemptSession(windowId);
 
-  if (!stopRequested && autoRunSkipFailures && successfulRuns < totalRuns && attemptRuns >= maxAttempts) {
-    await addLog(`已达到安全重试上限（${attemptRuns} 次尝试），当前仅完成 ${successfulRuns}/${totalRuns} 轮。`, 'error');
-    await broadcastAutoRunStatus('stopped', {
+  const stopped = isStopRequested(windowId);
+  let finalPhase = 'stopped';
+
+  if (!stopped && autoRunSkipFailures && successfulRuns < totalRuns && attemptRuns >= maxAttempts) {
+    await addLog(windowId, `已达到安全重试上限（${attemptRuns} 次尝试），当前仅完成 ${successfulRuns}/${totalRuns} 轮。`, 'error');
+    await broadcastAutoRunStatus(windowId, 'stopped', {
       currentRun: successfulRuns,
-      totalRuns: autoRunTotalRuns,
+      totalRuns,
       attemptRun: attemptRuns,
     });
-  } else if (stopRequested) {
-    await addLog(`=== 已停止，完成 ${successfulRuns}/${autoRunTotalRuns} 轮，共尝试 ${attemptRuns} 次 ===`, 'warn');
-    await broadcastAutoRunStatus('stopped', {
+  } else if (stopped) {
+    await addLog(windowId, `=== 已停止，完成 ${successfulRuns}/${totalRuns} 轮，共尝试 ${attemptRuns} 次 ===`, 'warn');
+    await broadcastAutoRunStatus(windowId, 'stopped', {
       currentRun: successfulRuns,
-      totalRuns: autoRunTotalRuns,
+      totalRuns,
       attemptRun: attemptRuns,
     });
-  } else if (successfulRuns >= autoRunTotalRuns) {
-    await addLog(`=== 全部 ${autoRunTotalRuns} 轮均已成功完成，共尝试 ${attemptRuns} 次 ===`, 'ok');
-    await broadcastAutoRunStatus('complete', {
+  } else if (successfulRuns >= totalRuns) {
+    finalPhase = 'complete';
+    await addLog(windowId, `=== 全部 ${totalRuns} 轮均已成功完成，共尝试 ${attemptRuns} 次 ===`, 'ok');
+    await broadcastAutoRunStatus(windowId, 'complete', {
       currentRun: successfulRuns,
-      totalRuns: autoRunTotalRuns,
+      totalRuns,
       attemptRun: attemptRuns,
     });
   } else {
-    await addLog(`=== 已停止，完成 ${successfulRuns}/${autoRunTotalRuns} 轮，共尝试 ${attemptRuns} 次 ===`, 'warn');
-    await broadcastAutoRunStatus('stopped', {
+    await addLog(windowId, `=== 已停止，完成 ${successfulRuns}/${totalRuns} 轮，共尝试 ${attemptRuns} 次 ===`, 'warn');
+    await broadcastAutoRunStatus(windowId, 'stopped', {
       currentRun: successfulRuns,
-      totalRuns: autoRunTotalRuns,
+      totalRuns,
       attemptRun: attemptRuns,
     });
   }
-  autoRunActive = false;
-  autoRunAttemptRun = attemptRuns;
-  await setState(getAutoRunStatusPayload(stopRequested ? 'stopped' : (successfulRuns >= autoRunTotalRuns ? 'complete' : 'stopped'), {
+
+  runtime.active = false;
+  runtime.currentRun = successfulRuns;
+  runtime.totalRuns = totalRuns;
+  runtime.attemptRun = attemptRuns;
+  await setState(windowId, getAutoRunStatusPayload(windowId, finalPhase, {
     currentRun: successfulRuns,
-    totalRuns: autoRunTotalRuns,
+    totalRuns,
     attemptRun: attemptRuns,
   }));
-  clearStopRequest();
+  clearStopRequest(windowId);
 }
 
-async function waitForResume() {
-  throwIfStopped();
-  const state = await getState();
+async function waitForResume(windowId) {
+  throwIfStopped(windowId);
+  const state = await getState(windowId);
   if (state.email) {
-    await addLog('邮箱已就绪，自动继续后续步骤...', 'info');
+    await addLog(windowId, '邮箱已就绪，自动继续后续步骤...', 'info');
     return;
   }
 
   return new Promise((resolve, reject) => {
-    resumeWaiter = { resolve, reject };
+    setResumeWaiter(windowId, { resolve, reject });
   });
 }
 
-async function resumeAutoRun() {
-  throwIfStopped();
-  const state = await getState();
+async function resumeAutoRun(windowId) {
+  throwIfStopped(windowId);
+  const state = await getState(windowId);
   if (!state.email) {
-    await addLog('无法继续：当前没有邮箱地址，请先在侧边栏填写邮箱。', 'error');
+    await addLog(windowId, '无法继续：当前没有邮箱地址，请先在侧边栏填写邮箱。', 'error');
     return false;
   }
 
-  const resumedInMemory = await resumeAutoRunIfWaitingForEmail({ silent: true });
+  const resumedInMemory = await resumeAutoRunIfWaitingForEmail(windowId, { silent: true });
   if (resumedInMemory) {
     return true;
   }
@@ -2327,7 +2680,7 @@ async function resumeAutoRun() {
     return false;
   }
 
-  if (autoRunActive) {
+  if (getAutoRunRuntime(windowId).active) {
     return false;
   }
 
@@ -2336,8 +2689,8 @@ async function resumeAutoRun() {
   const attemptRun = state.autoRunAttemptRun || 1;
   const successfulRuns = Math.max(0, currentRun - 1);
 
-  await addLog('检测到自动流程暂停上下文已丢失，正在从当前进度恢复自动运行...', 'warn');
-  autoRunLoop(totalRuns, {
+  await addLog(windowId, '检测到自动流程暂停上下文已丢失，正在从当前进度恢复自动运行...', 'warn');
+  autoRunLoop(windowId, totalRuns, {
     autoRunSkipFailures: Boolean(state.autoRunSkipFailures),
     mode: 'continue',
     resumeCurrentRun: currentRun,
@@ -2386,7 +2739,7 @@ async function requestFreshOAuthUrl(state, stepForLog = 7) {
     await addLog(`步骤 ${stepForLog}：CPA 页面尚未完全进入目标地址，继续尝试连接内容脚本...`, 'warn');
   }
 
-  await ensureContentScriptReadyOnTab('vps-panel', tabId, {
+  await ensureContentScriptReadyOnTab(windowId, 'vps-panel', tabId, {
     inject: injectFiles,
     injectSource: 'vps-panel',
     timeoutMs: 45000,
@@ -2483,17 +2836,17 @@ async function executeStep2(state) {
 // Step 3: Fill Email & Password (via signup-page.js)
 // ============================================================
 
-async function executeStep3(state) {
+async function executeStep3(windowId, state) {
   if (!state.email) {
     throw new Error('缺少邮箱地址，请先完成步骤 2。');
   }
 
   const password = state.customPassword || generatePassword();
-  await setPasswordState(password);
+  await setPasswordState(windowId, password);
 
   const accounts = state.accounts || [];
   accounts.push({ email: state.email, password, createdAt: new Date().toISOString() });
-  await setState({ accounts });
+  await setState(windowId, { accounts });
 
   await addLog(
     `步骤 3：正在为 ${state.email} 填写密码，密码为${state.customPassword ? '自定义' : '自动生成'}（${password.length} 位）`
@@ -2515,7 +2868,7 @@ async function executeStep3(state) {
 // ============================================================
 
 function getMailConfig(state) {
-  const provider = state.mailProvider || 'qq';
+  const provider = getEffectiveMailProvider(state) || 'qq';
   if (provider === '163') {
     return { source: 'mail-163', url: 'https://mail.163.com/js6/main.jsp?df=mail163_letter#module=mbox.ListModule%7C%7B%22fid%22%3A1%2C%22order%22%3A%22date%22%2C%22desc%22%3Atrue%7D', label: '163 邮箱' };
   }
@@ -2652,6 +3005,8 @@ function getVerificationPollPayload(step, state, overrides = {}) {
       senderFilters: ['openai', 'noreply', 'verify', 'auth', 'duckduckgo', 'forward'],
       subjectFilters: ['verify', 'verification', 'code', '楠岃瘉', 'confirm'],
       targetEmail: state.email,
+      disableFallbackToOldMail: true,
+      firstAttemptDelayMs: 3000,
       maxAttempts: 5,
       intervalMs: 3000,
       ...overrides,
@@ -2669,16 +3024,16 @@ function getVerificationPollPayload(step, state, overrides = {}) {
   };
 }
 
-async function requestVerificationCodeResend(step) {
-  const signupTabId = await getTabId('signup-page');
+async function requestVerificationCodeResend(windowId, step) {
+  const signupTabId = await getTabId(windowId, 'signup-page');
   if (!signupTabId) {
     throw new Error('认证页面标签页已关闭，无法重新请求验证码。');
   }
 
   await chrome.tabs.update(signupTabId, { active: true });
-  await addLog(`步骤 ${step}：正在请求新的${getVerificationCodeLabel(step)}验证码...`, 'warn');
+  await addLog(windowId, `步骤 ${step}：正在请求新的${getVerificationCodeLabel(step)}验证码...`, 'warn');
 
-  const result = await sendToContentScript('signup-page', {
+  const result = await sendToContentScript(windowId, 'signup-page', {
     type: 'RESEND_VERIFICATION_CODE',
     step,
     source: 'background',
@@ -2692,7 +3047,7 @@ async function requestVerificationCodeResend(step) {
   return Date.now();
 }
 
-async function pollFreshVerificationCode(step, state, mail, pollOverrides = {}) {
+async function pollFreshVerificationCode(windowId, step, state, mail, pollOverrides = {}) {
   const stateKey = getVerificationCodeStateKey(step);
   const rejectedCodes = new Set();
   if (state[stateKey]) {
@@ -2708,66 +3063,81 @@ async function pollFreshVerificationCode(step, state, mail, pollOverrides = {}) 
 
   for (let round = 1; round <= maxRounds; round++) {
     if (round > 1) {
-      await requestVerificationCodeResend(step);
+      await requestVerificationCodeResend(windowId, step);
     }
 
-    const payload = getVerificationPollPayload(step, state, {
-      ...pollOverrides,
-      filterAfterTimestamp,
-      excludeCodes: [...rejectedCodes],
-    });
+    while (true) {
+      const payload = getVerificationPollPayload(step, state, {
+        ...pollOverrides,
+        filterAfterTimestamp,
+        excludeCodes: [...rejectedCodes],
+      });
 
-    try {
-      const result = await sendToMailContentScriptResilient(
-        mail,
-        {
-          type: 'POLL_EMAIL',
-          step,
-          source: 'background',
-          payload,
-        },
-        {
-          timeoutMs: getContentScriptResponseTimeoutMs({
+      try {
+        const result = await sendToMailContentScriptResilient(
+          windowId,
+          mail,
+          {
             type: 'POLL_EMAIL',
+            step,
+            source: 'background',
             payload,
-          }) + VERIFICATION_MAIL_RECOVERY_GRACE_MS,
-          maxRecoveryAttempts: 2,
+          },
+          {
+            timeoutMs: getContentScriptResponseTimeoutMs({
+              type: 'POLL_EMAIL',
+              payload,
+            }) + VERIFICATION_MAIL_RECOVERY_GRACE_MS,
+            maxRecoveryAttempts: 2,
+          }
+        );
+
+        if (result?.reloadRequired && mail.source === 'qq-mail') {
+          await addLog(windowId, `步骤 ${step}：QQ 邮箱页内刷新无效，正在直接刷新页面后继续轮询...`, 'warn');
+          await reuseOrCreateTab(windowId, mail.source, mail.url, {
+            inject: mail.inject,
+            injectSource: mail.injectSource,
+            reloadIfSameUrl: true,
+          });
+          continue;
         }
-      );
 
-      if (result && result.error) {
-        throw new Error(result.error);
-      }
+        if (result && result.error) {
+          throw new Error(result.error);
+        }
 
-      if (!result || !result.code) {
-        throw new Error(`步骤 ${step}：邮箱轮询结束，但未获取到验证码。`);
-      }
+        if (!result || !result.code) {
+          throw new Error(`步骤 ${step}：邮箱轮询结束，但未获取到验证码。`);
+        }
 
-      if (rejectedCodes.has(result.code)) {
-        throw new Error(`步骤 ${step}：再次收到了相同的${getVerificationCodeLabel(step)}验证码：${result.code}`);
-      }
+        if (rejectedCodes.has(result.code)) {
+          throw new Error(`步骤 ${step}：再次收到了相同的${getVerificationCodeLabel(step)}验证码：${result.code}`);
+        }
 
-      return result;
-    } catch (err) {
-      lastError = err;
-      await addLog(`步骤 ${step}：${err.message}`, 'warn');
-      if (round < maxRounds) {
-        await addLog(`步骤 ${step}：将重新发送验证码后重试（${round + 1}/${maxRounds}）...`, 'warn');
+        return result;
+      } catch (err) {
+        lastError = err;
+        break;
       }
+    }
+
+    await addLog(windowId, `步骤 ${step}：${lastError.message}`, 'warn');
+    if (round < maxRounds) {
+      await addLog(windowId, `步骤 ${step}：将重新发送验证码后重试（${round + 1}/${maxRounds}）...`, 'warn');
     }
   }
 
   throw lastError || new Error(`步骤 ${step}：无法获取新的${getVerificationCodeLabel(step)}验证码。`);
 }
 
-async function submitVerificationCode(step, code) {
-  const signupTabId = await getTabId('signup-page');
+async function submitVerificationCode(windowId, step, code) {
+  const signupTabId = await getTabId(windowId, 'signup-page');
   if (!signupTabId) {
     throw new Error('认证页面标签页已关闭，无法填写验证码。');
   }
 
   await chrome.tabs.update(signupTabId, { active: true });
-  const result = await sendToContentScript('signup-page', {
+  const result = await sendToContentScript(windowId, 'signup-page', {
     type: 'FILL_CODE',
     step,
     source: 'background',
@@ -2781,7 +3151,7 @@ async function submitVerificationCode(step, code) {
   return result || {};
 }
 
-async function resolveVerificationStep(step, state, mail, options = {}) {
+async function resolveVerificationStep(windowId, step, state, mail, options = {}) {
   const stateKey = getVerificationCodeStateKey(step);
   const rejectedCodes = new Set();
   if (state[stateKey]) {
@@ -2790,69 +3160,76 @@ async function resolveVerificationStep(step, state, mail, options = {}) {
 
   const nextFilterAfterTimestamp = options.filterAfterTimestamp ?? null;
   const requestFreshCodeFirst = Boolean(options.requestFreshCodeFirst);
+  const reportCompletion = options.reportCompletion !== false;
   const maxSubmitAttempts = 3;
 
   if (requestFreshCodeFirst) {
     try {
-      await requestVerificationCodeResend(step);
-      await addLog(`步骤 ${step}：已先请求一封新的${getVerificationCodeLabel(step)}验证码，再开始轮询邮箱。`, 'warn');
+      await requestVerificationCodeResend(windowId, step);
+      await addLog(windowId, `步骤 ${step}：已先请求一封新的${getVerificationCodeLabel(step)}验证码，再开始轮询邮箱。`, 'warn');
     } catch (err) {
-      await addLog(`步骤 ${step}：首次重新获取验证码失败：${err.message}，将继续使用当前时间窗口轮询。`, 'warn');
+      await addLog(windowId, `步骤 ${step}：首次重新获取验证码失败：${err.message}，将继续使用当前时间窗口轮询。`, 'warn');
     }
   }
 
   for (let attempt = 1; attempt <= maxSubmitAttempts; attempt++) {
-    const result = await pollFreshVerificationCode(step, state, mail, {
+    const result = await pollFreshVerificationCode(windowId, step, state, mail, {
       excludeCodes: [...rejectedCodes],
       filterAfterTimestamp: nextFilterAfterTimestamp ?? undefined,
     });
 
-    await addLog(`步骤 ${step}：已获取${getVerificationCodeLabel(step)}验证码：${result.code}`);
-    const submitResult = await submitVerificationCode(step, result.code);
+    await addLog(windowId, `步骤 ${step}：已获取${getVerificationCodeLabel(step)}验证码：${result.code}`);
+    const submitResult = await submitVerificationCode(windowId, step, result.code);
 
     if (submitResult.addPhonePage) {
-      await addLog(`步骤 ${step}：验证码通过后进入手机号页面，本轮线程作废，准备重新开始新一轮。`, 'warn');
+      await addLog(windowId, `步骤 ${step}：验证码通过后进入手机号页面，本轮线程作废，准备重新开始新一轮。`, 'warn');
       throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
     }
 
     if (submitResult.invalidCode) {
       rejectedCodes.add(result.code);
-      await addLog(`步骤 ${step}：验证码被页面拒绝：${submitResult.errorText || result.code}`, 'warn');
+      await addLog(windowId, `步骤 ${step}：验证码被页面拒绝：${submitResult.errorText || result.code}`, 'warn');
 
       if (attempt >= maxSubmitAttempts) {
         throw new Error(`步骤 ${step}：验证码连续失败，已达到 ${maxSubmitAttempts} 次重试上限。`);
       }
 
-      await requestVerificationCodeResend(step);
-      await addLog(`步骤 ${step}：提交失败后已请求新验证码（${attempt + 1}/${maxSubmitAttempts}）...`, 'warn');
+      await requestVerificationCodeResend(windowId, step);
+      await addLog(windowId, `步骤 ${step}：提交失败后已请求新验证码（${attempt + 1}/${maxSubmitAttempts}）...`, 'warn');
       continue;
     }
 
-    await setState({
+    await setState(windowId, {
       lastEmailTimestamp: result.emailTimestamp,
       [stateKey]: result.code,
     });
 
-    await completeStepFromBackground(step, {
+    if (reportCompletion) {
+      await completeStepFromBackground(windowId, step, {
+        emailTimestamp: result.emailTimestamp,
+        code: result.code,
+      });
+    }
+    return {
       emailTimestamp: result.emailTimestamp,
       code: result.code,
-    });
-    return;
+    };
   }
 }
 
-async function executeStep4(state) {
+async function executeStep4(windowId, state) {
   const mail = getMailConfig(state);
   if (mail.error) throw new Error(mail.error);
   const stepStartedAt = Date.now();
-  const signupTabId = await getTabId('signup-page');
+  const signupTabId = await getTabId(windowId, 'signup-page');
   if (!signupTabId) {
     throw new Error('认证页面标签页已关闭，无法继续步骤 4。');
   }
 
   await chrome.tabs.update(signupTabId, { active: true });
-  await addLog('步骤 4：正在确认注册验证码页面是否就绪，必要时自动恢复密码页超时报错...');
+  await addLog(windowId, '步骤 4：正在确认注册验证码页面是否就绪，必要时自动恢复密码页超时报错...');
   const prepareResult = await sendToContentScriptResilient(
+    windowId,
     'signup-page',
     {
       type: 'PREPARE_SIGNUP_VERIFICATION',
@@ -2871,49 +3248,47 @@ async function executeStep4(state) {
     throw new Error(prepareResult.error);
   }
   if (prepareResult?.alreadyVerified) {
-    await completeStepFromBackground(4, {});
+    await completeStepFromBackground(windowId, 4, {});
     return;
   }
 
-  await addLog(`步骤 4：正在打开${mail.label}...`);
+  await addLog(windowId, `步骤 4：正在打开${mail.label}...`);
 
-  // For mail tabs, only create if not alive — don't navigate (preserves login session)
-  const alive = await isTabAlive(mail.source);
+  const alive = await isTabAlive(windowId, mail.source);
   if (alive) {
     if (mail.navigateOnReuse) {
-      await reuseOrCreateTab(mail.source, mail.url, {
+      await reuseOrCreateTab(windowId, mail.source, mail.url, {
         inject: mail.inject,
         injectSource: mail.injectSource,
       });
     } else {
-      const tabId = await getTabId(mail.source);
+      const tabId = await getTabId(windowId, mail.source);
       await chrome.tabs.update(tabId, { active: true });
     }
   } else {
-    await reuseOrCreateTab(mail.source, mail.url, {
+    await reuseOrCreateTab(windowId, mail.source, mail.url, {
       inject: mail.inject,
       injectSource: mail.injectSource,
     });
   }
 
-  await resolveVerificationStep(4, state, mail, {
+  await resolveVerificationStep(windowId, 4, state, mail, {
     filterAfterTimestamp: stepStartedAt,
     requestFreshCodeFirst: true,
   });
-  return;
 }
 
 // ============================================================
 // Step 5: Fill Name & Birthday (via signup-page.js)
 // ============================================================
 
-async function executeStep5(state) {
+async function executeStep5(windowId, state) {
   const { firstName, lastName } = generateRandomName();
   const { year, month, day } = generateRandomBirthday();
 
-  await addLog(`步骤 5：已生成姓名 ${firstName} ${lastName}，生日 ${year}-${month}-${day}`);
+  await addLog(windowId, `步骤 5：已生成姓名 ${firstName} ${lastName}，生日 ${year}-${month}-${day}`);
 
-  const signupTabId = await getTabId('signup-page');
+  const signupTabId = await getTabId(windowId, 'signup-page');
   if (signupTabId) {
     const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
     if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
@@ -3272,6 +3647,8 @@ let webNavListener = null;
 const STEP8_CLICK_EFFECT_TIMEOUT_MS = 3500;
 const STEP8_CLICK_RETRY_DELAY_MS = 500;
 const STEP8_READY_WAIT_TIMEOUT_MS = 30000;
+const STEP8_READY_SETTLE_MS = 1000;
+const STEP8_MAX_NO_EFFECT_ATTEMPTS = 4;
 const STEP8_STRATEGIES = [
   { mode: 'content', strategy: 'requestSubmit', label: 'form.requestSubmit' },
   { mode: 'debugger', label: 'debugger click' },
@@ -3280,7 +3657,7 @@ const STEP8_STRATEGIES = [
   { mode: 'debugger', label: 'debugger click retry' },
 ];
 
-async function getStep8PageState(tabId, responseTimeoutMs = 1500) {
+async function getStep8PageState(windowId, tabId, responseTimeoutMs = 1500) {
   try {
     const result = await sendTabMessageWithTimeout(tabId, 'signup-page', {
       type: 'STEP8_GET_STATE',
@@ -3299,26 +3676,39 @@ async function getStep8PageState(tabId, responseTimeoutMs = 1500) {
   }
 }
 
-async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS) {
+async function waitForStep8Ready(windowId, tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS) {
   const start = Date.now();
+  let settledSince = 0;
+  let latestReadyState = null;
 
   while (Date.now() - start < timeoutMs) {
-    throwIfStopped();
-    const pageState = await getStep8PageState(tabId);
+    throwIfStopped(windowId);
+    const pageState = await getStep8PageState(windowId, tabId);
     if (pageState?.addPhonePage) {
       throw new Error('步骤 9：认证页进入了手机号页面，当前不是 OAuth 同意页，无法继续自动授权。');
     }
     if (pageState?.consentReady) {
-      return pageState;
+      if (!settledSince) {
+        settledSince = Date.now();
+        latestReadyState = pageState;
+      } else {
+        latestReadyState = pageState;
+        if (Date.now() - settledSince >= STEP8_READY_SETTLE_MS) {
+          return latestReadyState;
+        }
+      }
+    } else {
+      settledSince = 0;
+      latestReadyState = null;
     }
-    await sleepWithStop(250);
+    await sleepWithStop(windowId, 250);
   }
 
   throw new Error('步骤 9：长时间未进入 OAuth 同意页，无法定位“继续”按钮。');
 }
 
-async function prepareStep8DebuggerClick() {
-  const result = await sendToContentScriptResilient('signup-page', {
+async function prepareStep8DebuggerClick(windowId) {
+  const result = await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'STEP8_FIND_AND_CLICK',
     source: 'background',
     payload: {},
@@ -3335,8 +3725,8 @@ async function prepareStep8DebuggerClick() {
   return result;
 }
 
-async function triggerStep8ContentStrategy(strategy) {
-  const result = await sendToContentScriptResilient('signup-page', {
+async function triggerStep8ContentStrategy(windowId, strategy) {
+  const result = await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'STEP8_TRIGGER_CONTINUE',
     source: 'background',
     payload: {
@@ -3357,11 +3747,11 @@ async function triggerStep8ContentStrategy(strategy) {
   return result;
 }
 
-async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLICK_EFFECT_TIMEOUT_MS) {
+async function waitForStep8ClickEffect(windowId, tabId, baselineUrl, timeoutMs = STEP8_CLICK_EFFECT_TIMEOUT_MS) {
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
-    throwIfStopped();
+    throwIfStopped(windowId);
 
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) {
@@ -3372,7 +3762,7 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
       return { progressed: true, reason: 'url_changed', url: tab.url };
     }
 
-    const pageState = await getStep8PageState(tabId);
+    const pageState = await getStep8PageState(windowId, tabId);
     if (pageState?.addPhonePage) {
       throw new Error('步骤 9：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
     }
@@ -3383,7 +3773,7 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
       return { progressed: true, reason: 'left_consent_page', url: pageState.url };
     }
 
-    await sleepWithStop(200);
+    await sleepWithStop(windowId, 200);
   }
 
   return { progressed: false, reason: 'no_effect' };
@@ -3432,7 +3822,7 @@ async function executeStep9(state) {
     }
 
     if (logMessage) {
-      await addLog(logMessage, 'ok');
+      await addLog(windowId, logMessage, 'ok');
     }
     await completeStepFromBackground(9, { localhostUrl: tab.url });
     return true;
@@ -3440,13 +3830,10 @@ async function executeStep9(state) {
 
   return new Promise((resolve, reject) => {
     let resolved = false;
-    let signupTabId = null;
+    let activeSignupTabId = null;
 
     const cleanupListener = () => {
-      if (webNavListener) {
-        chrome.webNavigation.onBeforeNavigate.removeListener(webNavListener);
-        webNavListener = null;
-      }
+      clearStep8Listener(windowId);
     };
 
     const failStep9 = (error) => {
@@ -3461,14 +3848,13 @@ async function executeStep9(state) {
       failStep9(new Error('120 秒内未捕获到 localhost 回调跳转，步骤 9 已持续重试点击“继续”但页面仍未完成授权。'));
     }, 120000);
 
-    webNavListener = (details) => {
-      if (resolved || !signupTabId) return;
-      if (details.tabId !== signupTabId) return;
+    const listener = (details) => {
+      if (resolved || !activeSignupTabId) return;
+      if (details.tabId !== activeSignupTabId) return;
       if (details.frameId !== 0) return;
       if (isLocalhostOAuthCallbackUrl(details.url)) {
-        console.log(LOG_PREFIX, `已捕获 localhost OAuth 回调：${details.url}`);
+        console.log(LOG_PREFIX, `已捕获 window=${windowId} localhost OAuth 回调：${details.url}`);
         resolved = true;
-        cleanupListener();
         clearTimeout(timeout);
         addLog(`步骤 9：已捕获 localhost 地址：${details.url}`, 'ok').then(() => {
           return completeStepFromBackground(9, { localhostUrl: details.url });
@@ -3507,13 +3893,14 @@ async function executeStep9(state) {
           return;
         }
 
-        chrome.webNavigation.onBeforeNavigate.addListener(webNavListener);
+        chrome.webNavigation.onBeforeNavigate.addListener(listener);
 
         let attempt = 0;
+        let noEffectAttempts = 0;
         while (!resolved) {
-          const pageState = await waitForStep8Ready(signupTabId);
+          const pageState = await waitForStep8Ready(windowId, activeSignupTabId);
           if (!pageState?.consentReady) {
-            await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
+            await sleepWithStop(windowId, STEP8_CLICK_RETRY_DELAY_MS);
             continue;
           }
 
@@ -3524,7 +3911,7 @@ async function executeStep9(state) {
           await addLog(`步骤 9：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
 
           if (strategy.mode === 'debugger') {
-            const clickTarget = await prepareStep8DebuggerClick();
+            const clickTarget = await prepareStep8DebuggerClick(windowId);
             if (clickTarget?.alreadyAtCallback) {
               resolved = true;
               cleanupListener();
@@ -3535,17 +3922,17 @@ async function executeStep9(state) {
               return;
             }
             if (!resolved) {
-              await clickWithDebugger(signupTabId, clickTarget?.rect);
+              await clickWithDebugger(activeSignupTabId, clickTarget?.rect);
             }
           } else {
-            await triggerStep8ContentStrategy(strategy.strategy);
+            await triggerStep8ContentStrategy(windowId, strategy.strategy);
           }
 
           if (resolved) {
             return;
           }
 
-          const effect = await waitForStep8ClickEffect(signupTabId, pageState.url);
+          const effect = await waitForStep8ClickEffect(windowId, activeSignupTabId, pageState.url);
           if (resolved) {
             return;
           }
@@ -3601,7 +3988,7 @@ async function executeStep10(state) {
     throw new Error('步骤 10：步骤 7 使用的 CPA 页面已离开原始面板地址。为确保沿用同一条授权链接，请从步骤 7 重新开始。');
   }
 
-  await ensureContentScriptReadyOnTab('vps-panel', tabId, {
+  await ensureContentScriptReadyOnTab(windowId, 'vps-panel', tabId, {
     inject: injectFiles,
     injectSource: 'vps-panel',
   });

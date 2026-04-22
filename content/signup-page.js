@@ -11,7 +11,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     || message.type === 'STEP8_FIND_AND_CLICK'
     || message.type === 'STEP8_GET_STATE'
     || message.type === 'STEP8_TRIGGER_CONTINUE'
-    || message.type === 'PREPARE_LOGIN_CODE'
     || message.type === 'PREPARE_SIGNUP_VERIFICATION'
     || message.type === 'RESEND_VERIFICATION_CODE'
     || message.type === 'INSPECT_AUTH_PAGE_STATE'
@@ -58,8 +57,6 @@ async function handleCommand(message) {
       return await fillVerificationCode(message.step, message.payload);
     case 'PREPARE_SIGNUP_VERIFICATION':
       return await prepareSignupVerificationFlow(message.payload);
-    case 'PREPARE_LOGIN_CODE':
-      return await prepareLoginCodeFlow();
     case 'RESEND_VERIFICATION_CODE':
       return await resendVerificationCode(message.step);
     case 'INSPECT_AUTH_PAGE_STATE':
@@ -1504,7 +1501,7 @@ async function fillVerificationCode(step, payload) {
 }
 
 // ============================================================
-// Step 6: Login with registered account (on OAuth auth page)
+// Step 6: Find "继续" on OAuth consent page for debugger click
 // ============================================================
 
 async function step7_login(payload) {
@@ -1676,7 +1673,7 @@ async function prepareStep8ContinueButton(options = {}) {
   const continueBtn = await findContinueButton(findTimeoutMs);
   await waitForButtonEnabled(continueBtn, enabledTimeoutMs);
 
-  await humanPause(250, 700);
+  await humanPause(350, 650);
   continueBtn.scrollIntoView({ behavior: 'auto', block: 'center' });
   continueBtn.focus();
   await waitForStableButtonRect(continueBtn);

@@ -62,6 +62,39 @@ let settingsSaveInFlight = false;
 let settingsAutoSaveTimer = null;
 let modalChoiceResolver = null;
 let currentModalActions = [];
+let currentWindowId = null;
+let currentWindowIdPromise = null;
+
+async function ensureWindowId() {
+  if (Number.isInteger(currentWindowId)) {
+    return currentWindowId;
+  }
+  if (!currentWindowIdPromise) {
+    currentWindowIdPromise = chrome.windows.getCurrent()
+      .then((win) => {
+        if (!Number.isInteger(win?.id)) {
+          throw new Error('无法获取当前窗口 ID。');
+        }
+        currentWindowId = win.id;
+        return currentWindowId;
+      })
+      .catch((err) => {
+        currentWindowIdPromise = null;
+        throw err;
+      });
+  }
+  return currentWindowIdPromise;
+}
+
+async function sendRuntimeMessage(message) {
+  const windowId = await ensureWindowId();
+  return chrome.runtime.sendMessage({
+    ...message,
+    windowId,
+  });
+}
+
+ensureWindowId().catch(() => { });
 
 const EYE_OPEN_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
 const EYE_CLOSED_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19C5 19 1 12 1 12a21.77 21.77 0 0 1 5.06-6.94"/><path d="M9.9 4.24A10.94 10.94 0 0 1 12 5c7 0 11 7 11 7a21.86 21.86 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/></svg>';
@@ -192,8 +225,59 @@ function isDoneStatus(status) {
   return status === 'completed' || status === 'manual_completed' || status === 'skipped';
 }
 
+function normalizeFlowStep(step) {
+  const numericStep = Number(step) || 0;
+  if (numericStep === 8) return 6;
+  if (numericStep === 9) return 7;
+  return numericStep;
+}
+
+function isLegacyFlowState(state = {}) {
+  const storedVersion = Number(state?.flowVersion || 0);
+  if (storedVersion >= FLOW_VERSION) {
+    return false;
+  }
+
+  const statuses = state?.stepStatuses || {};
+  return Boolean(
+    Number(state?.currentStep)
+    || statuses[6] !== undefined
+    || statuses[7] !== undefined
+    || statuses[8] !== undefined
+    || statuses[9] !== undefined
+    || state?.localhostUrl
+  );
+}
+
+function normalizeStepStatuses(statuses = {}, options = {}) {
+  const { legacy = false, localhostUrl = null } = options;
+  const normalized = { ...STEP_DEFAULT_STATUSES };
+  for (let step = 1; step <= 5; step++) {
+    if (statuses[step] !== undefined) {
+      normalized[step] = statuses[step];
+    }
+  }
+  if (legacy) {
+    if (statuses[8] !== undefined) normalized[6] = statuses[8];
+    if (statuses[9] !== undefined) normalized[7] = statuses[9];
+  } else {
+    if (statuses[6] !== undefined) normalized[6] = statuses[6];
+    if (statuses[7] !== undefined) normalized[7] = statuses[7];
+  }
+  if (localhostUrl) {
+    normalized[6] = isDoneStatus(normalized[6]) ? normalized[6] : 'completed';
+  }
+  if (isDoneStatus(normalized[7]) && !isDoneStatus(normalized[6])) {
+    normalized[6] = 'completed';
+  }
+  return normalized;
+}
+
 function getStepStatuses(state = latestState) {
-  return { ...STEP_DEFAULT_STATUSES, ...(state?.stepStatuses || {}) };
+  return normalizeStepStatuses(state?.stepStatuses || {}, {
+    legacy: isLegacyFlowState(state),
+    localhostUrl: state?.localhostUrl,
+  });
 }
 
 function getFirstUnfinishedStep(state = latestState) {
@@ -216,13 +300,20 @@ function shouldOfferAutoModeChoice(state = latestState) {
 }
 
 function syncLatestState(nextState) {
-  const mergedStepStatuses = nextState?.stepStatuses
-    ? { ...STEP_DEFAULT_STATUSES, ...(latestState?.stepStatuses || {}), ...nextState.stepStatuses }
-    : getStepStatuses(latestState);
-
-  latestState = {
+  const mergedState = {
     ...(latestState || {}),
     ...(nextState || {}),
+  };
+  const mergedStepStatuses = nextState?.stepStatuses
+    ? getStepStatuses({
+        ...mergedState,
+        stepStatuses: { ...(latestState?.stepStatuses || {}), ...nextState.stepStatuses },
+      })
+    : getStepStatuses(mergedState);
+
+  latestState = {
+    ...mergedState,
+    flowVersion: FLOW_VERSION,
     stepStatuses: mergedStepStatuses,
   };
 }
@@ -314,7 +405,7 @@ async function saveSettings(options = {}) {
   updateSaveButtonState();
 
   try {
-    const response = await chrome.runtime.sendMessage({
+    const response = await sendRuntimeMessage({
       type: 'SAVE_SETTING',
       source: 'sidepanel',
       payload,
@@ -417,7 +508,7 @@ function initializeManualStepActions() {
 
 async function restoreState() {
   try {
-    const state = await chrome.runtime.sendMessage({ type: 'GET_STATE', source: 'sidepanel' });
+    const state = await sendRuntimeMessage({ type: 'GET_STATE', source: 'sidepanel' });
     syncLatestState(state);
     syncAutoRunState(state);
 
@@ -505,13 +596,14 @@ function updateMailProviderUI() {
 // ============================================================
 
 function updateStepUI(step, status) {
-  const statusEl = document.querySelector(`.step-status[data-step="${step}"]`);
-  const row = document.querySelector(`.step-row[data-step="${step}"]`);
+  const normalizedStep = normalizeFlowStep(step);
+  const statusEl = document.querySelector(`.step-status[data-step="${normalizedStep}"]`);
+  const row = document.querySelector(`.step-row[data-step="${normalizedStep}"]`);
 
   syncLatestState({
     stepStatuses: {
       ...getStepStatuses(),
-      [step]: status,
+      [normalizedStep]: status,
     },
   });
 
@@ -554,7 +646,7 @@ function updateButtonStates() {
   }
 
   document.querySelectorAll('.step-manual-btn').forEach((btn) => {
-    const step = Number(btn.dataset.step);
+    const step = normalizeFlowStep(btn.dataset.step);
     const currentStatus = statuses[step];
     const index = STEP_INDEX_BY_ID.get(step) || 0;
     const previousStep = index > 0 ? STEP_IDS[index - 1] : null;
@@ -750,13 +842,13 @@ async function maybeTakeoverAutoRun(actionLabel) {
     return false;
   }
 
-  await chrome.runtime.sendMessage({ type: 'TAKEOVER_AUTO_RUN', source: 'sidepanel', payload: {} });
+  await sendRuntimeMessage({ type: 'TAKEOVER_AUTO_RUN', source: 'sidepanel', payload: {} });
   return true;
 }
 
 async function handleSkipStep(step) {
   if (isAutoRunPausedPhase()) {
-    const takeoverResponse = await chrome.runtime.sendMessage({
+    const takeoverResponse = await sendRuntimeMessage({
       type: 'TAKEOVER_AUTO_RUN',
       source: 'sidepanel',
       payload: {},
@@ -766,7 +858,7 @@ async function handleSkipStep(step) {
     }
   }
 
-  const response = await chrome.runtime.sendMessage({
+  const response = await sendRuntimeMessage({
     type: 'SKIP_STEP',
     source: 'sidepanel',
     payload: { step },
@@ -854,7 +946,8 @@ btnSaveSettings.addEventListener('click', async () => {
 
 btnStop.addEventListener('click', async () => {
   btnStop.disabled = true;
-  await chrome.runtime.sendMessage({ type: 'STOP_FLOW', source: 'sidepanel', payload: {} });
+  await sendRuntimeMessage({ type: 'STOP_FLOW', source: 'sidepanel', payload: {} });
+  updateButtonStates();
   showToast('正在停止当前流程...', 'warn', 2000);
 });
 
@@ -885,7 +978,7 @@ btnAutoRun.addEventListener('click', async () => {
     btnAutoRun.disabled = true;
     inputRunCount.disabled = true;
     btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> 运行中...';
-    const response = await chrome.runtime.sendMessage({
+    const response = await sendRuntimeMessage({
       type: 'AUTO_RUN',
       source: 'sidepanel',
       payload: {
@@ -912,7 +1005,7 @@ btnAutoContinue.addEventListener('click', async () => {
     return;
   }
   autoContinueBar.style.display = 'none';
-  await chrome.runtime.sendMessage({ type: 'RESUME_AUTO_RUN', source: 'sidepanel', payload: { email } });
+  await sendRuntimeMessage({ type: 'RESUME_AUTO_RUN', source: 'sidepanel', payload: { email } });
 });
 
 // Reset
@@ -927,8 +1020,8 @@ btnReset.addEventListener('click', async () => {
     return;
   }
 
-  await chrome.runtime.sendMessage({ type: 'RESET', source: 'sidepanel' });
-  syncLatestState({ stepStatuses: STEP_DEFAULT_STATUSES });
+  await sendRuntimeMessage({ type: 'RESET', source: 'sidepanel' });
+  syncLatestState({ stepStatuses: STEP_DEFAULT_STATUSES, email: null });
   syncAutoRunState({ autoRunning: false, autoRunPhase: 'idle', autoRunCurrentRun: 0, autoRunTotalRuns: 1, autoRunAttemptRun: 0 });
   displayOauthUrl.textContent = '等待中...';
   displayOauthUrl.classList.remove('has-value');
@@ -957,7 +1050,7 @@ btnClearLog.addEventListener('click', () => {
 inputEmail.addEventListener('change', async () => {
   const email = inputEmail.value.trim();
   if (email) {
-    await chrome.runtime.sendMessage({ type: 'SAVE_EMAIL', source: 'sidepanel', payload: { email } });
+    await sendRuntimeMessage({ type: 'SAVE_EMAIL', source: 'sidepanel', payload: { email } });
   }
 });
 inputEmail.addEventListener('input', updateButtonStates);
@@ -1008,6 +1101,15 @@ inputAutoSkipFailures.addEventListener('change', () => {
 // ============================================================
 
 chrome.runtime.onMessage.addListener((message) => {
+  if (Number.isInteger(message.windowId)) {
+    if (!Number.isInteger(currentWindowId)) {
+      return;
+    }
+    if (message.windowId !== currentWindowId) {
+      return;
+    }
+  }
+
   switch (message.type) {
     case 'LOG_ENTRY':
       appendLog(message.payload);
@@ -1017,9 +1119,10 @@ chrome.runtime.onMessage.addListener((message) => {
       break;
 
     case 'STEP_STATUS_CHANGED': {
-      const { step, status } = message.payload;
+      const step = normalizeFlowStep(message.payload.step);
+      const { status } = message.payload;
       updateStepUI(step, status);
-      chrome.runtime.sendMessage({ type: 'GET_STATE', source: 'sidepanel' }).then(state => {
+      sendRuntimeMessage({ type: 'GET_STATE', source: 'sidepanel' }).then(state => {
         syncLatestState(state);
         syncAutoRunState(state);
         updateStatusDisplay(latestState);
@@ -1069,8 +1172,8 @@ chrome.runtime.onMessage.addListener((message) => {
 
     case 'DATA_UPDATED': {
       syncLatestState(message.payload);
-      if (message.payload.email) {
-        inputEmail.value = message.payload.email;
+      if (message.payload.email !== undefined) {
+        inputEmail.value = message.payload.email || '';
       }
       if (message.payload.password !== undefined) {
         inputPassword.value = message.payload.password || '';

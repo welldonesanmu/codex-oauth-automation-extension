@@ -1,38 +1,15 @@
-# Multi-Page Automation
+# 多页面自动化
 
-一个用于批量跑通 ChatGPT OAuth 注册/登录流程的 Chrome 扩展。
+一个基于 Chromium Manifest V3 的侧边栏扩展，用于自动执行 Codex / ChatGPT OAuth 注册与授权流程。
 
 当前版本为 `v2.0.0`，基于侧边栏控制，支持单步执行、整套自动执行、停止当前流程、保存常用配置，以及通过 DuckDuckGo / QQ / 163 / Inbucket mailbox 协助获取验证码。
 
-## 最新版本测试结果
-
-最新版本实测了一个 5 轮自动，0 次失重试；睡前挂了一个十轮自动，1次重试：
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <img src="docs/images/五轮自动.png" alt="最新版本五轮测试结果" width="100%" />
-    </td>
-    <td align="center" width="50%">
-      <img src="docs/images/十轮自动.png" alt="最新版本运行日志" width="100%" />
-    </td>
-  </tr>
-</table>
-
-## 打赏一下
-
-佬们觉得好用的话，也可以打赏小弟一杯奶茶哦
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <img src="docs/images/支付宝.jpg" alt="支付宝收款码" width="100%" />
-    </td>
-    <td align="center" width="50%">
-      <img src="docs/images/微信.png" alt="微信收款码" width="100%" />
-    </td>
-  </tr>
-</table>
+- 保持 **7 步**主流程
+- 支持 **单步执行 / Auto 多轮运行 / Stop 中断**
+- 支持 **按浏览器 window 隔离状态与任务空间**
+- Step 1 / Step 2 尽量后台执行，减少抢焦点
+- Step 3 会切回注册页前台填写邮箱和密码，以提升成功率
+- Step 6 自动处理授权页“继续”与 localhost 回调捕获
 
 ## 当前能力
 
@@ -52,28 +29,52 @@
 - Step 9 会自动寻找 OAuth 同意页的“继续”按钮，并通过 Chrome debugger 输入事件发起点击，然后监听本地回调地址
 - Step 10 会校验 CPA 面板当前显示的授权链接必须与 Step 7 发起时一致，避免把 localhost 回调提交到错误链路
 
+## 邮箱相关
 
-## 环境要求
+当前版本把“生成注册邮箱”和“接收验证码邮箱”拆开：
 
-- Chrome 浏览器
-- 打开扩展开发者模式
-- 你自己的 CPA 管理面板，且页面结构与当前脚本适配
-- 至少准备一种验证码接收方式：
-  - DuckDuckGo `@duck.com` + QQ / 163 / Inbucket 转发
-  - 手动填写一个可收信邮箱
-- 如果使用 `QQ` / `163` / `Inbucket`，对应页面需要提前能正常打开
+- `emailGenerationService`：只决定 **Step 3 注册邮箱来源**
+- `mailProvider`：只决定 **Step 4 / Step 6 验证码邮箱来源**
 
-## 安装
+### Step 3 注册邮箱来源
 
-1. 打开 `chrome://extensions/`
-2. 开启“开发者模式”
-3. 点击“加载已解压的扩展程序”
-4. 选择本项目目录
-5. 打开扩展侧边栏
+支持：
 
-## 侧边栏配置说明
+- Duck Mail
+- SimpleLogin
+- Addy.io
 
-### `CPA`
+### 验证码邮箱来源
+
+支持：
+
+- 163 Mail
+- QQ Mail
+
+## 7 步流程
+
+1. `Get OAuth Link`：打开 CPA OAuth 面板并获取授权链接
+2. `Open Signup`：打开 OpenAI 注册页并进入注册入口
+3. `Fill Email / Password`：获取或填写邮箱，填写密码并提交
+4. `Get Signup Code`：轮询验证码邮箱，读取并回填注册验证码
+5. `Fill Name / Birthday`：填写资料页信息
+6. `Auto OAuth Confirm`：处理剩余登录校验、点击“继续”、监听 localhost 回调
+7. `CPA Verify`：回到 CPA 面板提交 localhost 回调地址并确认成功
+
+## 自动运行
+
+点击侧边栏右上角 `Auto` 后，扩展会按顺序执行整套 7 步流程。
+
+支持：
+
+- 多轮自动运行
+- 中途停止
+- 继续当前进度 / 重新开始
+- 当前轮失败后按策略重试
+
+## 侧边栏主要配置
+
+### CPA
 
 你的管理面板 OAuth 页面地址，例如：
 
@@ -83,24 +84,24 @@ http(s)://<your-host>/management.html#/oauth
 
 Step 7 和 Step 10 都依赖这个地址。
 
-### `Mail`
+### Mail Provider
 
-支持三种验证码来源：
+验证码邮箱来源：
 
-- `163 Mail`
-- `QQ Mail`
-- `Inbucket`
+- `163`
+- `QQ`
 
-说明：
+### Email Generation Service
 
-- `QQ` 和 `163` 用于直接轮询网页邮箱
-- `Inbucket` 通过你在侧边栏里配置的 host 访问 `mailbox` 页面：`https://<your-inbucket-host>/m/<mailbox>/`
+Step 3 注册邮箱生成服务：
 
-### `Mailbox`
+- `Duck Mail`
+- `SimpleLogin`
+- `Addy.io`
 
-仅当 `Mail = Inbucket` 时显示。
+### Email
 
-填写 Inbucket mailbox 名称，例如：
+当前轮使用的注册邮箱。
 
 ```txt
 tmp-mailbox
@@ -136,36 +137,37 @@ Step 2 使用的注册邮箱。
 来源有两种：
 
 - 手动粘贴
-- 点击 `Auto` 从 DuckDuckGo Email Protection 自动获取一个新的 `@duck.com`
+- 由所选 `Email Generation Service` 自动获取
 
-注意：
-
-- 当前 `Auto` 按钮只负责 DuckDuckGo 地址获取
-- 如果你使用 Inbucket，它只是验证码收件箱，不会自动生成 Inbucket 地址
-
-### `Password`
+### Password
 
 - 留空：自动生成强密码
-- 手动输入：使用你自定义的密码
-- 可通过输入框右侧的眼睛图标切换显示
-- 配置会自动保存，也可以点击右侧 `保存` 按钮手动保存一次
+- 手动输入：使用自定义密码
 
-扩展会把本轮实际使用的密码同步回侧边栏，便于查看和复制。
+## 安装
 
-### `Auto`
+1. 打开浏览器扩展页面
+   - Edge：`edge://extensions/`
+   - Chrome：`chrome://extensions/`
+2. 开启“开发者模式”
+3. 点击“加载已解压的扩展程序”
+4. 选择本项目目录
+5. 打开扩展侧边栏开始使用
 
-整套流程自动跑。
+## 关键行为说明
 
-支持多轮运行，运行次数由右上角数字框决定。
+### Step 1
 
-如果当前面板里已经存在未完成进度，点击 `Auto` 时会弹出选择：
+- CPA 面板会尽量后台打开
+- 如果复用的是同一个 CPA URL，会在后台 reload 一次，确保 OAuth 链接能刷新
 
 - `重新开始`：重置当前流程进度，从 Step 1 打开 ChatGPT 官网开始新一轮
 - `继续当前`：把 `已完成 / 已跳过` 视为已处理，从第一个未处理步骤继续往后执行
 
-## 工作流
+- 注册页会切到前台再填写邮箱/密码并提交
+- 这样能明显降低 `operation timed out` 的概率
 
-### 单步模式
+### Step 4 / Step 6
 
 侧边栏共有 10 个步骤按钮，可逐步执行：
 
@@ -382,8 +384,9 @@ content/signup-page.js     ChatGPT 注册/登录页步骤：Step 1 / 2 / 3 / 5 /
 content/duck-mail.js       Duck 邮箱自动获取
 content/qq-mail.js         QQ 邮箱验证码轮询
 content/mail-163.js        163 邮箱验证码轮询
-content/inbucket-mail.js   Inbucket mailbox 验证码轮询
+content/utils.js           通用工具
 sidepanel/                 侧边栏 UI
+data/names.js              随机资料数据
 ```
 
 ## 常见使用建议
@@ -442,14 +445,12 @@ sidepanel/                 侧边栏 UI
 
 ## 调试建议
 
-- 打开扩展侧边栏看日志
-- 查看 Service Worker 控制台
-- 查看目标页面的 content script 控制台日志
-- 当某一步频繁失败时，优先检查当前页面选择器是否仍然匹配
+- 先单步跑通，再开 Auto
+- 重点关注侧边栏日志和 Service Worker 控制台
+- 如果某一步频繁失败，优先检查目标页面 DOM / 按钮文案是否变化
 
-## 安全说明
+## 已知限制
 
-- 所有状态仅保存在浏览器会话中
-- 没有硬编码你的 CPA 地址、密码或账户
-- 自定义密码只存在当前会话存储中
-- 邮箱和密码会被记录到本轮 `accounts` 中，便于追踪本次运行结果
+- Step 6 对 OAuth 同意页结构较敏感
+- 邮箱页面 DOM 变化会影响验证码轮询
+- CPA 管理面板 DOM 变化会影响 Step 1 / Step 7
