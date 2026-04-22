@@ -1,13 +1,43 @@
 // background.js — Service Worker: orchestration, state, tab management, message routing
 
 importScripts('data/names.js');
+importScripts('data/step-definitions.js');
 
 const LOG_PREFIX = '[MultiPage:bg]';
 const DUCK_AUTOFILL_URL = 'https://duckduckgo.com/email/settings/autofill';
+const SIMPLELOGIN_APP_URL = 'https://app.simplelogin.io/dashboard/';
+const ADDY_APP_URL = 'https://app.addy.io/aliases';
+const EMAIL_GENERATION_SERVICE_DEFAULT = 'duckmail';
+const EMAIL_GENERATION_SERVICES = ['duckmail', 'simplelogin', 'addy'];
 const STOP_ERROR_MESSAGE = '流程已被用户停止。';
 const HUMAN_STEP_DELAY_MIN = 700;
 const HUMAN_STEP_DELAY_MAX = 2200;
-const STEP7_RESTART_MAX_ROUNDS = 8;
+const STEP8_RESTART_MAX_ROUNDS = 8;
+const SHARED_STEP_DEFINITIONS = self.MultiPageStepDefinitions?.getSteps?.() || [];
+const STEP_IDS = SHARED_STEP_DEFINITIONS
+  .map((definition) => Number(definition?.id))
+  .filter(Number.isFinite)
+  .sort((left, right) => left - right);
+const MAX_FLOW_STEP = STEP_IDS[STEP_IDS.length - 1] || 10;
+const FINAL_OAUTH_CHAIN_START_STEP = 7;
+const STEP_DEFAULT_STATUSES = Object.fromEntries(STEP_IDS.map((stepId) => [stepId, 'pending']));
+const PRE_LOGIN_COOKIE_CLEAR_DOMAINS = [
+  'chatgpt.com',
+  'chat.openai.com',
+  'openai.com',
+  'auth.openai.com',
+  'auth0.openai.com',
+  'accounts.openai.com',
+];
+const PRE_LOGIN_COOKIE_CLEAR_ORIGINS = [
+  'https://chatgpt.com',
+  'https://chat.openai.com',
+  'https://auth.openai.com',
+  'https://auth0.openai.com',
+  'https://accounts.openai.com',
+  'https://openai.com',
+];
+const STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS = 6000;
 
 initializeSessionStorageAccess();
 
@@ -16,24 +46,21 @@ initializeSessionStorageAccess();
 // ============================================================
 
 const PERSISTED_SETTING_DEFAULTS = {
-  vpsUrl: '', // VPS 面板地址，可手动填写。
-  vpsPassword: '', // VPS 面板登录密码，可手动填写。
-  customPassword: '', // 自定义账号密码；留空时由程序自动生成随机密码。
-  autoRunSkipFailures: false, // 自动运行遇到失败步骤后，是否继续执行后续流程。
-  mailProvider: '163', // 验证码邮箱来源，当前支持 163 / inbucket。
-  inbucketHost: '', // 仅当 mailProvider 为 inbucket 时填写 Inbucket 地址，其他情况保持为空。
-  inbucketMailbox: '', // 仅当 mailProvider 为 inbucket 时填写邮箱名，其他情况保持为空。
+  vpsUrl: '',
+  vpsPassword: '',
+  customPassword: '',
+  autoRunSkipFailures: false,
+  mailProvider: '163',
+  emailGenerationService: EMAIL_GENERATION_SERVICE_DEFAULT,
 };
 
 const PERSISTED_SETTING_KEYS = Object.keys(PERSISTED_SETTING_DEFAULTS);
 
 const DEFAULT_STATE = {
   currentStep: 0, // 当前流程执行到的步骤编号。
-  stepStatuses: {
-    1: 'pending', 2: 'pending', 3: 'pending', 4: 'pending', 5: 'pending', // 运行时步骤状态映射，不要手动预填。
-    6: 'pending', 7: 'pending', 8: 'pending', 9: 'pending',
-  },
+  stepStatuses: { ...STEP_DEFAULT_STATUSES },
   oauthUrl: null, // 运行时抓取到的 OAuth 地址，不要手动预填。
+  oauthSourceTabId: null, // 产生当前 OAuth 链路的 CPA 标签页。
   email: null, // 运行时邮箱，由程序自动获取并写入，不能手动预填。
   password: null, // 运行时实际密码，由 customPassword 或程序自动生成后写入。
   accounts: [], // 已生成账号记录：{ email, password, createdAt }。
@@ -41,6 +68,7 @@ const DEFAULT_STATE = {
   lastSignupCode: null, // 注册验证码，运行时由程序自动读取并写入。
   lastLoginCode: null, // 登录验证码，运行时由程序自动读取并写入。
   localhostUrl: null, // 运行时捕获到的 localhost 回调地址，不要手动预填。
+  authPageState: null, // 记录认证页当前已知的终态：logged_in_home / consent / callback。
   flowStartTime: null, // 当前流程开始时间。
   tabRegistry: {}, // 程序维护的标签页注册表。
   sourceLastUrls: {}, // 各来源页面最近一次打开的地址记录。
@@ -129,7 +157,6 @@ async function resetState() {
   const [prev, persistedSettings] = await Promise.all([
     chrome.storage.session.get([
       'seenCodes',
-      'seenInbucketMailIds',
       'accounts',
       'tabRegistry',
       'sourceLastUrls',
@@ -141,7 +168,6 @@ async function resetState() {
     ...DEFAULT_STATE,
     ...persistedSettings,
     seenCodes: prev.seenCodes || [],
-    seenInbucketMailIds: prev.seenInbucketMailIds || [],
     accounts: prev.accounts || [],
     tabRegistry: prev.tabRegistry || {},
     sourceLastUrls: prev.sourceLastUrls || {},
@@ -220,20 +246,19 @@ function parseUrlSafely(rawUrl) {
 }
 
 function isSignupPageHost(hostname = '') {
-  return ['auth0.openai.com', 'auth.openai.com', 'accounts.openai.com'].includes(hostname);
+  return ['auth0.openai.com', 'auth.openai.com', 'accounts.openai.com', 'chatgpt.com'].includes(hostname);
 }
 
 function is163MailHost(hostname = '') {
   return hostname === 'mail.163.com'
-    || hostname.endsWith('.mail.163.com')
-    || hostname === 'webmail.vip.163.com';
+    || hostname.endsWith('.mail.163.com');
 }
 
 function isLocalhostOAuthCallbackUrl(rawUrl) {
   const parsed = parseUrlSafely(rawUrl);
   if (!parsed) return false;
   if (!['http:', 'https:'].includes(parsed.protocol)) return false;
-  if (!['localhost', '127.0.0.1'].includes(parsed.hostname)) return false;
+  if (!['localhost', '127.0.0.1', '192.168.2.1'].includes(parsed.hostname)) return false;
   if (parsed.pathname !== '/auth/callback') return false;
 
   const code = (parsed.searchParams.get('code') || '').trim();
@@ -248,6 +273,51 @@ function buildLocalhostCleanupPrefix(rawUrl) {
   return parsed ? `${parsed.origin}/auth` : '';
 }
 
+function normalizeEmailGenerationService(service) {
+  const value = String(service || '').trim().toLowerCase();
+  return EMAIL_GENERATION_SERVICES.includes(value) ? value : EMAIL_GENERATION_SERVICE_DEFAULT;
+}
+
+function getEmailGenerationServiceLabel(service) {
+  const normalized = normalizeEmailGenerationService(service);
+  if (normalized === 'simplelogin') return 'SimpleLogin';
+  if (normalized === 'addy') return 'Addy.io';
+  return 'Duck 邮箱';
+}
+
+function isDuckMailGenerationService(service) {
+  return normalizeEmailGenerationService(service) === 'duckmail';
+}
+
+function getEmailGenerationServiceConfig(service) {
+  const normalized = normalizeEmailGenerationService(service);
+  if (normalized === 'simplelogin') {
+    return {
+      service: normalized,
+      source: 'simplelogin-mail',
+      url: SIMPLELOGIN_APP_URL,
+      label: 'SimpleLogin',
+      logLabel: 'SimpleLogin',
+    };
+  }
+  if (normalized === 'addy') {
+    return {
+      service: normalized,
+      source: 'addy-mail',
+      url: ADDY_APP_URL,
+      label: 'Addy.io',
+      logLabel: 'Addy.io',
+    };
+  }
+  return {
+    service: 'duckmail',
+    source: 'duck-mail',
+    url: DUCK_AUTOFILL_URL,
+    label: 'Duck 邮箱',
+    logLabel: 'Duck 邮箱',
+  };
+}
+
 function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
   const candidate = parseUrlSafely(candidateUrl);
   if (!candidate) return false;
@@ -259,14 +329,14 @@ function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
       return isSignupPageHost(candidate.hostname);
     case 'duck-mail':
       return candidate.hostname === 'duckduckgo.com' && candidate.pathname.startsWith('/email/');
+    case 'simplelogin-mail':
+      return candidate.hostname === 'app.simplelogin.io' && candidate.pathname.startsWith('/dashboard');
+    case 'addy-mail':
+      return candidate.hostname === 'app.addy.io' && candidate.pathname.startsWith('/aliases');
     case 'qq-mail':
       return candidate.hostname === 'mail.qq.com' || candidate.hostname === 'wx.mail.qq.com';
     case 'mail-163':
       return is163MailHost(candidate.hostname);
-    case 'inbucket-mail':
-      return Boolean(reference)
-        && candidate.origin === reference.origin
-        && candidate.pathname.startsWith('/m/');
     case 'vps-panel':
       return Boolean(reference)
         && candidate.origin === reference.origin
@@ -396,7 +466,17 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
     }
 
     if (!inject || !inject.length) {
-      throw new Error(`${getSourceLabel(source)} 内容脚本未就绪，且未提供可用的注入文件。`);
+      if (logMessage && !logged) {
+        console.warn(
+          LOG_PREFIX,
+          `[ensureContentScriptReadyOnTab] ${source} tab=${tabId} still not ready after ${Date.now() - start}ms`
+        );
+        await addLog(logMessage, 'warn');
+        logged = true;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      continue;
     }
 
     const registry = await getTabRegistry();
@@ -471,11 +551,19 @@ function getContentScriptResponseTimeoutMs(message) {
   }
 
   if (message.type === 'FILL_CODE') {
-    return Number(message.step) === 7 ? 45000 : 30000;
+    return Number(message.step) === 8 ? 45000 : 30000;
   }
 
   if (message.type === 'PREPARE_SIGNUP_VERIFICATION') {
     return 45000;
+  }
+
+  if (message.type === 'EXECUTE_STEP' && Number(message.step) === 2) {
+    return 45000;
+  }
+
+  if (message.type === 'FETCH_GENERATED_EMAIL' || message.type === 'FETCH_DUCK_EMAIL') {
+    return message.payload?.generateNew === false ? 45000 : 90000;
   }
 
   return 30000;
@@ -601,6 +689,7 @@ function cancelPendingCommands(reason = STOP_ERROR_MESSAGE) {
 // ============================================================
 
 async function reuseOrCreateTab(source, url, options = {}) {
+  const shouldActivate = options.activate !== false;
   const alive = await isTabAlive(source);
   if (alive) {
     const tabId = await getTabId(source);
@@ -611,7 +700,9 @@ async function reuseOrCreateTab(source, url, options = {}) {
 
     const registry = await getTabRegistry();
     if (sameUrl) {
-      await chrome.tabs.update(tabId, { active: true });
+      if (shouldActivate) {
+        await chrome.tabs.update(tabId, { active: true });
+      }
       console.log(LOG_PREFIX, `Reused tab ${source} (${tabId}) on same URL`);
 
       if (shouldReloadOnReuse) {
@@ -661,7 +752,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
     await setState({ tabRegistry: registry });
 
     // Navigate existing tab to new URL
-    await chrome.tabs.update(tabId, { url, active: true });
+    await chrome.tabs.update(tabId, shouldActivate ? { url, active: true } : { url });
     console.log(LOG_PREFIX, `Reused tab ${source} (${tabId}), navigated to ${url.slice(0, 60)}`);
 
     // Wait for page load complete (with 30s timeout)
@@ -703,7 +794,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
 
   // Create new tab
   await closeConflictingTabsForSource(source, url);
-  const tab = await chrome.tabs.create({ url, active: true });
+  const tab = await chrome.tabs.create({ url, active: shouldActivate });
   console.log(LOG_PREFIX, `Created new tab ${source} (${tab.id})`);
 
   // If dynamic injection needed (VPS panel), inject scripts after load
@@ -750,7 +841,7 @@ async function sendToContentScript(source, message, options = {}) {
 
   if (!entry || !entry.ready) {
     console.log(LOG_PREFIX, `${source} not ready, queuing command`);
-    return queueCommand(source, messageWithSession);
+    return queueCommand(source, messageWithSession, Math.max(15000, responseTimeoutMs));
   }
 
   // Verify tab is still alive
@@ -758,7 +849,7 @@ async function sendToContentScript(source, message, options = {}) {
   if (!alive) {
     // Tab was closed — queue the command, it will be sent when tab is reopened
     console.log(LOG_PREFIX, `${source} tab was closed, queuing command`);
-    return queueCommand(source, messageWithSession);
+    return queueCommand(source, messageWithSession, Math.max(15000, responseTimeoutMs));
   }
 
   console.log(LOG_PREFIX, `Sending to ${source} (tab ${entry.tabId}):`, messageWithSession.type);
@@ -766,7 +857,13 @@ async function sendToContentScript(source, message, options = {}) {
 }
 
 async function sendToContentScriptResilient(source, message, options = {}) {
-  const { timeoutMs = 30000, retryDelayMs = 600, logMessage = '' } = options;
+  const {
+    timeoutMs = 30000,
+    retryDelayMs = 600,
+    logMessage = '',
+    responseTimeoutMs,
+    reinjectOnRetry = null,
+  } = options;
   const start = Date.now();
   let lastError = null;
   let logged = false;
@@ -787,7 +884,11 @@ async function sendToContentScriptResilient(source, message, options = {}) {
         LOG_PREFIX,
         `[sendToContentScriptResilient] attempt ${attempt} -> ${debugLabel}, elapsed=${Date.now() - start}ms`
       );
-      const result = await sendToContentScript(source, message);
+      const result = await sendToContentScript(
+        source,
+        message,
+        Number.isFinite(responseTimeoutMs) ? { responseTimeoutMs } : {}
+      );
       console.log(
         LOG_PREFIX,
         `[sendToContentScriptResilient] success ${debugLabel} on attempt ${attempt} after ${Date.now() - start}ms`
@@ -807,6 +908,22 @@ async function sendToContentScriptResilient(source, message, options = {}) {
       if (logMessage && !logged) {
         await addLog(logMessage, 'warn');
         logged = true;
+      }
+
+      if (reinjectOnRetry?.url && Array.isArray(reinjectOnRetry.inject) && reinjectOnRetry.inject.length) {
+        try {
+          await reuseOrCreateTab(source, reinjectOnRetry.url, {
+            inject: reinjectOnRetry.inject,
+            injectSource: reinjectOnRetry.injectSource,
+            reloadIfSameUrl: true,
+            activate: reinjectOnRetry.activate !== false,
+          });
+        } catch (reinjectError) {
+          console.warn(
+            LOG_PREFIX,
+            `[sendToContentScriptResilient] reinject failed for ${debugLabel}: ${reinjectError?.message || reinjectError}`
+          );
+        }
       }
 
       await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
@@ -925,8 +1042,9 @@ function getSourceLabel(source) {
     'vps-panel': 'CPA 面板',
     'qq-mail': 'QQ 邮箱',
     'mail-163': '163 邮箱',
-    'inbucket-mail': 'Inbucket 邮箱',
     'duck-mail': 'Duck 邮箱',
+    'simplelogin-mail': 'SimpleLogin',
+    'addy-mail': 'Addy.io',
   };
   return labels[source] || source || '未知来源';
 }
@@ -968,12 +1086,12 @@ function isVerificationMailPollingError(error) {
 
 function isRestartCurrentAttemptError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
-  return /当前邮箱已存在，需要重新开始新一轮|当前流程已进入手机号页面，需要重新开始新一轮|Duck 邮箱自动获取失败，需要重新开始新一轮|认证页进入了手机号页面|点击“继续”后页面跳到了手机号页面|当前页面已进入手机号页面，不是 OAuth 授权同意页/.test(message);
+  return /当前邮箱已存在，需要重新开始新一轮|当前流程已进入手机号页面，需要重新开始新一轮|邮箱自动获取失败，需要重新开始新一轮|认证页进入了手机号页面|点击“继续”后页面跳到了手机号页面|当前页面已进入手机号页面，不是 OAuth 授权同意页/.test(message);
 }
 
-function isStep9OAuthTimeoutError(error) {
+function isStep10OAuthTimeoutError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
-  return /STEP9_OAUTH_TIMEOUT::|认证失败:\s*Timeout waiting for OAuth callback/i.test(message);
+  return /STEP9_OAUTH_TIMEOUT::|STEP10_OAUTH_TIMEOUT::|认证失败:\s*Timeout waiting for OAuth callback/i.test(message);
 }
 
 function isStepDoneStatus(status) {
@@ -981,7 +1099,7 @@ function isStepDoneStatus(status) {
 }
 
 function getFirstUnfinishedStep(statuses = {}) {
-  for (let step = 1; step <= 9; step++) {
+  for (const step of STEP_IDS) {
     if (!isStepDoneStatus(statuses[step] || 'pending')) {
       return step;
     }
@@ -990,19 +1108,21 @@ function getFirstUnfinishedStep(statuses = {}) {
 }
 
 function hasSavedProgress(statuses = {}) {
-  return Object.values({ ...DEFAULT_STATE.stepStatuses, ...statuses }).some((status) => status !== 'pending');
+  return Object.values({ ...STEP_DEFAULT_STATUSES, ...statuses }).some((status) => status !== 'pending');
 }
 
 function getDownstreamStateResets(step) {
   if (step <= 1) {
     return {
       oauthUrl: null,
+      oauthSourceTabId: null,
       flowStartTime: null,
       password: null,
       lastEmailTimestamp: null,
       lastSignupCode: null,
       lastLoginCode: null,
       localhostUrl: null,
+      authPageState: null,
     };
   }
   if (step === 2) {
@@ -1012,6 +1132,8 @@ function getDownstreamStateResets(step) {
       lastSignupCode: null,
       lastLoginCode: null,
       localhostUrl: null,
+      authPageState: null,
+      oauthSourceTabId: null,
     };
   }
   if (step === 3 || step === 4) {
@@ -1020,17 +1142,23 @@ function getDownstreamStateResets(step) {
       lastSignupCode: null,
       lastLoginCode: null,
       localhostUrl: null,
+      authPageState: null,
+      oauthSourceTabId: null,
     };
   }
-  if (step === 5 || step === 6 || step === 7) {
+  if (step >= 5 && step <= 8) {
     return {
       lastLoginCode: null,
       localhostUrl: null,
+      authPageState: null,
+      oauthSourceTabId: null,
     };
   }
-  if (step === 8) {
+  if (step === 9) {
     return {
       localhostUrl: null,
+      authPageState: null,
+      oauthSourceTabId: null,
     };
   }
   return {};
@@ -1042,7 +1170,7 @@ async function invalidateDownstreamAfterStepRestart(step, options = {}) {
   const statuses = { ...(state.stepStatuses || {}) };
   const changedSteps = [];
 
-  for (let downstream = step + 1; downstream <= 9; downstream++) {
+  for (let downstream = step + 1; downstream <= MAX_FLOW_STEP; downstream++) {
     if (statuses[downstream] !== 'pending') {
       statuses[downstream] = 'pending';
       changedSteps.push(downstream);
@@ -1148,15 +1276,6 @@ async function skipStep(step) {
   await setStepStatus(step, 'skipped');
   await addLog(`步骤 ${step} 已跳过`, 'warn');
 
-  if (step === 1) {
-    const latestState = await getState();
-    const step2Status = latestState.stepStatuses?.[2];
-    if (!isStepDoneStatus(step2Status) && step2Status !== 'running') {
-      await setStepStatus(2, 'skipped');
-      await addLog('步骤 1 已跳过，步骤 2 也已同时跳过。', 'warn');
-    }
-  }
-
   return { ok: true, step, status: 'skipped' };
 }
 
@@ -1184,7 +1303,7 @@ async function clickWithDebugger(tabId, rect) {
     throw new Error('未找到用于调试点击的认证页面标签页。');
   }
   if (!rect || !Number.isFinite(rect.centerX) || !Number.isFinite(rect.centerY)) {
-    throw new Error('步骤 8 的调试器兜底点击需要有效的按钮坐标。');
+    throw new Error('步骤 9 的调试器兜底点击需要有效的按钮坐标。');
   }
 
   const target = { tabId };
@@ -1192,7 +1311,7 @@ async function clickWithDebugger(tabId, rect) {
     await chrome.debugger.attach(target, '1.3');
   } catch (err) {
     throw new Error(
-      `步骤 8 的调试器兜底点击附加失败：${err.message}。` +
+      `步骤 9 的调试器兜底点击附加失败：${err.message}。` +
       '如果认证页标签已打开 DevTools，请先关闭后重试。'
     );
   }
@@ -1339,6 +1458,25 @@ async function handleMessage(message, sender) {
       return { ok: true };
     }
 
+    case 'TRACE_EVENT': {
+      if (shouldIgnoreAutoRunAttemptMessage(message)) {
+        console.log(LOG_PREFIX, `Ignored stale TRACE_EVENT from ${message.source}`, message);
+        return { ok: true, ignored: true };
+      }
+      const { kind, url, title, note, step, entries, detail } = message.payload || {};
+      const parts = [
+        `[追踪:${message.source}] ${kind || 'unknown'}`,
+        step ? `step=${step}` : '',
+        note || '',
+        title ? `title=${String(title).replace(/\s+/g, ' ').trim().slice(0, 80)}` : '',
+        url ? `url=${String(url).slice(0, 180)}` : '',
+        detail ? `detail=${String(detail).replace(/\s+/g, ' ').trim().slice(0, 180)}` : '',
+        Array.isArray(entries) && entries.length ? `entries=${entries.join(' || ').slice(0, 700)}` : '',
+      ].filter(Boolean);
+      await addLog(parts.join(' | '), kind === 'add_phone_detected' ? 'warn' : 'info');
+      return { ok: true };
+    }
+
     case 'STEP_COMPLETE': {
       if (shouldIgnoreAutoRunAttemptMessage(message)) {
         console.log(LOG_PREFIX, `Ignored stale STEP_COMPLETE for step ${message.step} from ${message.source}`, message);
@@ -1406,7 +1544,9 @@ async function handleMessage(message, sender) {
       const totalRuns = message.payload?.totalRuns || 1;
       const autoRunSkipFailures = Boolean(message.payload?.autoRunSkipFailures);
       const mode = message.payload?.mode === 'continue' ? 'continue' : 'restart';
-      await setState({ autoRunSkipFailures });
+      const emailGenerationService = normalizeEmailGenerationService(message.payload?.emailGenerationService);
+      await setPersistentSettings({ autoRunSkipFailures, emailGenerationService });
+      await setState({ autoRunSkipFailures, emailGenerationService });
       autoRunLoop(totalRuns, { autoRunSkipFailures, mode });  // fire-and-forget
       return { ok: true };
     }
@@ -1438,8 +1578,7 @@ async function handleMessage(message, sender) {
       if (message.payload.customPassword !== undefined) updates.customPassword = message.payload.customPassword;
       if (message.payload.autoRunSkipFailures !== undefined) updates.autoRunSkipFailures = Boolean(message.payload.autoRunSkipFailures);
       if (message.payload.mailProvider !== undefined) updates.mailProvider = message.payload.mailProvider;
-      if (message.payload.inbucketHost !== undefined) updates.inbucketHost = message.payload.inbucketHost;
-      if (message.payload.inbucketMailbox !== undefined) updates.inbucketMailbox = message.payload.inbucketMailbox;
+      if (message.payload.emailGenerationService !== undefined) updates.emailGenerationService = normalizeEmailGenerationService(message.payload.emailGenerationService);
       await setPersistentSettings(updates);
       await setState(updates);
       return { ok: true };
@@ -1471,13 +1610,14 @@ async function handleMessage(message, sender) {
       return { ok: true };
     }
 
+    case 'FETCH_GENERATED_EMAIL':
     case 'FETCH_DUCK_EMAIL': {
       clearStopRequest();
       const state = await getState();
       if (isAutoRunLockedState(state)) {
-        throw new Error('自动流程运行中，当前不能手动获取 Duck 邮箱。');
+        throw new Error('自动流程运行中，当前不能手动获取邮箱。');
       }
-      const email = await fetchDuckEmail(message.payload || {});
+      const email = await fetchGeneratedEmail(message.payload || {});
       await resumeAutoRun();
       return { ok: true, email };
     }
@@ -1505,22 +1645,47 @@ async function handleStepData(step, payload) {
         broadcastDataUpdate({ oauthUrl: payload.oauthUrl });
       }
       break;
+    case 2:
     case 3:
       if (payload.email) await setEmailState(payload.email);
       break;
     case 4:
       if (payload.emailTimestamp) await setState({ lastEmailTimestamp: payload.emailTimestamp });
       break;
-    case 8:
+    case 5:
+    case 7:
+    case 8: {
+      const updates = {};
       if (payload.localhostUrl) {
         if (!isLocalhostOAuthCallbackUrl(payload.localhostUrl)) {
-          throw new Error('步骤 8 返回了无效的 localhost OAuth 回调地址。');
+          throw new Error(`步骤 ${step} 返回了无效的 localhost OAuth 回调地址。`);
         }
-        await setState({ localhostUrl: payload.localhostUrl });
+        updates.localhostUrl = payload.localhostUrl;
+        updates.authPageState = 'callback';
+      } else if (payload.skippedDirectToConsent) {
+        updates.authPageState = 'consent';
+      } else if (payload.loggedInHome) {
+        updates.authPageState = 'logged_in_home';
+      }
+
+      if (Object.keys(updates).length) {
+        await setState(updates);
+        if (updates.localhostUrl) {
+          broadcastDataUpdate({ localhostUrl: updates.localhostUrl });
+        }
+      }
+      break;
+    }
+    case 9:
+      if (payload.localhostUrl) {
+        if (!isLocalhostOAuthCallbackUrl(payload.localhostUrl)) {
+          throw new Error('步骤 9 返回了无效的 localhost OAuth 回调地址。');
+        }
+        await setState({ localhostUrl: payload.localhostUrl, authPageState: 'callback' });
         broadcastDataUpdate({ localhostUrl: payload.localhostUrl });
       }
       break;
-    case 9: {
+    case 10: {
       const localhostPrefix = buildLocalhostCleanupPrefix(payload.localhostUrl);
       if (localhostPrefix) {
         await closeTabsByUrlPrefix(localhostPrefix);
@@ -1538,7 +1703,7 @@ async function handleStepData(step, payload) {
 const stepWaiters = new Map();
 let resumeWaiter = null;
 const AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS = 120000;
-const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([4, 7, 8]);
+const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([4, 6, 8, 9]);
 
 function waitForStepComplete(step, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
@@ -1643,7 +1808,6 @@ async function executeStep(step) {
 
   const state = await getState();
 
-  // Set flow start time on first step
   if (step === 1 && !state.flowStartTime) {
     await setState({ flowStartTime: Date.now() });
   }
@@ -1659,6 +1823,7 @@ async function executeStep(step) {
       case 7: await executeStep7(state); break;
       case 8: await executeStep8(state); break;
       case 9: await executeStep9(state); break;
+      case 10: await executeStep10(state); break;
       default:
         throw new Error(`未知步骤：${step}`);
     }
@@ -1717,27 +1882,60 @@ async function executeStepAndWait(step, delayAfter = 2000) {
 }
 
 async function fetchDuckEmail(options = {}) {
+  return fetchGeneratedEmail({ ...options, service: 'duckmail' });
+}
+
+async function fetchGeneratedEmail(options = {}) {
   throwIfStopped();
+  const state = await getState();
+  const service = normalizeEmailGenerationService(options.service || state.emailGenerationService);
   const { generateNew = true } = options;
 
-  await addLog(`Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
-  await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL);
+  if (isDuckMailGenerationService(service)) {
+    await addLog(`Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
+    await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL);
 
-  const result = await sendToContentScript('duck-mail', {
-    type: 'FETCH_DUCK_EMAIL',
+    const result = await sendToContentScript('duck-mail', {
+      type: 'FETCH_DUCK_EMAIL',
+      source: 'background',
+      payload: { generateNew },
+    }, {
+      responseTimeoutMs: getContentScriptResponseTimeoutMs({ type: 'FETCH_DUCK_EMAIL', payload: { generateNew } }),
+    });
+
+    if (result?.error) {
+      throw new Error(result.error);
+    }
+    if (!result?.email) {
+      throw new Error('未返回 Duck 邮箱地址。');
+    }
+
+    await setEmailState(result.email);
+    await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
+    return result.email;
+  }
+
+  const config = getEmailGenerationServiceConfig(service);
+  await addLog(`${config.logLabel}：正在打开页面（${generateNew ? '生成新地址' : '读取当前地址'}）...`);
+  await reuseOrCreateTab(config.source, config.url);
+
+  const result = await sendToContentScript(config.source, {
+    type: 'FETCH_GENERATED_EMAIL',
     source: 'background',
-    payload: { generateNew },
+    payload: { generateNew, service },
+  }, {
+    responseTimeoutMs: getContentScriptResponseTimeoutMs({ type: 'FETCH_GENERATED_EMAIL', payload: { generateNew } }),
   });
 
   if (result?.error) {
     throw new Error(result.error);
   }
   if (!result?.email) {
-    throw new Error('未返回 Duck 邮箱地址。');
+    throw new Error(`未返回 ${config.label} 邮箱地址。`);
   }
 
   await setEmailState(result.email);
-  await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
+  await addLog(`${config.logLabel}：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
   return result.email;
 }
 
@@ -1755,17 +1953,18 @@ let activeAutoRunAttemptSessionId = null;
 const DUCK_EMAIL_MAX_ATTEMPTS = 5;
 const VERIFICATION_POLL_MAX_ROUNDS = 5;
 const VERIFICATION_MAIL_RECOVERY_GRACE_MS = 30000;
-const DUCK_EMAIL_RESTART_ERROR_MESSAGE = 'Duck 邮箱自动获取失败，需要重新开始新一轮。';
+const GENERATED_EMAIL_RESTART_ERROR_MESSAGE = '邮箱自动获取失败，需要重新开始新一轮。';
 const AUTO_STEP_DELAYS = {
   1: 2000,
   2: 2000,
   3: 3000,
   4: 2000,
   5: 3000,
-  6: 3000,
-  7: 2000,
+  6: 1000,
+  7: 3000,
   8: 2000,
-  9: 1000,
+  9: 2000,
+  10: 1000,
 };
 
 async function resumeAutoRunIfWaitingForEmail(options = {}) {
@@ -1793,46 +1992,54 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
     return currentState.email;
   }
 
-  let lastDuckError = null;
-  for (let duckAttempt = 1; duckAttempt <= DUCK_EMAIL_MAX_ATTEMPTS; duckAttempt++) {
+  const serviceLabel = getEmailGenerationServiceLabel(currentState.emailGenerationService);
+  let lastGenerationError = null;
+  for (let generationAttempt = 1; generationAttempt <= DUCK_EMAIL_MAX_ATTEMPTS; generationAttempt++) {
     try {
-      if (duckAttempt > 1) {
-        await addLog(`Duck 邮箱：正在进行第 ${duckAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS} 次自动获取重试...`, 'warn');
+      if (generationAttempt > 1) {
+        await addLog(`${serviceLabel}：正在进行第 ${generationAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS} 次自动获取重试...`, 'warn');
       }
-      const duckEmail = await fetchDuckEmail({ generateNew: true });
-      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：Duck 邮箱已就绪：${duckEmail}（第 ${attemptRuns} 次尝试，Duck 第 ${duckAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS} 次获取）===`, 'ok');
-      return duckEmail;
+      const generatedEmail = await fetchGeneratedEmail({ generateNew: true, service: currentState.emailGenerationService });
+      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：${serviceLabel} 已就绪：${generatedEmail}（第 ${attemptRuns} 次尝试，获取第 ${generationAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS} 次）===`, 'ok');
+      return generatedEmail;
     } catch (err) {
-      lastDuckError = err;
-      await addLog(`Duck 邮箱自动获取失败（${duckAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS}）：${err.message}`, 'warn');
+      lastGenerationError = err;
+      await addLog(`${serviceLabel} 自动获取失败（${generationAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS}）：${err.message}`, 'warn');
     }
   }
 
-  await addLog(`Duck 邮箱自动获取已连续失败 ${DUCK_EMAIL_MAX_ATTEMPTS} 次：${lastDuckError?.message || '未知错误'}`, 'error');
-  throw new Error(DUCK_EMAIL_RESTART_ERROR_MESSAGE);
+  await addLog(`${serviceLabel} 自动获取已连续失败 ${DUCK_EMAIL_MAX_ATTEMPTS} 次：${lastGenerationError?.message || '未知错误'}`, 'error');
+  throw new Error(GENERATED_EMAIL_RESTART_ERROR_MESSAGE);
 }
 
 async function runAutoSequenceFromStep(startStep, context = {}) {
   const { targetRun, totalRuns, attemptRuns, continued = false } = context;
-  const maxStep9RestartAttempts = 5;
-  let step9RestartAttempts = 0;
+  const maxStep10RestartAttempts = 5;
+  let step10RestartAttempts = 0;
 
   if (continued) {
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续当前进度，从步骤 ${startStep} 开始（第 ${attemptRuns} 次尝试）===`, 'info');
   } else {
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：第 ${attemptRuns} 次尝试，阶段 1，获取 OAuth 链接并打开注册页 ===`, 'info');
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：第 ${attemptRuns} 次尝试，阶段 1，打开 ChatGPT 官网并准备注册 ===`, 'info');
+  }
+
+  if (startStep <= 1) {
+    await executeStepAndWait(1, AUTO_STEP_DELAYS[1]);
   }
 
   if (startStep <= 2) {
-    for (const step of [1, 2]) {
-      if (step < startStep) continue;
-      await executeStepAndWait(step, AUTO_STEP_DELAYS[step]);
-    }
-  }
-
-  if (startStep <= 3) {
     await ensureAutoEmailReady(targetRun, totalRuns, attemptRuns);
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，注册、验证、登录并完成授权（第 ${attemptRuns} 次尝试）===`, 'info');
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，进入注册流程并填写账号信息（第 ${attemptRuns} 次尝试）===`, 'info');
+    await broadcastAutoRunStatus('running', {
+      currentRun: targetRun,
+      totalRuns,
+      attemptRun: attemptRuns,
+    });
+    await executeStepAndWait(2, AUTO_STEP_DELAYS[2]);
+    await executeStepAndWait(3, AUTO_STEP_DELAYS[3]);
+  } else if (startStep === 3 && !continued) {
+    await ensureAutoEmailReady(targetRun, totalRuns, attemptRuns);
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，填写密码并继续注册（第 ${attemptRuns} 次尝试）===`, 'info');
     await broadcastAutoRunStatus('running', {
       currentRun: targetRun,
       totalRuns,
@@ -1849,21 +2056,21 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
   }
 
   let step = Math.max(startStep, 4);
-  while (step <= 9) {
+  while (step <= MAX_FLOW_STEP) {
     try {
       await executeStepAndWait(step, AUTO_STEP_DELAYS[step]);
       step += 1;
     } catch (err) {
-      if (step === 9 && isStep9OAuthTimeoutError(err) && step9RestartAttempts < maxStep9RestartAttempts) {
-        step9RestartAttempts += 1;
+      if (step === 10 && isStep10OAuthTimeoutError(err) && step10RestartAttempts < maxStep10RestartAttempts) {
+        step10RestartAttempts += 1;
         await addLog(
-          `步骤 9：检测到 OAuth callback 超时，正在回到步骤 6 重新开始授权流程（${step9RestartAttempts}/${maxStep9RestartAttempts}）...`,
+          `步骤 10：检测到 OAuth callback 超时，正在回到步骤 ${FINAL_OAUTH_CHAIN_START_STEP} 重新开始授权流程（${step10RestartAttempts}/${maxStep10RestartAttempts}）...`,
           'warn'
         );
-        await invalidateDownstreamAfterStepRestart(6, {
-          logLabel: `步骤 9 超时后准备回到步骤 6 重试（${step9RestartAttempts}/${maxStep9RestartAttempts}）`,
+        await invalidateDownstreamAfterStepRestart(FINAL_OAUTH_CHAIN_START_STEP, {
+          logLabel: `步骤 10 超时后准备回到步骤 ${FINAL_OAUTH_CHAIN_START_STEP} 重试（${step10RestartAttempts}/${maxStep10RestartAttempts}）`,
         });
-        step = 6;
+        step = FINAL_OAUTH_CHAIN_START_STEP;
         continue;
       }
       throw err;
@@ -1939,8 +2146,7 @@ async function autoRunLoop(totalRuns, options = {}) {
         customPassword: prevState.customPassword,
         autoRunSkipFailures: prevState.autoRunSkipFailures,
         mailProvider: prevState.mailProvider,
-        inbucketHost: prevState.inbucketHost,
-        inbucketMailbox: prevState.inbucketMailbox,
+        emailGenerationService: prevState.emailGenerationService,
         ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
         ...(forceFreshTabsNextRun ? { tabRegistry: {} } : {}),
       };
@@ -2002,8 +2208,8 @@ async function autoRunLoop(totalRuns, options = {}) {
         const errorMessage = getErrorMessage(err);
         const restartReason = errorMessage.includes('手机号页面')
           ? '目标流程进入手机号页面'
-          : (errorMessage.includes('Duck 邮箱自动获取失败')
-            ? 'Duck 邮箱自动获取连续失败'
+          : (errorMessage.includes('邮箱自动获取失败')
+            ? `${getEmailGenerationServiceLabel((await getState()).emailGenerationService)} 自动获取连续失败`
             : '检测到当前邮箱已存在');
         await addLog(`目标 ${targetRun}/${totalRuns} 轮${restartReason}，当前线程已放弃，将重新开始新一轮。`, 'warn');
         const mailSource = getMailConfig(await getState()).source;
@@ -2145,50 +2351,104 @@ async function resumeAutoRun() {
 // Step 1: Get OAuth Link (via vps-panel.js)
 // ============================================================
 
-async function executeStep1(state) {
+async function requestFreshOAuthUrl(state, stepForLog = 7) {
   if (!state.vpsUrl) {
     throw new Error('尚未配置 CPA 地址，请先在侧边栏填写。');
   }
-  await addLog('步骤 1：正在打开 CPA 面板...');
 
+  await addLog(`步骤 ${stepForLog}：正在打开 CPA 面板并刷新 OAuth 链接...`);
   const injectFiles = ['content/utils.js', 'content/vps-panel.js'];
+  let tabId = await getTabId('vps-panel');
+  const alive = tabId && await isTabAlive('vps-panel');
 
-  await closeConflictingTabsForSource('vps-panel', state.vpsUrl);
+  if (!alive) {
+    tabId = await reuseOrCreateTab('vps-panel', state.vpsUrl, {
+      inject: injectFiles,
+      injectSource: 'vps-panel',
+      reloadIfSameUrl: true,
+      activate: false,
+    });
+  } else {
+    await closeConflictingTabsForSource('vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
+    tabId = await reuseOrCreateTab('vps-panel', state.vpsUrl, {
+      inject: injectFiles,
+      injectSource: 'vps-panel',
+      reloadIfSameUrl: true,
+      activate: false,
+    });
+  }
 
-  const tab = await chrome.tabs.create({ url: state.vpsUrl, active: true });
-  const tabId = tab.id;
-  await rememberSourceLastUrl('vps-panel', state.vpsUrl);
-
-  await addLog('步骤 1：CPA 面板已打开，正在等待页面进入目标地址...');
   const matchedTab = await waitForTabUrlFamily('vps-panel', tabId, state.vpsUrl, {
     timeoutMs: 15000,
     retryDelayMs: 400,
   });
   if (!matchedTab) {
-    await addLog('步骤 1：CPA 页面尚未完全进入目标地址，继续尝试连接内容脚本...', 'warn');
+    await addLog(`步骤 ${stepForLog}：CPA 页面尚未完全进入目标地址，继续尝试连接内容脚本...`, 'warn');
   }
 
   await ensureContentScriptReadyOnTab('vps-panel', tabId, {
     inject: injectFiles,
+    injectSource: 'vps-panel',
     timeoutMs: 45000,
     retryDelayMs: 900,
-    logMessage: '步骤 1：CPA 面板仍在加载，正在重试连接内容脚本...',
+    logMessage: `步骤 ${stepForLog}：CPA 面板仍在加载，正在重试连接内容脚本...`,
   });
 
   const result = await sendToContentScriptResilient('vps-panel', {
-    type: 'EXECUTE_STEP',
+    type: 'FETCH_OAUTH_URL',
+    step: stepForLog,
+    source: 'background',
+    payload: { vpsPassword: state.vpsPassword, step: stepForLog },
+  }, {
+    timeoutMs: 120000,
+    responseTimeoutMs: 60000,
+    retryDelayMs: 700,
+    logMessage: `步骤 ${stepForLog}：CPA 面板通信未就绪，正在等待页面恢复...`,
+    reinjectOnRetry: {
+      url: state.vpsUrl,
+      inject: injectFiles,
+      injectSource: 'vps-panel',
+      activate: false,
+      reloadIfSameUrl: true,
+    },
+  });
+
+  const oauthUrl = result?.oauthUrl;
+  if (!oauthUrl) {
+    throw new Error('刷新 OAuth 链接后仍未拿到可用链接。');
+  }
+
+  await setState({ oauthUrl, oauthSourceTabId: tabId, localhostUrl: null, authPageState: null });
+  broadcastDataUpdate({ oauthUrl });
+  return oauthUrl;
+}
+
+async function executeStep1() {
+  const chatgptUrl = 'https://chatgpt.com/';
+  await addLog('步骤 1：正在打开 ChatGPT 官网...');
+  const tabId = await reuseOrCreateTab('signup-page', chatgptUrl);
+  await ensureContentScriptReadyOnTab('signup-page', tabId, {
+    timeoutMs: 30000,
+    retryDelayMs: 600,
+    logMessage: '步骤 1：ChatGPT 页面仍在加载，正在等待内容脚本就绪...',
+  });
+
+  const result = await sendToContentScriptResilient('signup-page', {
+    type: 'ENSURE_SIGNUP_ENTRY_READY',
     step: 1,
     source: 'background',
-    payload: { vpsPassword: state.vpsPassword },
+    payload: { timeout: 20000 },
   }, {
     timeoutMs: 30000,
     retryDelayMs: 700,
-    logMessage: '步骤 1：CPA 面板通信未就绪，正在等待页面恢复...',
+    logMessage: '步骤 1：正在等待 ChatGPT 官网出现注册入口...',
   });
 
   if (result?.error) {
     throw new Error(result.error);
   }
+
+  await completeStepFromBackground(1, {});
 }
 
 // ============================================================
@@ -2196,17 +2456,26 @@ async function executeStep1(state) {
 // ============================================================
 
 async function executeStep2(state) {
-  if (!state.oauthUrl) {
-    throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
+  if (!state.email) {
+    throw new Error('缺少邮箱地址，请先在侧边栏填写或获取邮箱。');
   }
-  await addLog('步骤 2：正在打开认证链接...');
-  await reuseOrCreateTab('signup-page', state.oauthUrl);
 
-  await sendToContentScript('signup-page', {
+  const signupTabId = await getTabId('signup-page');
+  if (!signupTabId) {
+    throw new Error('缺少 ChatGPT 页面，请先完成步骤 1。');
+  }
+
+  await chrome.tabs.update(signupTabId, { active: true });
+  await addLog(`步骤 2：正在进入注册流程并填写邮箱 ${state.email}...`);
+  await sendToContentScriptResilient('signup-page', {
     type: 'EXECUTE_STEP',
     step: 2,
     source: 'background',
-    payload: {},
+    payload: { email: state.email },
+  }, {
+    timeoutMs: 45000,
+    retryDelayMs: 700,
+    logMessage: '步骤 2：注册入口正在跳转到 OpenAI 认证页，等待页面重新就绪后继续填写邮箱...',
   });
 }
 
@@ -2216,25 +2485,28 @@ async function executeStep2(state) {
 
 async function executeStep3(state) {
   if (!state.email) {
-    throw new Error('缺少邮箱地址，请先在侧边栏粘贴邮箱。');
+    throw new Error('缺少邮箱地址，请先完成步骤 2。');
   }
 
   const password = state.customPassword || generatePassword();
   await setPasswordState(password);
 
-  // Save account record
   const accounts = state.accounts || [];
   accounts.push({ email: state.email, password, createdAt: new Date().toISOString() });
   await setState({ accounts });
 
   await addLog(
-    `步骤 3：正在填写邮箱 ${state.email}，密码为${state.customPassword ? '自定义' : '自动生成'}（${password.length} 位）`
+    `步骤 3：正在为 ${state.email} 填写密码，密码为${state.customPassword ? '自定义' : '自动生成'}（${password.length} 位）`
   );
-  await sendToContentScript('signup-page', {
+  await sendToContentScriptResilient('signup-page', {
     type: 'EXECUTE_STEP',
     step: 3,
     source: 'background',
     payload: { email: state.email, password },
+  }, {
+    timeoutMs: 45000,
+    retryDelayMs: 700,
+    logMessage: '步骤 3：认证页正在跳转到密码页，等待页面重新就绪后继续填写密码...',
   });
 }
 
@@ -2247,42 +2519,122 @@ function getMailConfig(state) {
   if (provider === '163') {
     return { source: 'mail-163', url: 'https://mail.163.com/js6/main.jsp?df=mail163_letter#module=mbox.ListModule%7C%7B%22fid%22%3A1%2C%22order%22%3A%22date%22%2C%22desc%22%3Atrue%7D', label: '163 邮箱' };
   }
-  if (provider === '163-vip') {
-    return { source: 'mail-163', url: 'https://webmail.vip.163.com/js6/main.jsp?df=mail163_letter#module=mbox.ListModule%7C%7B%22fid%22%3A1%2C%22order%22%3A%22date%22%2C%22desc%22%3Atrue%7D', label: '163 VIP 邮箱' };
-  }
-  if (provider === 'inbucket') {
-    const host = normalizeInbucketOrigin(state.inbucketHost);
-    const mailbox = (state.inbucketMailbox || '').trim();
-    if (!host) {
-      return { error: 'Inbucket 主机地址为空或无效。' };
-    }
-    if (!mailbox) {
-      return { error: 'Inbucket 邮箱名称为空。' };
-    }
-    return {
-      source: 'inbucket-mail',
-      url: `${host}/m/${encodeURIComponent(mailbox)}/`,
-      label: `Inbucket 邮箱（${mailbox}）`,
-      navigateOnReuse: true,
-      inject: ['content/utils.js', 'content/inbucket-mail.js'],
-      injectSource: 'inbucket-mail',
-    };
-  }
   return { source: 'qq-mail', url: 'https://wx.mail.qq.com/', label: 'QQ 邮箱' };
 }
 
-function normalizeInbucketOrigin(rawValue) {
-  const value = (rawValue || '').trim();
-  if (!value) return '';
+function normalizeCookieDomainForMatch(domain) {
+  return String(domain || '').trim().replace(/^\./, '').toLowerCase();
+}
 
-  const candidate = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(value) ? value : `https://${value}`;
+function shouldClearPreLoginCookie(cookie) {
+  const domain = normalizeCookieDomainForMatch(cookie?.domain);
+  if (!domain) return false;
+  return PRE_LOGIN_COOKIE_CLEAR_DOMAINS.some((target) => (
+    domain === target || domain.endsWith(`.${target}`)
+  ));
+}
+
+function buildCookieRemovalUrl(cookie) {
+  const host = normalizeCookieDomainForMatch(cookie?.domain);
+  const path = String(cookie?.path || '/').startsWith('/')
+    ? String(cookie?.path || '/')
+    : `/${String(cookie?.path || '')}`;
+  return `https://${host}${path}`;
+}
+
+async function collectCookiesForPreLoginCleanup() {
+  if (!chrome.cookies?.getAll) {
+    return [];
+  }
+
+  const stores = chrome.cookies.getAllCookieStores
+    ? await chrome.cookies.getAllCookieStores()
+    : [{ id: undefined }];
+  const cookies = [];
+  const seen = new Set();
+
+  for (const store of stores) {
+    const storeId = store?.id;
+    const batch = await chrome.cookies.getAll(storeId ? { storeId } : {});
+    for (const cookie of batch || []) {
+      if (!shouldClearPreLoginCookie(cookie)) continue;
+      const key = [
+        cookie.storeId || storeId || '',
+        cookie.domain || '',
+        cookie.path || '',
+        cookie.name || '',
+        cookie.partitionKey ? JSON.stringify(cookie.partitionKey) : '',
+      ].join('|');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cookies.push(cookie);
+    }
+  }
+
+  return cookies;
+}
+
+async function removeCookieDirectly(cookie) {
+  const details = {
+    url: buildCookieRemovalUrl(cookie),
+    name: cookie.name,
+  };
+
+  if (cookie.storeId) {
+    details.storeId = cookie.storeId;
+  }
+  if (cookie.partitionKey) {
+    details.partitionKey = cookie.partitionKey;
+  }
 
   try {
-    const parsed = new URL(candidate);
-    return parsed.origin;
-  } catch {
-    return '';
+    const result = await chrome.cookies.remove(details);
+    return Boolean(result);
+  } catch (err) {
+    console.warn(LOG_PREFIX, '[removeCookieDirectly] failed', {
+      domain: cookie?.domain,
+      name: cookie?.name,
+      message: getErrorMessage(err),
+    });
+    return false;
   }
+}
+
+async function runPreStep6CookieCleanup() {
+  await addLog(
+    `步骤 6：开始前等待 ${Math.round(STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS / 1000)} 秒，然后直接删除 ChatGPT / OpenAI cookies...`,
+    'info'
+  );
+
+  await sleepWithStop(STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS);
+
+  if (!chrome.cookies?.getAll || !chrome.cookies?.remove) {
+    await addLog('步骤 6：当前浏览器不支持 cookies API，无法直接删除 cookies。', 'warn');
+    return;
+  }
+
+  const cookies = await collectCookiesForPreLoginCleanup();
+  let removedCount = 0;
+
+  for (const cookie of cookies) {
+    throwIfStopped();
+    if (await removeCookieDirectly(cookie)) {
+      removedCount += 1;
+    }
+  }
+
+  if (chrome.browsingData?.removeCookies) {
+    try {
+      await chrome.browsingData.removeCookies({
+        since: 0,
+        origins: PRE_LOGIN_COOKIE_CLEAR_ORIGINS,
+      });
+    } catch (err) {
+      await addLog(`步骤 6：browsingData 补扫 cookies 失败：${getErrorMessage(err)}`, 'warn');
+    }
+  }
+
+  await addLog(`步骤 6：已直接删除 ${removedCount} 个 ChatGPT / OpenAI cookies，准备继续获取链接并登录。`, 'ok');
 }
 
 function getVerificationCodeStateKey(step) {
@@ -2566,162 +2918,161 @@ async function executeStep5(state) {
     const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
     if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
       await addLog('步骤 5：认证页已直接进入 localhost 回调地址，资料页按已跳过处理。', 'ok');
-      await completeStepFromBackground(5, { skippedDirectToCallback: true });
+      await completeStepFromBackground(5, { skippedDirectToCallback: true, localhostUrl: signupTab.url });
       return;
     }
   }
 
-  await sendToContentScript('signup-page', {
-    type: 'EXECUTE_STEP',
-    step: 5,
-    source: 'background',
-    payload: { firstName, lastName, year, month, day },
-  });
-}
+  try {
+    await sendToContentScript('signup-page', {
+      type: 'EXECUTE_STEP',
+      step: 5,
+      source: 'background',
+      payload: { firstName, lastName, year, month, day },
+    });
+  } catch (err) {
+    if (!isRetryableContentScriptTransportError(err) || !signupTabId) {
+      throw err;
+    }
 
-// ============================================================
-// Step 6: Login ChatGPT (Background opens tab, chatgpt.js handles login)
-// ============================================================
+    await addLog('步骤 5：资料提交后页面正在切换，准备检查是否已进入后续阶段...', 'warn');
+    await sleepWithStop(4000);
 
-async function refreshOAuthUrlBeforeStep6(state) {
-  if (!state.vpsUrl) {
-    throw new Error('尚未配置 CPA 地址，请先在侧边栏填写。');
-  }
-
-  await addLog('步骤 6：正在刷新登录用的 CPA OAuth 链接...');
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] preparing fresh OAuth via step 1');
-  const waitForFreshOAuth = waitForStepComplete(1, 120000);
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] executing step 1 for fresh OAuth');
-  await executeStep1(state);
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] step 1 execute returned, waiting for completion signal');
-  await waitForFreshOAuth;
-  console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] step 1 completion signal received');
-
-  const latestState = await getState();
-  if (!latestState.oauthUrl) {
-    throw new Error('刷新 OAuth 链接后仍未拿到可用链接。');
-  }
-
-  return latestState.oauthUrl;
-}
-
-async function executeStep6(state) {
-  if (!state.email) {
-    throw new Error('缺少邮箱地址，请先完成步骤 3。');
-  }
-
-  const existingSignupTabId = await getTabId('signup-page');
-  if (existingSignupTabId) {
-    const existingSignupTab = await chrome.tabs.get(existingSignupTabId).catch(() => null);
-    if (isLocalhostOAuthCallbackUrl(existingSignupTab?.url)) {
-      await addLog('步骤 6：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-      await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
+    const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
+    if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
+      await addLog('步骤 5：资料提交后已直接进入 localhost 回调地址，资料页按已跳过处理。', 'ok');
+      await completeStepFromBackground(5, { skippedDirectToCallback: true, localhostUrl: signupTab.url });
       return;
     }
 
     const authState = await sendToContentScriptResilient('signup-page', {
       type: 'INSPECT_AUTH_PAGE_STATE',
-      step: 6,
+      step: 5,
+      source: 'background',
+      payload: {},
+    }, {
+      timeoutMs: 20000,
+      retryDelayMs: 600,
+      logMessage: '步骤 5：正在等待资料提交后的页面恢复，以确认是否已进入后续阶段...',
+    });
+
+    if (authState?.localhostUrl && isLocalhostOAuthCallbackUrl(authState.localhostUrl)) {
+      await addLog('步骤 5：资料提交后已直接进入 localhost 回调地址，资料页按已跳过处理。', 'ok');
+      await completeStepFromBackground(5, { skippedDirectToCallback: true, localhostUrl: authState.localhostUrl });
+      return;
+    }
+
+    if (authState?.state === 'consent') {
+      await addLog('步骤 5：资料提交后已进入 OAuth 同意页，资料页按已完成处理。', 'ok');
+      await completeStepFromBackground(5, { skippedDirectToConsent: true });
+      return;
+    }
+
+    if (authState?.state === 'logged_in_home') {
+      await addLog('步骤 5：资料提交后进入已登录首页，将刷新 OAuth 链接重新进入登录链路。', 'ok');
+      await completeStepFromBackground(5, { loggedInHome: true });
+      return;
+    }
+
+    if (authState?.state === 'add_phone') {
+      await addLog('步骤 5：资料提交后进入手机号页面。', 'ok');
+      await completeStepFromBackground(5, { addPhonePage: true });
+      return;
+    }
+
+    throw err;
+  }
+}
+
+// ============================================================
+// Step 6: Clear login cookies before OAuth login
+// ============================================================
+
+async function executeStep6() {
+  await runPreStep6CookieCleanup();
+  await completeStepFromBackground(6, {});
+}
+
+// ============================================================
+// Step 7: Login ChatGPT (Background opens tab, signup-page.js handles login)
+// ============================================================
+
+async function refreshOAuthUrlBeforeStep7(state) {
+  return requestFreshOAuthUrl(state, 7);
+}
+
+async function executeStep7(state) {
+  if (!state.email) {
+    throw new Error('缺少邮箱地址，请先完成步骤 3。');
+  }
+
+  if (state.localhostUrl && isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
+    await addLog('步骤 7：已记录 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: state.localhostUrl });
+    return;
+  }
+
+  if (state.authPageState === 'consent') {
+    await addLog('步骤 7：已记录认证页直达 OAuth 同意页，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(7, { needsOTP: false, skippedDirectToConsent: true });
+    return;
+  }
+
+  if (state.authPageState === 'logged_in_home') {
+    await addLog('步骤 7：当前记录为已登录首页，不直接跳过，将刷新 OAuth 链接重新进入授权链路。', 'info');
+    await setState({ authPageState: null });
+  }
+
+  const existingSignupTabAlive = await isTabAlive('signup-page');
+  const existingSignupTabId = existingSignupTabAlive ? await getTabId('signup-page') : null;
+  if (existingSignupTabId) {
+    const existingSignupTab = await chrome.tabs.get(existingSignupTabId).catch(() => null);
+    if (isLocalhostOAuthCallbackUrl(existingSignupTab?.url)) {
+      await addLog('步骤 7：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+      await completeStepFromBackground(7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: existingSignupTab.url });
+      return;
+    }
+
+    const authState = await sendToContentScriptResilient('signup-page', {
+      type: 'INSPECT_AUTH_PAGE_STATE',
+      step: 7,
       source: 'background',
       payload: {},
     }, {
       timeoutMs: 15000,
       retryDelayMs: 500,
-      logMessage: '步骤 6：认证页状态检测未就绪，正在重试...',
+      logMessage: '步骤 7：认证页状态检测未就绪，正在重试...',
     });
 
     if (authState?.localhostUrl && isLocalhostOAuthCallbackUrl(authState.localhostUrl)) {
-      await addLog('步骤 6：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-      await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
+      await addLog('步骤 7：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+      await completeStepFromBackground(7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: authState.localhostUrl });
       return;
     }
 
     if (authState?.state === 'consent') {
-      await addLog('步骤 6：认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
-      await completeStepFromBackground(6, { needsOTP: false, skippedDirectToConsent: true });
+      await addLog('步骤 7：认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
+      await completeStepFromBackground(7, { needsOTP: false, skippedDirectToConsent: true });
       return;
     }
 
     if (authState?.state === 'add_phone') {
-      await addLog('步骤 6：资料提交后进入手机号页面属于正常中间态，将按旧逻辑刷新 OAuth 链接继续登录。', 'info');
+      await addLog('步骤 7：资料提交后进入手机号页面属于正常中间态，将刷新 OAuth 链接继续登录。', 'info');
     }
   }
 
-  const oauthUrl = await refreshOAuthUrlBeforeStep6(state);
+  const oauthUrl = await refreshOAuthUrlBeforeStep7(state);
 
-  await addLog('步骤 6：正在打开最新 OAuth 链接并登录...');
-  // Reuse the signup-page tab — navigate it to the OAuth URL
+  await addLog('步骤 7：正在打开最新 OAuth 链接并登录...');
   const signupTabId = await reuseOrCreateTab('signup-page', oauthUrl);
   const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
   if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
-    await addLog('步骤 6：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
+    await addLog('步骤 7：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: signupTab.url });
     return;
   }
 
   const postOpenAuthState = await sendToContentScriptResilient('signup-page', {
-    type: 'INSPECT_AUTH_PAGE_STATE',
-    step: 6,
-    source: 'background',
-    payload: {},
-  }, {
-    timeoutMs: 15000,
-    retryDelayMs: 500,
-    logMessage: '步骤 6：正在等待刷新后的认证页就绪...',
-  });
-
-  if (postOpenAuthState?.localhostUrl && isLocalhostOAuthCallbackUrl(postOpenAuthState.localhostUrl)) {
-    await addLog('步骤 6：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(6, { needsOTP: false, alreadyAtCallback: true });
-    return;
-  }
-
-  if (postOpenAuthState?.state === 'consent') {
-    await addLog('步骤 6：刷新后的认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(6, { needsOTP: false, skippedDirectToConsent: true });
-    return;
-  }
-
-  if (postOpenAuthState?.state === 'add_phone') {
-    await addLog('步骤 6：刷新后的认证页仍显示手机号页面，继续沿用旧逻辑重新执行登录。', 'info');
-  }
-
-  // signup-page.js will inject (same auth.openai.com domain) and handle login
-  await sendToContentScript('signup-page', {
-    type: 'EXECUTE_STEP',
-    step: 6,
-    source: 'background',
-    payload: { email: state.email, password: state.password },
-  });
-}
-
-// ============================================================
-// Step 7: Get Login Verification Code (qq-mail.js polls, then fills in chatgpt.js)
-// ============================================================
-
-async function runStep7Attempt(state) {
-  const mail = getMailConfig(state);
-  if (mail.error) throw new Error(mail.error);
-  const stepStartedAt = Date.now();
-  const authTabId = await getTabId('signup-page');
-
-  if (authTabId) {
-    await chrome.tabs.update(authTabId, { active: true });
-  } else {
-    if (!state.oauthUrl) {
-      throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
-    }
-    await reuseOrCreateTab('signup-page', state.oauthUrl);
-  }
-
-  const currentAuthTab = authTabId ? await chrome.tabs.get(authTabId).catch(() => null) : null;
-  if (isLocalhostOAuthCallbackUrl(currentAuthTab?.url)) {
-    await addLog('步骤 7：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(7, { skippedDirectToCallback: true });
-    return;
-  }
-
-  const currentAuthState = await sendToContentScriptResilient('signup-page', {
     type: 'INSPECT_AUTH_PAGE_STATE',
     step: 7,
     source: 'background',
@@ -2729,18 +3080,105 @@ async function runStep7Attempt(state) {
   }, {
     timeoutMs: 15000,
     retryDelayMs: 500,
-    logMessage: '步骤 7：认证页状态检测未就绪，正在重试...',
+    logMessage: '步骤 7：正在等待刷新后的认证页就绪...',
+  });
+
+  if (postOpenAuthState?.localhostUrl && isLocalhostOAuthCallbackUrl(postOpenAuthState.localhostUrl)) {
+    await addLog('步骤 7：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: postOpenAuthState.localhostUrl });
+    return;
+  }
+
+  if (postOpenAuthState?.state === 'consent') {
+    await addLog('步骤 7：刷新后的认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(7, { needsOTP: false, skippedDirectToConsent: true });
+    return;
+  }
+
+  if (postOpenAuthState?.state === 'add_phone') {
+    await addLog('步骤 7：刷新后的认证页仍显示手机号页面，继续重新执行登录。', 'info');
+  }
+
+  const loginPassword = state.password || state.customPassword;
+  if (!loginPassword) {
+    throw new Error('缺少登录密码，请先完成步骤 3 或在侧边栏填写自定义密码。');
+  }
+
+  await sendToContentScript('signup-page', {
+    type: 'EXECUTE_STEP',
+    step: 7,
+    source: 'background',
+    payload: { email: state.email, password: loginPassword },
+  });
+}
+
+// ============================================================
+// Step 8: Get Login Verification Code (mail provider polls, then fills in signup-page.js)
+// ============================================================
+
+async function runStep8Attempt(state) {
+  const mail = getMailConfig(state);
+  if (mail.error) throw new Error(mail.error);
+  const stepStartedAt = Date.now();
+
+  if (state.localhostUrl && isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
+    await addLog('步骤 8：已记录 localhost 回调地址，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(8, { skippedDirectToCallback: true, localhostUrl: state.localhostUrl });
+    return;
+  }
+
+  if (state.authPageState === 'consent') {
+    await addLog('步骤 8：已记录认证页直达 OAuth 同意页，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(8, { skippedDirectToConsent: true });
+    return;
+  }
+
+  if (state.authPageState === 'logged_in_home') {
+    await addLog('步骤 8：当前记录为已登录首页，不视为 OAuth 同意页，先回到步骤 7 刷新授权链路。', 'warn');
+    await setState({ authPageState: null });
+    await rerunStep7ForStep8Recovery();
+    await runStep8Attempt(await getState());
+    return;
+  }
+
+  let authTabId = await (await isTabAlive('signup-page') ? getTabId('signup-page') : null);
+
+  if (authTabId) {
+    await chrome.tabs.update(authTabId, { active: true });
+  } else {
+    if (!state.oauthUrl) {
+      throw new Error('缺少 OAuth 链接，请先完成步骤 7。');
+    }
+    authTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
+  }
+
+  const currentAuthTab = authTabId ? await chrome.tabs.get(authTabId).catch(() => null) : null;
+  if (isLocalhostOAuthCallbackUrl(currentAuthTab?.url)) {
+    await addLog('步骤 8：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(8, { skippedDirectToCallback: true, localhostUrl: currentAuthTab.url });
+    return;
+  }
+
+  const currentAuthState = await sendToContentScriptResilient('signup-page', {
+    type: 'INSPECT_AUTH_PAGE_STATE',
+    step: 8,
+    source: 'background',
+    payload: {},
+  }, {
+    timeoutMs: 15000,
+    retryDelayMs: 500,
+    logMessage: '步骤 8：认证页状态检测未就绪，正在重试...',
   });
 
   if (currentAuthState?.localhostUrl && isLocalhostOAuthCallbackUrl(currentAuthState.localhostUrl)) {
-    await addLog('步骤 7：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(7, { skippedDirectToCallback: true });
+    await addLog('步骤 8：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(8, { skippedDirectToCallback: true, localhostUrl: currentAuthState.localhostUrl });
     return;
   }
 
   if (currentAuthState?.state === 'consent') {
-    await addLog('步骤 7：认证页已直接进入 OAuth 同意页，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(7, { skippedDirectToConsent: true });
+    await addLog('步骤 8：认证页已直接进入 OAuth 同意页，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(8, { skippedDirectToConsent: true });
     return;
   }
 
@@ -2748,10 +3186,10 @@ async function runStep7Attempt(state) {
     throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
   }
 
-  await addLog('步骤 7：正在准备认证页，必要时切换到一次性验证码登录...');
+  await addLog('步骤 8：正在准备认证页，必要时切换到一次性验证码登录...');
   const prepareResult = await sendToContentScript('signup-page', {
     type: 'PREPARE_LOGIN_CODE',
-    step: 7,
+    step: 8,
     source: 'background',
     payload: {},
   });
@@ -2760,7 +3198,7 @@ async function runStep7Attempt(state) {
     throw new Error(prepareResult.error);
   }
 
-  await addLog(`步骤 7：正在打开${mail.label}...`);
+  await addLog(`步骤 8：正在打开${mail.label}...`);
 
   const alive = await isTabAlive(mail.source);
   if (alive) {
@@ -2780,32 +3218,32 @@ async function runStep7Attempt(state) {
     });
   }
 
-  await resolveVerificationStep(7, state, mail, {
+  await resolveVerificationStep(8, state, mail, {
     filterAfterTimestamp: stepStartedAt,
     requestFreshCodeFirst: true,
   });
 }
 
-async function rerunStep6ForStep7Recovery() {
+async function rerunStep7ForStep8Recovery() {
   const currentState = await getState();
-  const waitForStep6 = waitForStepComplete(6, 120000);
-  await addLog('步骤 7：正在回到步骤 6，重新发起登录验证码流程...', 'warn');
-  await executeStep6(currentState);
-  await waitForStep6;
+  const waitForStep7 = waitForStepComplete(7, 120000);
+  await addLog('步骤 8：正在回到步骤 7，重新发起登录验证码流程...', 'warn');
+  await executeStep7(currentState);
+  await waitForStep7;
   await sleepWithStop(3000);
 }
 
-async function executeStep7(state) {
+async function executeStep8(state) {
   let lastError = null;
 
-  for (let round = 1; round <= STEP7_RESTART_MAX_ROUNDS; round++) {
+  for (let round = 1; round <= STEP8_RESTART_MAX_ROUNDS; round++) {
     const currentState = round === 1 ? state : await getState();
 
     try {
       if (round > 1) {
-        await addLog(`步骤 7：正在进行第 ${round}/${STEP7_RESTART_MAX_ROUNDS} 轮登录验证码恢复尝试。`, 'warn');
+        await addLog(`步骤 8：正在进行第 ${round}/${STEP8_RESTART_MAX_ROUNDS} 轮登录验证码恢复尝试。`, 'warn');
       }
-      await runStep7Attempt(currentState);
+      await runStep8Attempt(currentState);
       return;
     } catch (err) {
       lastError = err;
@@ -2814,20 +3252,20 @@ async function executeStep7(state) {
         throw err;
       }
 
-      if (round >= STEP7_RESTART_MAX_ROUNDS) {
+      if (round >= STEP8_RESTART_MAX_ROUNDS) {
         break;
       }
 
-      await addLog(`步骤 7：检测到邮箱轮询类失败，准备从步骤 6 重新开始（${round + 1}/${STEP7_RESTART_MAX_ROUNDS}）...`, 'warn');
-      await rerunStep6ForStep7Recovery();
+      await addLog(`步骤 8：检测到邮箱轮询类失败，准备从步骤 7 重新开始（${round + 1}/${STEP8_RESTART_MAX_ROUNDS}）...`, 'warn');
+      await rerunStep7ForStep8Recovery();
     }
   }
 
-  throw lastError || new Error(`步骤 7：登录验证码流程在 ${STEP7_RESTART_MAX_ROUNDS} 轮后仍未成功。`);
+  throw lastError || new Error(`步骤 8：登录验证码流程在 ${STEP8_RESTART_MAX_ROUNDS} 轮后仍未成功。`);
 }
 
 // ============================================================
-// Step 8: 完成 OAuth（自动点击 + localhost 回调监听）
+// Step 9: 完成 OAuth（自动点击 + localhost 回调监听）
 // ============================================================
 
 let webNavListener = null;
@@ -2868,7 +3306,7 @@ async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS)
     throwIfStopped();
     const pageState = await getStep8PageState(tabId);
     if (pageState?.addPhonePage) {
-      throw new Error('步骤 8：认证页进入了手机号页面，当前不是 OAuth 同意页，无法继续自动授权。');
+      throw new Error('步骤 9：认证页进入了手机号页面，当前不是 OAuth 同意页，无法继续自动授权。');
     }
     if (pageState?.consentReady) {
       return pageState;
@@ -2876,7 +3314,7 @@ async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS)
     await sleepWithStop(250);
   }
 
-  throw new Error('步骤 8：长时间未进入 OAuth 同意页，无法定位“继续”按钮。');
+  throw new Error('步骤 9：长时间未进入 OAuth 同意页，无法定位“继续”按钮。');
 }
 
 async function prepareStep8DebuggerClick() {
@@ -2887,7 +3325,7 @@ async function prepareStep8DebuggerClick() {
   }, {
     timeoutMs: 15000,
     retryDelayMs: 600,
-    logMessage: '步骤 8：认证页正在切换，等待 OAuth 同意页按钮重新就绪...',
+    logMessage: '步骤 9：认证页正在切换，等待 OAuth 同意页按钮重新就绪...',
   });
 
   if (result?.error) {
@@ -2909,7 +3347,7 @@ async function triggerStep8ContentStrategy(strategy) {
   }, {
     timeoutMs: 15000,
     retryDelayMs: 600,
-    logMessage: '步骤 8：认证页正在切换，等待“继续”按钮重新就绪...',
+    logMessage: '步骤 9：认证页正在切换，等待“继续”按钮重新就绪...',
   });
 
   if (result?.error) {
@@ -2927,7 +3365,7 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
 
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) {
-      throw new Error('步骤 8：认证页面标签页已关闭，无法继续自动授权。');
+      throw new Error('步骤 9：认证页面标签页已关闭，无法继续自动授权。');
     }
 
     if (baselineUrl && typeof tab.url === 'string' && tab.url !== baselineUrl) {
@@ -2936,7 +3374,7 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
 
     const pageState = await getStep8PageState(tabId);
     if (pageState?.addPhonePage) {
-      throw new Error('步骤 8：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
+      throw new Error('步骤 9：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
     }
     if (pageState === null) {
       return { progressed: true, reason: 'page_reloading' };
@@ -2964,12 +3402,20 @@ function getStep8EffectLabel(effect) {
   }
 }
 
-async function executeStep8(state) {
-  if (!state.oauthUrl) {
-    throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
+async function executeStep9(state) {
+  if (state.localhostUrl && isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
+    await addLog('步骤 9：已记录 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(9, { localhostUrl: state.localhostUrl });
+    return;
   }
 
-  await addLog('步骤 8：正在监听 localhost 回调地址...');
+  const existingSignupTabAlive = await isTabAlive('signup-page');
+  const existingSignupTabId = existingSignupTabAlive ? await getTabId('signup-page') : null;
+  if (!existingSignupTabId && !state.oauthUrl) {
+    throw new Error('缺少 OAuth 链接，且当前没有可复用的认证页，请先完成步骤 7。');
+  }
+
+  await addLog('步骤 9：正在监听 localhost 回调地址...');
 
   async function completeIfCurrentTabAlreadyAtCallback(tabId, logMessage) {
     if (!tabId) return false;
@@ -2988,7 +3434,7 @@ async function executeStep8(state) {
     if (logMessage) {
       await addLog(logMessage, 'ok');
     }
-    await completeStepFromBackground(8, { localhostUrl: tab.url });
+    await completeStepFromBackground(9, { localhostUrl: tab.url });
     return true;
   }
 
@@ -3003,7 +3449,7 @@ async function executeStep8(state) {
       }
     };
 
-    const failStep8 = (error) => {
+    const failStep9 = (error) => {
       if (resolved) return;
       resolved = true;
       clearTimeout(timeout);
@@ -3012,7 +3458,7 @@ async function executeStep8(state) {
     };
 
     const timeout = setTimeout(() => {
-      failStep8(new Error('120 秒内未捕获到 localhost 回调跳转，步骤 8 已持续重试点击“继续”但页面仍未完成授权。'));
+      failStep9(new Error('120 秒内未捕获到 localhost 回调跳转，步骤 9 已持续重试点击“继续”但页面仍未完成授权。'));
     }, 120000);
 
     webNavListener = (details) => {
@@ -3024,8 +3470,8 @@ async function executeStep8(state) {
         resolved = true;
         cleanupListener();
         clearTimeout(timeout);
-        addLog(`步骤 8：已捕获 localhost 地址：${details.url}`, 'ok').then(() => {
-          return completeStepFromBackground(8, { localhostUrl: details.url });
+        addLog(`步骤 9：已捕获 localhost 地址：${details.url}`, 'ok').then(() => {
+          return completeStepFromBackground(9, { localhostUrl: details.url });
         }).then(() => {
           resolve();
         }).catch((err) => {
@@ -3036,9 +3482,9 @@ async function executeStep8(state) {
 
     (async () => {
       try {
-        signupTabId = await getTabId('signup-page');
+        signupTabId = await (await isTabAlive('signup-page') ? getTabId('signup-page') : null);
         if (signupTabId) {
-          if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 8：检测到认证页已停留在 localhost 回调地址，直接完成当前步骤。')) {
+          if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 9：检测到认证页已停留在 localhost 回调地址，直接完成当前步骤。')) {
             resolved = true;
             clearTimeout(timeout);
             cleanupListener();
@@ -3047,13 +3493,13 @@ async function executeStep8(state) {
           }
 
           await chrome.tabs.update(signupTabId, { active: true });
-          await addLog('步骤 8：已切回认证页，准备循环确认“继续”按钮直到页面真正跳转...');
+          await addLog('步骤 9：已切回认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         } else {
           signupTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
-          await addLog('步骤 8：已重新打开认证页，准备循环确认“继续”按钮直到页面真正跳转...');
+          await addLog('步骤 9：已重新打开认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         }
 
-        if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 8：检测到认证页已跳到 localhost 回调地址，直接完成当前步骤。')) {
+        if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 9：检测到认证页已跳到 localhost 回调地址，直接完成当前步骤。')) {
           resolved = true;
           clearTimeout(timeout);
           cleanupListener();
@@ -3075,7 +3521,7 @@ async function executeStep8(state) {
           const round = attempt + 1;
           attempt += 1;
 
-          await addLog(`步骤 8：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
+          await addLog(`步骤 9：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
 
           if (strategy.mode === 'debugger') {
             const clickTarget = await prepareStep8DebuggerClick();
@@ -3083,8 +3529,8 @@ async function executeStep8(state) {
               resolved = true;
               cleanupListener();
               clearTimeout(timeout);
-              await addLog(`步骤 8：内容脚本确认当前页面已是 localhost 回调地址：${clickTarget.url}`, 'ok');
-              await completeStepFromBackground(8, { localhostUrl: clickTarget.url });
+              await addLog(`步骤 9：内容脚本确认当前页面已是 localhost 回调地址：${clickTarget.url}`, 'ok');
+              await completeStepFromBackground(9, { localhostUrl: clickTarget.url });
               resolve();
               return;
             }
@@ -3105,66 +3551,151 @@ async function executeStep8(state) {
           }
 
           if (effect.progressed) {
-            await addLog(`步骤 8：检测到本次点击已生效，${getStep8EffectLabel(effect)}，继续等待 localhost 回调...`, 'info');
+            await addLog(`步骤 9：检测到本次点击已生效，${getStep8EffectLabel(effect)}，继续等待 localhost 回调...`, 'info');
             break;
           }
 
-          await addLog(`步骤 8：${strategy.label} 本次未触发页面离开同意页，准备继续重试。`, 'warn');
+          await addLog(`步骤 9：${strategy.label} 本次未触发页面离开同意页，准备继续重试。`, 'warn');
           await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
         }
       } catch (err) {
-        failStep8(err);
+        failStep9(err);
       }
     })();
   });
 }
 
 // ============================================================
-// Step 9: CPA 回调验证（通过 vps-panel.js）
+// Step 10: CPA 回调验证（通过 vps-panel.js）
 // ============================================================
 
-async function executeStep9(state) {
+async function executeStep10(state) {
   if (state.localhostUrl && !isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
-    throw new Error('步骤 8 捕获到的 localhost OAuth 回调地址无效，请重新执行步骤 8。');
+    throw new Error('步骤 9 捕获到的 localhost OAuth 回调地址无效，请重新执行步骤 9。');
   }
   if (!state.localhostUrl) {
-    throw new Error('缺少 localhost 回调地址，请先完成步骤 8。');
+    throw new Error('缺少 localhost 回调地址，请先完成步骤 9。');
   }
   if (!state.vpsUrl) {
     throw new Error('尚未填写 CPA 地址，请先在侧边栏输入。');
   }
+  if (!state.oauthUrl) {
+    throw new Error('缺少步骤 7 生成的 OAuth 链接，请从步骤 7 重新开始。');
+  }
 
-  await addLog('步骤 9：正在打开 CPA 面板...');
+  await addLog('步骤 10：正在回到步骤 7 使用的 CPA 面板...');
 
   const injectFiles = ['content/utils.js', 'content/vps-panel.js'];
-  let tabId = await getTabId('vps-panel');
+  let tabId = Number.isInteger(state.oauthSourceTabId) ? state.oauthSourceTabId : await getTabId('vps-panel');
   const alive = tabId && await isTabAlive('vps-panel');
 
   if (!alive) {
-    tabId = await reuseOrCreateTab('vps-panel', state.vpsUrl, {
-      inject: injectFiles,
-      reloadIfSameUrl: true,
-    });
-  } else {
-    await closeConflictingTabsForSource('vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
-    await chrome.tabs.update(tabId, { active: true });
-    await rememberSourceLastUrl('vps-panel', state.vpsUrl);
+    throw new Error('步骤 10：步骤 7 发起 OAuth 的 CPA 标签页已不存在。为确保使用同一条授权链接，请从步骤 7 重新开始。');
+  }
+
+  await closeConflictingTabsForSource('vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
+  await rememberSourceLastUrl('vps-panel', state.vpsUrl);
+
+  const currentPanelTab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!currentPanelTab || !matchesSourceUrlFamily('vps-panel', currentPanelTab.url, state.vpsUrl)) {
+    throw new Error('步骤 10：步骤 7 使用的 CPA 页面已离开原始面板地址。为确保沿用同一条授权链接，请从步骤 7 重新开始。');
   }
 
   await ensureContentScriptReadyOnTab('vps-panel', tabId, {
     inject: injectFiles,
+    injectSource: 'vps-panel',
   });
 
-  await addLog('步骤 9：正在填写回调地址...');
+  const [currentTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  let vpsPanelTab = await chrome.tabs.get(tabId).catch(() => null);
+  console.log(LOG_PREFIX, '[Step 10] tab switch precheck', {
+    currentTab: currentTab ? {
+      id: currentTab.id,
+      windowId: currentTab.windowId,
+      active: currentTab.active,
+      url: currentTab.url,
+      title: currentTab.title,
+    } : null,
+    vpsPanelTab: vpsPanelTab ? {
+      id: vpsPanelTab.id,
+      windowId: vpsPanelTab.windowId,
+      active: vpsPanelTab.active,
+      url: vpsPanelTab.url,
+      title: vpsPanelTab.title,
+    } : null,
+  });
+  await addLog(
+    `步骤 10 调试：currentTab=${currentTab ? `${currentTab.id}@${currentTab.windowId}${currentTab.active ? ':active' : ''}` : 'null'}，` +
+    `cpaTab=${vpsPanelTab ? `${vpsPanelTab.id}@${vpsPanelTab.windowId}${vpsPanelTab.active ? ':active' : ''}` : 'null'}`,
+    'info'
+  );
+
+  if (vpsPanelTab && currentTab && Number.isInteger(currentTab.windowId) && vpsPanelTab.windowId !== currentTab.windowId) {
+    console.log(LOG_PREFIX, '[Step 10] moving CPA tab to current window', {
+      tabId,
+      fromWindowId: vpsPanelTab.windowId,
+      toWindowId: currentTab.windowId,
+    });
+    await addLog(`步骤 10 调试：检测到 CPA tab 在其他窗口，尝试移动到当前窗口 ${currentTab.windowId}。`, 'warn');
+    const movedTab = await chrome.tabs.move(tabId, {
+      windowId: currentTab.windowId,
+      index: -1,
+    }).catch((err) => {
+      console.warn(LOG_PREFIX, '[Step 10] move CPA tab failed', err);
+      return null;
+    });
+    const movedTabId = Array.isArray(movedTab) ? movedTab[0]?.id : movedTab?.id;
+    await addLog(`步骤 10 调试：move 结果=${movedTabId || 'null'}`, movedTabId ? 'info' : 'warn');
+    if (Number.isInteger(movedTabId)) {
+      tabId = movedTabId;
+      vpsPanelTab = await chrome.tabs.get(tabId).catch(() => vpsPanelTab);
+    }
+  }
+  if (vpsPanelTab && !vpsPanelTab.active) {
+    console.log(LOG_PREFIX, '[Step 10] activating CPA tab', {
+      tabId,
+      windowId: vpsPanelTab.windowId,
+    });
+    await addLog(`步骤 10 调试：准备激活 CPA tab ${tabId}@${vpsPanelTab.windowId}。`, 'info');
+    await chrome.tabs.update(tabId, { active: true });
+  }
+  const finalCurrentTab = await chrome.tabs.get(tabId).catch(() => null);
+  console.log(LOG_PREFIX, '[Step 10] tab switch final state', {
+    tabId,
+    finalCurrentTab: finalCurrentTab ? {
+      id: finalCurrentTab.id,
+      windowId: finalCurrentTab.windowId,
+      active: finalCurrentTab.active,
+      url: finalCurrentTab.url,
+      title: finalCurrentTab.title,
+    } : null,
+  });
+  await addLog(
+    `步骤 10 调试：切换后 CPA tab=${finalCurrentTab ? `${finalCurrentTab.id}@${finalCurrentTab.windowId}${finalCurrentTab.active ? ':active' : ':inactive'}` : 'null'}`,
+    finalCurrentTab?.active ? 'ok' : 'warn'
+  );
+
+  await addLog('步骤 10：正在填写回调地址...');
   const result = await sendToContentScriptResilient('vps-panel', {
     type: 'EXECUTE_STEP',
-    step: 9,
+    step: 10,
     source: 'background',
-    payload: { localhostUrl: state.localhostUrl, vpsPassword: state.vpsPassword },
+    payload: {
+      localhostUrl: state.localhostUrl,
+      vpsPassword: state.vpsPassword,
+      expectedOauthUrl: state.oauthUrl,
+    },
   }, {
-    timeoutMs: 30000,
+    timeoutMs: 50000,
+    responseTimeoutMs: 45000,
     retryDelayMs: 700,
-    logMessage: '步骤 9：CPA 面板通信未就绪，正在等待页面恢复...',
+    logMessage: '步骤 10：CPA 面板通信未就绪，正在等待页面恢复...',
+    reinjectOnRetry: {
+      url: state.vpsUrl,
+      inject: injectFiles,
+      injectSource: 'vps-panel',
+      activate: false,
+    },
   });
 
   if (result?.error) {

@@ -1,4 +1,4 @@
-// content/vps-panel.js — Content script for CPA panel (steps 1, 9)
+// content/vps-panel.js — Content script for CPA panel (steps 1, 10)
 // Injected on: CPA panel (user-configured URL)
 //
 // Actual DOM structure (after login click):
@@ -62,6 +62,31 @@ if (document.documentElement.getAttribute(VPS_PANEL_LISTENER_SENTINEL) !== '1') 
       });
       return true;
     }
+
+    if (message.type === 'FETCH_OAUTH_URL') {
+      setCurrentCommandContext(message);
+      resetStopState();
+      const startedAt = Date.now();
+      console.log(LOG_PREFIX, 'FETCH_OAUTH_URL received', {
+        url: location.href,
+        payloadKeys: Object.keys(message.payload || {}),
+        snapshot: getVpsPanelSnapshot(),
+      });
+      fetchOAuthUrl(message.payload).then((oauthUrl) => {
+        console.log(LOG_PREFIX, `FETCH_OAUTH_URL resolved after ${Date.now() - startedAt}ms`, {
+          url: location.href,
+          oauthUrlPreview: oauthUrl.slice(0, 120),
+        });
+        sendResponse({ ok: true, oauthUrl });
+      }).catch(err => {
+        console.error(LOG_PREFIX, `FETCH_OAUTH_URL rejected after ${Date.now() - startedAt}ms: ${err?.message || err}`, {
+          url: location.href,
+          snapshot: getVpsPanelSnapshot(),
+        });
+        sendResponse({ error: err.message });
+      });
+      return true;
+    }
   });
 } else {
   console.log('[MultiPage:vps-panel] 消息监听已存在，跳过重复注册');
@@ -70,7 +95,7 @@ if (document.documentElement.getAttribute(VPS_PANEL_LISTENER_SENTINEL) !== '1') 
 async function handleStep(step, payload) {
   switch (step) {
     case 1: return await step1_getOAuthLink(payload);
-    case 9: return await step9_vpsVerify(payload);
+    case 10: return await step10_vpsVerify(payload);
     default:
       throw new Error(`vps-panel.js 不处理步骤 ${step}`);
   }
@@ -169,7 +194,7 @@ function isLocalhostOAuthCallbackUrl(rawUrl) {
   const parsed = parseUrlSafely(rawUrl);
   if (!parsed) return false;
   if (!['http:', 'https:'].includes(parsed.protocol)) return false;
-  if (!['localhost', '127.0.0.1'].includes(parsed.hostname)) return false;
+  if (!['localhost', '127.0.0.1', '192.168.2.1'].includes(parsed.hostname)) return false;
   if (parsed.pathname !== '/auth/callback') return false;
 
   const code = (parsed.searchParams.get('code') || '').trim();
@@ -217,7 +242,7 @@ async function waitForExactSuccessBadge(timeout = 30000) {
 
   const finalText = getStatusBadgeText();
   if (isOAuthCallbackTimeoutFailure(finalText)) {
-    throw new Error(`STEP9_OAUTH_TIMEOUT::${finalText}`);
+    throw new Error(`STEP10_OAUTH_TIMEOUT::${finalText}`);
   }
   throw new Error(finalText
     ? `CPA 面板状态不是“认证成功！”，当前为“${finalText}”。`
@@ -276,6 +301,14 @@ function findOAuthCardLoginButton(header) {
 function findAuthUrlElement() {
   const candidates = document.querySelectorAll('[class*="authUrlValue"], .OAuthPage-module__authUrlValue___axvUJ');
   return Array.from(candidates).find((el) => isVisibleElement(el) && /^https?:\/\//i.test((el.textContent || '').trim())) || null;
+}
+
+function normalizeVisibleOauthUrl(value) {
+  return String(value || '').trim();
+}
+
+function getVisibleOauthUrl() {
+  return normalizeVisibleOauthUrl(findAuthUrlElement()?.textContent || '');
 }
 
 async function ensureOAuthManagementPage(vpsPassword, step = 1, timeout = 45000) {
@@ -385,20 +418,25 @@ async function ensureOAuthManagementPage(vpsPassword, step = 1, timeout = 45000)
 // Step 1: Get OAuth Link
 // ============================================================
 
-async function step1_getOAuthLink(payload) {
-  const { vpsPassword } = payload || {};
-  console.log(LOG_PREFIX, '[Step 1] step1_getOAuthLink start', {
+async function fetchOAuthUrl(payload) {
+  const { vpsPassword, step = 7, silent = false } = payload || {};
+  console.log(LOG_PREFIX, '[OAuth] fetchOAuthUrl start', {
     url: location.href,
+    step,
+    silent,
     hasVpsPassword: Boolean(vpsPassword),
     snapshot: getVpsPanelSnapshot(),
   });
 
-  log('步骤 1：正在等待 CPA 面板加载并进入 OAuth 页面...');
+  if (!silent) {
+    log(`步骤 ${step}：正在等待 CPA 面板加载并进入 OAuth 页面...`);
+  }
 
-  const { header, authUrlEl: existingAuthUrlEl } = await ensureOAuthManagementPage(vpsPassword, 1);
+  const { header, authUrlEl: existingAuthUrlEl } = await ensureOAuthManagementPage(vpsPassword, step);
   let authUrlEl = existingAuthUrlEl;
-  console.log(LOG_PREFIX, '[Step 1] ensureOAuthManagementPage resolved', {
+  console.log(LOG_PREFIX, '[OAuth] ensureOAuthManagementPage resolved', {
     url: location.href,
+    step,
     hasHeader: Boolean(header),
     hasExistingAuthUrl: Boolean(existingAuthUrlEl),
     snapshot: getVpsPanelSnapshot(),
@@ -411,19 +449,25 @@ async function step1_getOAuthLink(payload) {
     }
 
     if (loginBtn.disabled) {
-      console.log(LOG_PREFIX, '[Step 1] OAuth login button is disabled, waiting for auth URL', {
+      console.log(LOG_PREFIX, '[OAuth] login button is disabled, waiting for auth URL', {
         url: location.href,
+        step,
         buttonText: getInlineTextSnippet(getActionText(loginBtn), 80),
       });
-      log('步骤 1：OAuth 登录按钮当前不可用，正在等待授权链接出现...');
+      if (!silent) {
+        log(`步骤 ${step}：OAuth 登录按钮当前不可用，正在等待授权链接出现...`);
+      }
     } else {
       await humanPause(500, 1400);
       simulateClick(loginBtn);
-      console.log(LOG_PREFIX, '[Step 1] clicked OAuth login button and waiting for auth URL', {
+      console.log(LOG_PREFIX, '[OAuth] clicked login button and waiting for auth URL', {
         url: location.href,
+        step,
         buttonText: getInlineTextSnippet(getActionText(loginBtn), 80),
       });
-      log('步骤 1：已点击 OAuth 登录按钮，正在等待授权链接...');
+      if (!silent) {
+        log(`步骤 ${step}：已点击 OAuth 登录按钮，正在等待授权链接...`);
+      }
     }
 
     try {
@@ -434,8 +478,8 @@ async function step1_getOAuthLink(payload) {
         '请检查 CPA 面板服务是否正在运行。URL: ' + location.href
       );
     }
-  } else {
-    log('步骤 1：CPA 面板上已显示授权链接。');
+  } else if (!silent) {
+    log(`步骤 ${step}：CPA 面板上已显示授权链接。`);
   }
 
   const oauthUrl = (authUrlEl.textContent || '').trim();
@@ -443,7 +487,15 @@ async function step1_getOAuthLink(payload) {
     throw new Error(`拿到的 OAuth 链接无效：\"${oauthUrl.slice(0, 50)}\"。应为 http 开头的 URL。`);
   }
 
-  log(`步骤 1：已获取 OAuth 链接：${oauthUrl.slice(0, 80)}...`, 'ok');
+  if (!silent) {
+    log(`步骤 ${step}：已获取 OAuth 链接：${oauthUrl.slice(0, 80)}...`, 'ok');
+  }
+
+  return oauthUrl;
+}
+
+async function step1_getOAuthLink(payload) {
+  const oauthUrl = await fetchOAuthUrl({ ...(payload || {}), step: 1, silent: false });
   console.log(LOG_PREFIX, '[Step 1] reporting completion with oauthUrl', {
     url: location.href,
     oauthUrlPreview: oauthUrl.slice(0, 120),
@@ -452,31 +504,46 @@ async function step1_getOAuthLink(payload) {
 }
 
 // ============================================================
-// 步骤 9：CPA 回调验证——填写 localhost 回调地址并提交
+// 步骤 10：CPA 回调验证——填写 localhost 回调地址并提交
 // ============================================================
 
-async function step9_vpsVerify(payload) {
-  await ensureOAuthManagementPage(payload?.vpsPassword, 9);
+async function step10_vpsVerify(payload) {
+  await ensureOAuthManagementPage(payload?.vpsPassword, 10);
+
+  const expectedOauthUrl = normalizeVisibleOauthUrl(payload?.expectedOauthUrl);
+  if (expectedOauthUrl) {
+    const currentOauthUrl = getVisibleOauthUrl();
+    if (!currentOauthUrl) {
+      throw new Error('步骤 10：当前 CPA 面板没有显示授权链接，无法确认是否仍是步骤 7 的同一条链路。请从步骤 7 重新开始。');
+    }
+    if (currentOauthUrl !== expectedOauthUrl) {
+      throw new Error(
+        `步骤 10：当前 CPA 面板授权链接已变化，不能提交到新的链路。` +
+        `当前=${currentOauthUrl.slice(0, 120)}...；步骤7=${expectedOauthUrl.slice(0, 120)}...`
+      );
+    }
+    log('步骤 10：已确认当前 CPA 面板仍在使用步骤 7 的授权链接。', 'ok');
+  }
 
   // 优先从 payload 读取 localhostUrl；没有时再回退到全局状态
   let localhostUrl = payload?.localhostUrl;
   if (localhostUrl && !isLocalhostOAuthCallbackUrl(localhostUrl)) {
-    throw new Error('步骤 9 只接受真实的 localhost OAuth 回调地址，请重新执行步骤 8。');
+    throw new Error('步骤 10 只接受真实的 localhost OAuth 回调地址，请重新执行步骤 9。');
   }
   if (!localhostUrl) {
-    log('步骤 9：payload 中没有 localhostUrl，正在从状态中读取...');
+    log('步骤 10：payload 中没有 localhostUrl，正在从状态中读取...');
     const state = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
     localhostUrl = state.localhostUrl;
     if (localhostUrl && !isLocalhostOAuthCallbackUrl(localhostUrl)) {
-      throw new Error('步骤 9 只接受真实的 localhost OAuth 回调地址，请重新执行步骤 8。');
+      throw new Error('步骤 10 只接受真实的 localhost OAuth 回调地址，请重新执行步骤 9。');
     }
   }
   if (!localhostUrl) {
-    throw new Error('未找到 localhost 回调地址，请先完成步骤 8。');
+    throw new Error('未找到 localhost 回调地址，请先完成步骤 9。');
   }
-  log(`步骤 9：已获取 localhostUrl：${localhostUrl.slice(0, 60)}...`);
+  log(`步骤 10：已获取 localhostUrl：${localhostUrl.slice(0, 60)}...`);
 
-  log('步骤 9：正在查找回调地址输入框...');
+  log('步骤 10：正在查找回调地址输入框...');
 
   // Find the callback URL input
   // Actual DOM: <input class="input" placeholder="http://localhost:1455/auth/callback?code=...&state=...">
@@ -493,7 +560,7 @@ async function step9_vpsVerify(payload) {
 
   await humanPause(600, 1500);
   fillInput(urlInput, localhostUrl);
-  log(`步骤 9：已填写回调地址：${localhostUrl.slice(0, 80)}...`);
+  log(`步骤 10：已填写回调地址：${localhostUrl.slice(0, 80)}...`);
 
   // Find and click "提交回调 URL" button
   let submitBtn = null;
@@ -513,9 +580,9 @@ async function step9_vpsVerify(payload) {
 
   await humanPause(450, 1200);
   simulateClick(submitBtn);
-  log('步骤 9：已点击“提交回调 URL”，正在等待认证结果...');
+  log('步骤 10：已点击“提交回调 URL”，正在等待认证结果...');
 
   const verifiedStatus = await waitForExactSuccessBadge();
-  log(`步骤 9：${verifiedStatus}`, 'ok');
-  reportComplete(9, { localhostUrl, verifiedStatus });
+  log(`步骤 10：${verifiedStatus}`, 'ok');
+  reportComplete(10, { localhostUrl, verifiedStatus });
 }

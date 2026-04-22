@@ -1,13 +1,15 @@
 {
   "manifest_version": 3,
   "name": "多页面自动化",
-  "version": "1.1.1",
+  "version": "2.0.0",
   "description": "用于自动执行多步骤 OAuth 注册流程",
   "permissions": [
     "sidePanel",
     "tabs",
     "webNavigation",
     "debugger",
+    "browsingData",
+    "cookies",
     "storage",
     "scripting",
     "activeTab"
@@ -26,7 +28,8 @@
       "matches": [
         "https://auth0.openai.com/*",
         "https://auth.openai.com/*",
-        "https://accounts.openai.com/*"
+        "https://accounts.openai.com/*",
+        "https://chatgpt.com/*"
       ],
       "js": ["content/utils.js", "content/signup-page.js"],
       "run_at": "document_idle"
@@ -43,8 +46,7 @@
     {
       "matches": [
         "https://mail.163.com/*",
-        "https://*.mail.163.com/*",
-        "https://webmail.vip.163.com/*"
+        "https://*.mail.163.com/*"
       ],
       "js": ["content/utils.js", "content/mail-163.js"],
       "all_frames": true,
@@ -55,6 +57,20 @@
         "https://duckduckgo.com/email/settings/autofill*"
       ],
       "js": ["content/utils.js", "content/duck-mail.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://app.simplelogin.io/*"
+      ],
+      "js": ["content/utils.js", "content/simplelogin-mail.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://app.addy.io/*"
+      ],
+      "js": ["content/utils.js", "content/addy-mail.js"],
       "run_at": "document_idle"
     }
   ],

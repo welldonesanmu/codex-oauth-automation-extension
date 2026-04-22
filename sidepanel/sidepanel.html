@@ -56,26 +56,24 @@
         <input type="password" id="input-vps-password" class="data-input" placeholder="请输入 CPA 管理密钥" />
       </div>
       <div class="data-row">
-        <span class="data-label">邮箱服务</span>
+        <span class="data-label">收码邮箱</span>
         <select id="select-mail-provider" class="data-select">
           <option value="163">163 邮箱 (mail.163.com)</option>
-          <option value="163-vip">163 VIP 邮箱 (webmail.vip.163.com)</option>
           <option value="qq">QQ 邮箱 (wx.mail.qq.com)</option>
-          <option value="inbucket">Inbucket（自定义主机）</option>
         </select>
       </div>
-      <div class="data-row" id="row-inbucket-host" style="display:none;">
-        <span class="data-label">Inbucket</span>
-        <input type="text" id="input-inbucket-host" class="data-input" placeholder="填写主机或 https://主机地址" />
-      </div>
-      <div class="data-row" id="row-inbucket-mailbox" style="display:none;">
-        <span class="data-label">邮箱名</span>
-        <input type="text" id="input-inbucket-mailbox" class="data-input" placeholder="例如 zju2001" />
+      <div class="data-row">
+        <span class="data-label">生成服务</span>
+        <select id="select-email-generation-service" class="data-select">
+          <option value="duckmail">Duck Mail</option>
+          <option value="simplelogin">SimpleLogin</option>
+          <option value="addy">Addy.io</option>
+        </select>
       </div>
       <div class="data-row">
         <span class="data-label">邮箱</span>
         <div class="data-inline">
-          <input type="text" id="input-email" class="data-input" placeholder="粘贴 DuckDuckGo 邮箱" />
+          <input type="text" id="input-email" class="data-input" placeholder="粘贴或获取邮箱" />
           <button id="btn-fetch-email" class="btn btn-outline btn-sm" type="button">获取</button>
         </div>
       </div>
@@ -111,7 +109,7 @@
     </div>
     <div id="auto-continue-bar" class="auto-continue-bar" style="display:none;">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-      <span class="auto-hint">先自动获取 Duck 邮箱，或手动粘贴邮箱后再继续</span>
+      <span class="auto-hint">先自动获取邮箱，或手动粘贴邮箱后再继续</span>
       <button id="btn-auto-continue" class="btn btn-primary btn-sm">继续</button>
     </div>
   </section>
@@ -119,55 +117,9 @@
   <section id="steps-section">
     <div class="steps-header">
       <span class="section-label">流程</span>
-      <span id="steps-progress" class="steps-progress">0 / 9</span>
+      <span id="steps-progress" class="steps-progress">0 / 10</span>
     </div>
-    <div class="steps-list">
-      <div class="step-row" data-step="1">
-        <div class="step-indicator" data-step="1"><span class="step-num">1</span></div>
-        <button class="step-btn" data-step="1">获取 OAuth 链接</button>
-        <span class="step-status" data-step="1"></span>
-      </div>
-      <div class="step-row" data-step="2">
-        <div class="step-indicator" data-step="2"><span class="step-num">2</span></div>
-        <button class="step-btn" data-step="2">打开注册页</button>
-        <span class="step-status" data-step="2"></span>
-      </div>
-      <div class="step-row" data-step="3">
-        <div class="step-indicator" data-step="3"><span class="step-num">3</span></div>
-        <button class="step-btn" data-step="3">填写邮箱和密码</button>
-        <span class="step-status" data-step="3"></span>
-      </div>
-      <div class="step-row" data-step="4">
-        <div class="step-indicator" data-step="4"><span class="step-num">4</span></div>
-        <button class="step-btn" data-step="4">获取注册验证码</button>
-        <span class="step-status" data-step="4"></span>
-      </div>
-      <div class="step-row" data-step="5">
-        <div class="step-indicator" data-step="5"><span class="step-num">5</span></div>
-        <button class="step-btn" data-step="5">填写姓名和生日</button>
-        <span class="step-status" data-step="5"></span>
-      </div>
-      <div class="step-row" data-step="6">
-        <div class="step-indicator" data-step="6"><span class="step-num">6</span></div>
-        <button class="step-btn" data-step="6">刷新 OAuth 并登录</button>
-        <span class="step-status" data-step="6"></span>
-      </div>
-      <div class="step-row" data-step="7">
-        <div class="step-indicator" data-step="7"><span class="step-num">7</span></div>
-        <button class="step-btn" data-step="7">获取登录验证码</button>
-        <span class="step-status" data-step="7"></span>
-      </div>
-      <div class="step-row" data-step="8">
-        <div class="step-indicator" data-step="8"><span class="step-num">8</span></div>
-        <button class="step-btn" data-step="8">自动确认 OAuth</button>
-        <span class="step-status" data-step="8"></span>
-      </div>
-      <div class="step-row" data-step="9">
-        <div class="step-indicator" data-step="9"><span class="step-num">9</span></div>
-        <button class="step-btn" data-step="9">CPA 回调验证</button>
-        <span class="step-status" data-step="9"></span>
-      </div>
-    </div>
+    <div class="steps-list"></div>
   </section>
 
   <section id="log-section">
@@ -194,6 +146,7 @@
   </div>
 
   <div id="toast-container"></div>
+  <script src="../data/step-definitions.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 </html>

@@ -24,6 +24,7 @@ const btnSaveSettings = document.getElementById('btn-save-settings');
 const btnStop = document.getElementById('btn-stop');
 const btnReset = document.getElementById('btn-reset');
 const stepsProgress = document.getElementById('steps-progress');
+const stepsList = document.querySelector('.steps-list');
 const btnAutoRun = document.getElementById('btn-auto-run');
 const btnAutoContinue = document.getElementById('btn-auto-continue');
 const autoContinueBar = document.getElementById('auto-continue-bar');
@@ -31,10 +32,7 @@ const btnClearLog = document.getElementById('btn-clear-log');
 const inputVpsUrl = document.getElementById('input-vps-url');
 const inputVpsPassword = document.getElementById('input-vps-password');
 const selectMailProvider = document.getElementById('select-mail-provider');
-const rowInbucketHost = document.getElementById('row-inbucket-host');
-const inputInbucketHost = document.getElementById('input-inbucket-host');
-const rowInbucketMailbox = document.getElementById('row-inbucket-mailbox');
-const inputInbucketMailbox = document.getElementById('input-inbucket-mailbox');
+const selectEmailGenerationService = document.getElementById('select-email-generation-service');
 const inputRunCount = document.getElementById('input-run-count');
 const inputAutoSkipFailures = document.getElementById('input-auto-skip-failures');
 const autoStartModal = document.getElementById('auto-start-modal');
@@ -44,18 +42,12 @@ const btnAutoStartClose = document.getElementById('btn-auto-start-close');
 const btnAutoStartCancel = document.getElementById('btn-auto-start-cancel');
 const btnAutoStartRestart = document.getElementById('btn-auto-start-restart');
 const btnAutoStartContinue = document.getElementById('btn-auto-start-continue');
-const STEP_DEFAULT_STATUSES = {
-  1: 'pending',
-  2: 'pending',
-  3: 'pending',
-  4: 'pending',
-  5: 'pending',
-  6: 'pending',
-  7: 'pending',
-  8: 'pending',
-  9: 'pending',
-};
-const SKIPPABLE_STEPS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+const stepDefinitions = (window.MultiPageStepDefinitions?.getSteps?.() || []).sort((left, right) => left.order - right.order);
+const STEP_IDS = stepDefinitions.map((step) => Number(step.id)).filter(Number.isFinite);
+const MAX_FLOW_STEP = STEP_IDS[STEP_IDS.length - 1] || 10;
+const STEP_DEFAULT_STATUSES = Object.fromEntries(STEP_IDS.map((stepId) => [stepId, 'pending']));
+const SKIPPABLE_STEPS = new Set(STEP_IDS);
+const STEP_INDEX_BY_ID = new Map(STEP_IDS.map((stepId, index) => [stepId, index]));
 
 let latestState = null;
 let currentAutoRun = {
@@ -206,7 +198,7 @@ function getStepStatuses(state = latestState) {
 
 function getFirstUnfinishedStep(state = latestState) {
   const statuses = getStepStatuses(state);
-  for (let step = 1; step <= 9; step++) {
+  for (const step of STEP_IDS) {
     if (!isDoneStatus(statuses[step])) {
       return step;
     }
@@ -280,8 +272,7 @@ function collectSettingsPayload() {
     vpsPassword: inputVpsPassword.value,
     customPassword: inputPassword.value,
     mailProvider: selectMailProvider.value,
-    inbucketHost: inputInbucketHost.value.trim(),
-    inbucketMailbox: inputInbucketMailbox.value.trim(),
+    emailGenerationService: selectEmailGenerationService.value,
     autoRunSkipFailures: inputAutoSkipFailures.checked,
   };
 }
@@ -309,6 +300,13 @@ async function saveSettings(options = {}) {
 
   if (!settingsDirty && !settingsSaveInFlight && silent) {
     return;
+  }
+
+  while (settingsSaveInFlight) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    if (!settingsDirty && silent) {
+      return;
+    }
   }
 
   const payload = collectSettingsPayload();
@@ -444,11 +442,8 @@ async function restoreState() {
     if (state.mailProvider) {
       selectMailProvider.value = state.mailProvider;
     }
-    if (state.inbucketHost) {
-      inputInbucketHost.value = state.inbucketHost;
-    }
-    if (state.inbucketMailbox) {
-      inputInbucketMailbox.value = state.inbucketMailbox;
+    if (state.emailGenerationService) {
+      selectEmailGenerationService.value = state.emailGenerationService;
     }
     inputAutoSkipFailures.checked = Boolean(state.autoRunSkipFailures);
 
@@ -479,10 +474,30 @@ function syncPasswordField(state) {
   inputPassword.value = state.customPassword || state.password || '';
 }
 
+function getSelectedEmailGenerationService() {
+  return (selectEmailGenerationService?.value || 'duckmail').trim().toLowerCase() || 'duckmail';
+}
+
+function getEmailGenerationServiceLabel(service = getSelectedEmailGenerationService()) {
+  if (service === 'simplelogin') return 'SimpleLogin';
+  if (service === 'addy') return 'Addy.io';
+  return 'Duck Mail';
+}
+
+function updateEmailInputPlaceholder() {
+  if (!inputEmail) return;
+  inputEmail.placeholder = `粘贴或获取 ${getEmailGenerationServiceLabel()} 邮箱`;
+}
+
+function updateAutoContinueHint() {
+  const hint = autoContinueBar?.querySelector('.auto-hint');
+  if (!hint) return;
+  hint.textContent = `先自动获取 ${getEmailGenerationServiceLabel()} 邮箱，或手动粘贴邮箱后再继续`;
+}
+
 function updateMailProviderUI() {
-  const useInbucket = selectMailProvider.value === 'inbucket';
-  rowInbucketHost.style.display = useInbucket ? '' : 'none';
-  rowInbucketMailbox.style.display = useInbucket ? '' : 'none';
+  updateEmailInputPlaceholder();
+  updateAutoContinueHint();
 }
 
 // ============================================================
@@ -510,8 +525,9 @@ function updateStepUI(step, status) {
 }
 
 function updateProgressCounter() {
-  const completed = Object.values(getStepStatuses()).filter(isDoneStatus).length;
-  stepsProgress.textContent = `${completed} / 9`;
+  const statuses = getStepStatuses();
+  const completed = STEP_IDS.filter((stepId) => isDoneStatus(statuses[stepId])).length;
+  stepsProgress.textContent = `${completed} / ${STEP_IDS.length}`;
 }
 
 function updateButtonStates() {
@@ -519,16 +535,19 @@ function updateButtonStates() {
   const anyRunning = Object.values(statuses).some(s => s === 'running');
   const autoLocked = isAutoRunLockedPhase();
 
-  for (let step = 1; step <= 9; step++) {
+  for (const step of STEP_IDS) {
     const btn = document.querySelector(`.step-btn[data-step="${step}"]`);
     if (!btn) continue;
 
+    const index = STEP_INDEX_BY_ID.get(step) || 0;
+    const previousStep = index > 0 ? STEP_IDS[index - 1] : null;
+
     if (anyRunning || autoLocked) {
       btn.disabled = true;
-    } else if (step === 1) {
+    } else if (!previousStep) {
       btn.disabled = false;
     } else {
-      const prevStatus = statuses[step - 1];
+      const prevStatus = statuses[previousStep];
       const currentStatus = statuses[step];
       btn.disabled = !(isDoneStatus(prevStatus) || currentStatus === 'failed' || isDoneStatus(currentStatus) || currentStatus === 'stopped');
     }
@@ -537,7 +556,9 @@ function updateButtonStates() {
   document.querySelectorAll('.step-manual-btn').forEach((btn) => {
     const step = Number(btn.dataset.step);
     const currentStatus = statuses[step];
-    const prevStatus = statuses[step - 1];
+    const index = STEP_INDEX_BY_ID.get(step) || 0;
+    const previousStep = index > 0 ? STEP_IDS[index - 1] : null;
+    const prevStatus = previousStep ? statuses[previousStep] : null;
 
     if (!SKIPPABLE_STEPS.has(step) || anyRunning || autoLocked || currentStatus === 'running' || isDoneStatus(currentStatus)) {
       btn.style.display = 'none';
@@ -546,10 +567,10 @@ function updateButtonStates() {
       return;
     }
 
-    if (step > 1 && !isDoneStatus(prevStatus)) {
+    if (previousStep && !isDoneStatus(prevStatus)) {
       btn.style.display = 'none';
       btn.disabled = true;
-      btn.title = `请先完成步骤 ${step - 1}`;
+      btn.title = `请先完成步骤 ${previousStep}`;
       return;
     }
 
@@ -609,13 +630,13 @@ function updateStatusDisplay(state) {
     return;
   }
 
-  const lastCompleted = Object.entries(state.stepStatuses)
-    .filter(([, s]) => isDoneStatus(s))
-    .map(([k]) => Number(k))
+  const lastCompleted = STEP_IDS
+    .filter((stepId) => isDoneStatus(state.stepStatuses[stepId]))
     .sort((a, b) => b - a)[0];
+  const finalStepId = STEP_IDS[STEP_IDS.length - 1];
 
-  if (lastCompleted === 9) {
-    displayStatus.textContent = (state.stepStatuses[9] === 'manual_completed' || state.stepStatuses[9] === 'skipped') ? '全部步骤已跳过/完成' : '全部步骤已完成';
+  if (lastCompleted === finalStepId) {
+    displayStatus.textContent = (state.stepStatuses[finalStepId] === 'manual_completed' || state.stepStatuses[finalStepId] === 'skipped') ? '全部步骤已跳过/完成' : '全部步骤已完成';
     statusBar.classList.add('completed');
   } else if (lastCompleted) {
     displayStatus.textContent = (state.stepStatuses[lastCompleted] === 'manual_completed' || state.stepStatuses[lastCompleted] === 'skipped')
@@ -653,24 +674,28 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-async function fetchDuckEmail(options = {}) {
+async function fetchGeneratedEmail(options = {}) {
   const { showFailureToast = true } = options;
   const defaultLabel = '获取';
+  const serviceLabel = getEmailGenerationServiceLabel();
   btnFetchEmail.disabled = true;
   btnFetchEmail.textContent = '...';
 
   try {
     const response = await chrome.runtime.sendMessage({
-      type: 'FETCH_DUCK_EMAIL',
+      type: 'FETCH_GENERATED_EMAIL',
       source: 'sidepanel',
-      payload: { generateNew: true },
+      payload: {
+        generateNew: true,
+        service: getSelectedEmailGenerationService(),
+      },
     });
 
     if (response?.error) {
       throw new Error(response.error);
     }
     if (!response?.email) {
-      throw new Error('未返回 Duck 邮箱。');
+      throw new Error(`未返回 ${serviceLabel} 邮箱。`);
     }
 
     inputEmail.value = response.email;
@@ -758,49 +783,55 @@ async function handleSkipStep(step) {
 // Button Handlers
 // ============================================================
 
-document.querySelectorAll('.step-btn').forEach(btn => {
-  btn.addEventListener('click', async () => {
-    try {
-      const step = Number(btn.dataset.step);
-      if (!(await maybeTakeoverAutoRun(`执行步骤 ${step}`))) {
-        return;
-      }
-      if (step === 3) {
-        if (inputPassword.value !== (latestState?.customPassword || '')) {
-          await chrome.runtime.sendMessage({
-            type: 'SAVE_SETTING',
-            source: 'sidepanel',
-            payload: { customPassword: inputPassword.value },
-          });
-          syncLatestState({ customPassword: inputPassword.value });
+function bindStepButtonHandlers() {
+  document.querySelectorAll('.step-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      try {
+        const step = Number(btn.dataset.step);
+        if (!(await maybeTakeoverAutoRun(`执行步骤 ${step}`))) {
+          return;
         }
-        let email = inputEmail.value.trim();
-        if (!email) {
-          try {
-            email = await fetchDuckEmail({ showFailureToast: false });
-          } catch (err) {
-            showToast(`自动获取失败：${err.message}，请手动粘贴邮箱后重试。`, 'warn');
-            return;
+        if (step === 2 || step === 3) {
+          if (inputPassword.value !== (latestState?.customPassword || '')) {
+            await chrome.runtime.sendMessage({
+              type: 'SAVE_SETTING',
+              source: 'sidepanel',
+              payload: { customPassword: inputPassword.value },
+            });
+            syncLatestState({ customPassword: inputPassword.value });
+          }
+          let email = inputEmail.value.trim();
+          if (!email) {
+            try {
+              email = await fetchGeneratedEmail({ showFailureToast: false });
+            } catch (err) {
+              showToast(`自动获取失败：${err.message}，请手动粘贴邮箱后重试。`, 'warn');
+              return;
+            }
+            if (!email) {
+              showToast(`请先获取或粘贴 ${getEmailGenerationServiceLabel()} 邮箱。`, 'warn');
+              return;
+            }
+          }
+          const response = await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, email } });
+          if (response?.error) {
+            throw new Error(response.error);
+          }
+        } else {
+          const response = await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step } });
+          if (response?.error) {
+            throw new Error(response.error);
           }
         }
-        const response = await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, email } });
-        if (response?.error) {
-          throw new Error(response.error);
-        }
-      } else {
-        const response = await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step } });
-        if (response?.error) {
-          throw new Error(response.error);
-        }
+      } catch (err) {
+        showToast(err.message, 'error');
       }
-    } catch (err) {
-      showToast(err.message, 'error');
-    }
+    });
   });
-});
+}
 
 btnFetchEmail.addEventListener('click', async () => {
-  await fetchDuckEmail().catch(() => { });
+  await fetchGeneratedEmail().catch(() => { });
 });
 
 btnTogglePassword.addEventListener('click', () => {
@@ -849,6 +880,8 @@ btnAutoRun.addEventListener('click', async () => {
       mode = choice;
     }
 
+    await saveSettings({ silent: true }).catch(() => { });
+
     btnAutoRun.disabled = true;
     inputRunCount.disabled = true;
     btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> 运行中...';
@@ -858,6 +891,7 @@ btnAutoRun.addEventListener('click', async () => {
       payload: {
         totalRuns,
         autoRunSkipFailures: inputAutoSkipFailures.checked,
+        emailGenerationService: getSelectedEmailGenerationService(),
         mode,
       },
     });
@@ -874,7 +908,7 @@ btnAutoRun.addEventListener('click', async () => {
 btnAutoContinue.addEventListener('click', async () => {
   const email = inputEmail.value.trim();
   if (!email) {
-    showToast('请先获取或粘贴 DuckDuckGo 邮箱。', 'warn');
+    showToast(`请先获取或粘贴 ${getEmailGenerationServiceLabel()} 邮箱。`, 'warn');
     return;
   }
   autoContinueBar.style.display = 'none';
@@ -958,19 +992,9 @@ selectMailProvider.addEventListener('change', () => {
   saveSettings({ silent: true }).catch(() => { });
 });
 
-inputInbucketMailbox.addEventListener('input', () => {
+selectEmailGenerationService.addEventListener('change', () => {
+  updateMailProviderUI();
   markSettingsDirty(true);
-  scheduleSettingsAutoSave();
-});
-inputInbucketMailbox.addEventListener('blur', () => {
-  saveSettings({ silent: true }).catch(() => { });
-});
-
-inputInbucketHost.addEventListener('input', () => {
-  markSettingsDirty(true);
-  scheduleSettingsAutoSave();
-});
-inputInbucketHost.addEventListener('blur', () => {
   saveSettings({ silent: true }).catch(() => { });
 });
 
@@ -1107,7 +1131,25 @@ btnTheme.addEventListener('click', () => {
 // Init
 // ============================================================
 
+function renderStepsList() {
+  if (!stepsList) return;
+
+  stepsList.innerHTML = stepDefinitions.map((step) => `
+    <div class="step-row" data-step="${step.id}" data-step-key="${escapeHtml(step.key)}">
+      <div class="step-indicator" data-step="${step.id}"><span class="step-num">${step.id}</span></div>
+      <button class="step-btn" data-step="${step.id}" data-step-key="${escapeHtml(step.key)}">${escapeHtml(step.title)}</button>
+      <span class="step-status" data-step="${step.id}"></span>
+    </div>
+  `).join('');
+
+  if (stepsProgress) {
+    stepsProgress.textContent = `0 / ${STEP_IDS.length}`;
+  }
+}
+
+renderStepsList();
 initializeManualStepActions();
+bindStepButtonHandlers();
 initTheme();
 updateSaveButtonState();
 restoreState().then(() => {
