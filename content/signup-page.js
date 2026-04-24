@@ -643,6 +643,46 @@ async function ensureSignupPasswordPageReady(timeout = 20000) {
   throw new Error('等待进入密码页超时。URL: ' + location.href);
 }
 
+async function waitForSignupPasswordOrVerificationReady(timeout = 20000) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeout) {
+    throwIfStopped();
+
+    const entrySnapshot = inspectSignupEntryState();
+    if (entrySnapshot.state === 'password_page' && entrySnapshot.passwordInput) {
+      return {
+        ready: true,
+        state: 'password_page',
+        snapshot: entrySnapshot,
+        url: location.href,
+      };
+    }
+
+    const verificationSnapshot = inspectSignupVerificationState();
+    if (verificationSnapshot.state === 'verification' || verificationSnapshot.state === 'step5') {
+      return {
+        ready: true,
+        state: verificationSnapshot.state,
+        snapshot: verificationSnapshot,
+        url: location.href,
+      };
+    }
+    if (verificationSnapshot.state === 'email_exists') {
+      return {
+        ready: false,
+        state: 'email_exists',
+        snapshot: verificationSnapshot,
+        url: location.href,
+      };
+    }
+
+    await sleep(200);
+  }
+
+  throw new Error('等待进入密码页或验证码页超时。URL: ' + location.href);
+}
+
 async function waitForSignupEmailContinueOrPasswordPage(email, step, timeout = 12000) {
   const normalizedEmail = String(email || '').trim().toLowerCase();
   const start = Date.now();
@@ -683,6 +723,63 @@ async function waitForSignupEmailContinueOrPasswordPage(email, step, timeout = 1
     state: 'timeout',
     snapshot: inspectSignupEntryState(),
   };
+}
+
+async function waitForStep3EntryTransitionAfterEmailFilled(email, timeout = 45000) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  const start = Date.now();
+  let lastHeartbeatAt = 0;
+
+  while (Date.now() - start < timeout) {
+    throwIfStopped();
+
+    const entrySnapshot = inspectSignupEntryState();
+    if (entrySnapshot.state === 'password_page' && entrySnapshot.passwordInput) {
+      return {
+        state: 'password_page',
+        snapshot: entrySnapshot,
+        url: location.href,
+      };
+    }
+
+    const verificationSnapshot = inspectSignupVerificationState();
+    if (verificationSnapshot.state === 'verification' || verificationSnapshot.state === 'step5') {
+      return {
+        state: verificationSnapshot.state,
+        snapshot: verificationSnapshot,
+        url: location.href,
+      };
+    }
+    if (verificationSnapshot.state === 'email_exists') {
+      return {
+        state: 'email_exists',
+        snapshot: verificationSnapshot,
+        url: location.href,
+      };
+    }
+
+    if (entrySnapshot.state === 'email_entry' && entrySnapshot.emailInput) {
+      const currentValue = String(entrySnapshot.emailInput.value || '').trim().toLowerCase();
+      const continueButton = entrySnapshot.continueButton || getSignupEmailContinueButton({ allowDisabled: true });
+      if (currentValue === normalizedEmail && continueButton && isActionEnabled(continueButton)) {
+        return {
+          state: 'ready',
+          snapshot: entrySnapshot,
+          continueButton,
+          url: location.href,
+        };
+      }
+    }
+
+    if (Date.now() - lastHeartbeatAt >= 3000) {
+      lastHeartbeatAt = Date.now();
+      log(`步骤 3：仍在等待页面进入密码页或验证码页，当前 URL：${location.href}`);
+    }
+
+    await sleep(200);
+  }
+
+  throw new Error('步骤 3：等待邮箱页进入下一阶段超时。URL: ' + location.href);
 }
 
 async function fillSignupEmailAndContinue(email, step) {
@@ -787,17 +884,92 @@ async function step3_fillEmailPassword(payload) {
     throw new Error('当前仍停留在 ChatGPT 官网首页，请先完成步骤 2。');
   }
 
+  const authSnapshot = inspectAuthPageState();
+  if (authSnapshot.state === 'verification' || authSnapshot.state === 'step5') {
+    const completionPayload = {
+      email,
+      signupVerificationRequestedAt: Date.now(),
+      skippedPasswordPage: true,
+      deferredSubmit: false,
+    };
+    log('步骤 3：页面已直接进入验证码阶段，无需再等待密码页。', 'ok');
+    reportComplete(3, completionPayload);
+    return completionPayload;
+  }
+  if (authSnapshot.state === 'email_exists') {
+    throw new Error('当前邮箱已存在，需要重新开始新一轮。');
+  }
+
   if (snapshot.state === 'email_entry') {
-    const transition = await fillSignupEmailAndContinue(email, 3);
-    if (!transition.alreadyOnPasswordPage) {
-      await sleep(1200);
-      await ensureSignupPasswordPageReady();
+    if (!email) throw new Error('未提供邮箱地址，步骤 3 无法继续。');
+
+    const currentValue = String(snapshot.emailInput?.value || '').trim().toLowerCase();
+    if (currentValue !== normalizedEmail) {
+      log(`步骤 3：正在填写邮箱：${email}`);
+      await humanPause(500, 1400);
+      fillInput(snapshot.emailInput, email);
+      log('步骤 3：邮箱已填写，正在等待页面进入下一阶段...');
+    } else {
+      log('步骤 3：邮箱已就绪，正在等待页面进入下一阶段...');
     }
+
+    const transitionStart = Date.now();
+    let lastContinueClickAt = 0;
+
+    while (Date.now() - transitionStart < 45000) {
+      const nextState = await waitForStep3EntryTransitionAfterEmailFilled(
+        email,
+        Math.max(1000, 45000 - (Date.now() - transitionStart)),
+      );
+      if (nextState.state === 'verification' || nextState.state === 'step5') {
+        const completionPayload = {
+          email,
+          signupVerificationRequestedAt: Date.now(),
+          skippedPasswordPage: true,
+          deferredSubmit: false,
+        };
+        log('步骤 3：提交邮箱后页面直接进入验证码阶段，交由步骤 4 继续。', 'ok');
+        reportComplete(3, completionPayload);
+        return completionPayload;
+      }
+      if (nextState.state === 'email_exists') {
+        throw new Error('当前邮箱已存在，需要重新开始新一轮。');
+      }
+      if (nextState.state === 'password_page') {
+        snapshot = nextState.snapshot;
+        break;
+      }
+      if (nextState.state === 'ready' && nextState.continueButton) {
+        const now = Date.now();
+        if (now - lastContinueClickAt < 1200) {
+          await sleep(200);
+          continue;
+        }
+        lastContinueClickAt = now;
+        log('步骤 3：邮箱页已就绪，点击继续并等待密码页或验证码页...');
+        simulateClick(nextState.continueButton);
+      }
+    }
+
     snapshot = inspectSignupEntryState();
   }
 
   if (snapshot.state !== 'password_page' || !snapshot.passwordInput) {
-    await ensureSignupPasswordPageReady();
+    const nextState = await waitForSignupPasswordOrVerificationReady();
+    if (nextState.state === 'verification' || nextState.state === 'step5') {
+      const completionPayload = {
+        email,
+        signupVerificationRequestedAt: Date.now(),
+        skippedPasswordPage: true,
+        deferredSubmit: false,
+      };
+      log('步骤 3：页面已直接进入验证码阶段，交由步骤 4 继续。', 'ok');
+      reportComplete(3, completionPayload);
+      return completionPayload;
+    }
+    if (nextState.state === 'email_exists') {
+      throw new Error('当前邮箱已存在，需要重新开始新一轮。');
+    }
     snapshot = inspectSignupEntryState();
   }
 
@@ -848,7 +1020,7 @@ async function step3_fillEmailPassword(payload) {
 // ============================================================
 
 const INVALID_VERIFICATION_CODE_PATTERN = /代码不正确|验证码不正确|验证码错误|code\s+(?:is\s+)?incorrect|invalid\s+code|incorrect\s+code|try\s+again/i;
-const VERIFICATION_PAGE_PATTERN = /检查您的收件箱|输入我们刚刚向|重新发送电子邮件|重新发送验证码|验证码|代码不正确|email\s+verification/i;
+const VERIFICATION_PAGE_PATTERN = /检查您的收件箱|输入我们刚刚向|重新发送电子邮件|重新发送验证码|代码不正确|email\s+verification/i;
 const OAUTH_CONSENT_PAGE_PATTERN = /使用\s*ChatGPT\s*登录到\s*Codex|sign\s+in\s+to\s+codex(?:\s+with\s+chatgpt)?|login\s+to\s+codex|log\s+in\s+to\s+codex|continue\s+to\s+codex|authorize|授权/i;
 const ADD_PHONE_PAGE_PATTERN = /add[\s-]*phone|添加手机号|手机号码|手机号|phone\s+number|telephone/i;
 const STEP5_SUBMIT_ERROR_PATTERN = /无法根据该信息创建帐户|请重试|unable\s+to\s+create\s+(?:your\s+)?account|couldn'?t\s+create\s+(?:your\s+)?account|something\s+went\s+wrong|invalid\s+(?:birthday|birth|date)|生日|出生日期/i;
@@ -1422,6 +1594,28 @@ async function waitForVerificationSubmitOutcome(step, timeout) {
   return { success: true, assumed: true };
 }
 
+async function ensureMinimumHumanDelayBeforeStep8Submit(payload = {}) {
+  const firstRequestedAt = Number.isFinite(payload?.firstVerificationCodeRequestedAt)
+    ? Math.floor(payload.firstVerificationCodeRequestedAt)
+    : null;
+  const minHumanDelayMs = Number.isFinite(payload?.minHumanDelayMs)
+    ? Math.max(0, Math.floor(payload.minHumanDelayMs))
+    : 0;
+
+  if (!Number.isFinite(firstRequestedAt) || minHumanDelayMs <= 0) {
+    return;
+  }
+
+  const elapsedMs = Date.now() - firstRequestedAt;
+  const remainingMs = minHumanDelayMs - elapsedMs;
+  if (remainingMs <= 0) {
+    return;
+  }
+
+  log(`步骤 8：为满足最小人类等待时长，提交前再等待 ${remainingMs}ms...`);
+  await sleep(remainingMs);
+}
+
 async function fillVerificationCode(step, payload) {
   const { code } = payload;
   if (!code) throw new Error('未提供验证码。');
@@ -1441,6 +1635,9 @@ async function fillVerificationCode(step, payload) {
     const singleInputs = document.querySelectorAll('input[maxlength="1"]');
     if (singleInputs.length >= 6) {
       log(`步骤 ${step}：发现分开的单字符验证码输入框，正在逐个填写...`);
+      if (step === 8) {
+        await humanPause(1000, 2000);
+      }
       for (let i = 0; i < 6 && i < singleInputs.length; i++) {
         fillInput(singleInputs[i], code[i]);
         await sleep(100);
@@ -1458,17 +1655,27 @@ async function fillVerificationCode(step, payload) {
     throw new Error('未找到验证码输入框。URL: ' + location.href);
   }
 
+  if (step === 8) {
+    await humanPause(1000, 2000);
+  }
   fillInput(codeInput, code);
   log(`步骤 ${step}：验证码已填写`);
 
   // Report complete BEFORE submit (page may navigate away)
 
   // Submit
-  await sleep(500);
+  if (step === 8) {
+    await humanPause(1000, 2000);
+  } else {
+    await sleep(500);
+  }
   const submitBtn = document.querySelector('button[type="submit"]')
     || await waitForElementByText('button', /verify|confirm|submit|continue|确认|验证/i, 5000).catch(() => null);
 
   if (submitBtn) {
+    if (step === 8) {
+      await ensureMinimumHumanDelayBeforeStep8Submit(payload);
+    }
     await humanPause(450, 1200);
     if (step === 8) {
       emitAuthFlowTrace('before_step8_code_submit', {
@@ -1526,7 +1733,7 @@ async function step7_login(payload) {
     throw new Error('在登录页未找到邮箱输入框。URL: ' + location.href);
   }
 
-  await humanPause(500, 1400);
+  await humanPause(1600, 3400);
   fillInput(emailInput, email);
   log('步骤 7：邮箱已填写');
 
@@ -1535,18 +1742,18 @@ async function step7_login(payload) {
   const submitBtn1 = document.querySelector('button[type="submit"]')
     || await waitForElementByText('button', /continue|next|submit|继续|下一步/i, 5000).catch(() => null);
   if (submitBtn1) {
-    await humanPause(400, 1100);
+    await humanPause(1800, 3600);
     simulateClick(submitBtn1);
     log('步骤 7：邮箱已提交');
   }
 
-  await sleep(2000);
+  await humanPause(2400, 4200);
 
   // Check for password field
   const passwordInput = document.querySelector('input[type="password"]');
   if (passwordInput) {
     log('步骤 7：已找到密码输入框，正在填写密码...');
-    await humanPause(550, 1450);
+    await humanPause(1800, 3600);
     fillInput(passwordInput, password);
 
     await sleep(500);
@@ -1556,7 +1763,7 @@ async function step7_login(payload) {
     reportComplete(7, { needsOTP: true });
 
     if (submitBtn2) {
-      await humanPause(450, 1200);
+      await humanPause(1800, 3600);
       simulateClick(submitBtn2);
       log('步骤 7：密码已提交，可能还需要验证码（步骤 8）');
     }

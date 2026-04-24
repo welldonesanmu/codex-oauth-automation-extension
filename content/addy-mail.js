@@ -38,6 +38,8 @@ if (!window.__MULTIPAGE_ADDY_LISTENER_READY__) {
 
     const requestKey = JSON.stringify({
       generateNew: message?.payload?.generateNew !== false,
+      addyRecipients: String(message?.payload?.addyRecipients || ''),
+      addyAliasDomain: String(message?.payload?.addyAliasDomain || ''),
     });
     const now = Date.now();
     const inFlightRequest = window.__MULTIPAGE_ADDY_FETCH_IN_FLIGHT__;
@@ -388,6 +390,403 @@ function findAddySuccessCopyState() {
   return candidates[0] || null;
 }
 
+function getAddyFieldDescriptorText(el) {
+  return normalizeAddyText([
+    el?.getAttribute?.('aria-label'),
+    el?.getAttribute?.('placeholder'),
+    el?.getAttribute?.('name'),
+    el?.getAttribute?.('id'),
+    el?.labels ? Array.from(el.labels).map((label) => label.textContent || '').join(' ') : '',
+    el?.closest?.('label, [role="group"], [class*="field" i], [class*="input" i], [class*="select" i], [class*="combobox" i]')?.textContent || '',
+  ].join(' ')).toLowerCase();
+}
+
+function isAddyRecipientsField(el) {
+  if (!el || !isAddyElementVisible(el)) return false;
+  return /recipients?/.test(getAddyFieldDescriptorText(el));
+}
+
+function isAddyAliasDomainField(el) {
+  if (!el || !isAddyElementVisible(el)) return false;
+  const text = getAddyFieldDescriptorText(el);
+  return /(alias\s*domain|domain)/.test(text) && !/recipient/.test(text);
+}
+
+function findAddyRecipientsInput(container) {
+  if (!container?.querySelectorAll) return null;
+  const selectors = [
+    'input',
+    'textarea',
+    '[role="combobox"] input',
+    'input[aria-autocomplete]',
+  ];
+  for (const selector of selectors) {
+    const match = Array.from(container.querySelectorAll(selector)).find((el) => isAddyRecipientsField(el));
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function findAddyAliasDomainField(container) {
+  if (!container?.querySelectorAll) return null;
+  const selectors = [
+    'select',
+    'input',
+    'textarea',
+    '[role="combobox"]',
+    '[role="combobox"] input',
+    'input[aria-autocomplete]',
+    'button[aria-haspopup="listbox"]',
+    'button[aria-haspopup="menu"]',
+  ];
+  for (const selector of selectors) {
+    const match = Array.from(container.querySelectorAll(selector)).find((el) => isAddyAliasDomainField(el));
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function getAddyOptionCandidateText(el) {
+  return normalizeAddyText([
+    el?.textContent || '',
+    el?.getAttribute?.('aria-label') || '',
+    el?.getAttribute?.('data-value') || '',
+    el?.title || '',
+    el?.getAttribute?.('value') || '',
+  ].join(' '));
+}
+
+function getAddyRecipientCandidateText(el) {
+  return getAddyOptionCandidateText(el);
+}
+
+function scoreAddyRecipientsOption(el, field, recipientText) {
+  if (!el || el === field || el.contains?.(field) || field?.contains?.(el)) return -Infinity;
+  if (!(el instanceof HTMLElement) || !isAddyElementVisible(el)) return -Infinity;
+
+  const text = getAddyRecipientCandidateText(el);
+  const normalizedText = text.toLowerCase();
+  const target = normalizeAddyText(recipientText).toLowerCase();
+  if (!target || !normalizedText.includes(target)) return -Infinity;
+
+  const role = String(el.getAttribute('role') || '').toLowerCase();
+  const tagName = String(el.tagName || '').toLowerCase();
+  let score = 0;
+  if (normalizedText === target) score += 4000;
+  if ((normalizeAddyText(el.textContent || '').toLowerCase()) === target) score += 2000;
+  if (role === 'option') score += 1200;
+  if (role === 'button' || role === 'menuitem') score += 700;
+  if (['button', 'li', 'a'].includes(tagName)) score += 500;
+  if (el.getAttribute('aria-selected') === 'false') score += 200;
+  if (el.getAttribute('aria-selected') === 'true') score += 500;
+  if (text.length <= target.length + 8) score += 300;
+
+  const fieldRect = field?.getBoundingClientRect?.();
+  const optionRect = el.getBoundingClientRect();
+  if (fieldRect && optionRect) {
+    if (optionRect.top >= fieldRect.bottom - 6) score += 800;
+    if (Math.abs(optionRect.left - fieldRect.left) <= 80) score += 250;
+    score -= Math.min(600, Math.abs(optionRect.top - fieldRect.bottom));
+  }
+
+  score -= Math.min(500, (el.querySelectorAll?.('*').length || 0) * 10);
+  return score;
+}
+
+function findAddyRecipientsOption(container, field, recipients) {
+  if (!container?.querySelectorAll) return null;
+  const candidates = Array.from(container.querySelectorAll('*'))
+    .map((el) => ({ el, score: scoreAddyRecipientsOption(el, field, recipients) }))
+    .filter((item) => Number.isFinite(item.score) && item.score > -Infinity)
+    .sort((left, right) => right.score - left.score);
+  return candidates[0]?.el || null;
+}
+
+async function clickAddyRecipientsOption(container, field, recipients, requestId = null, timeoutMs = 5000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    throwIfAddyRequestInvalid(requestId);
+    const option = findAddyRecipientsOption(container, field, recipients);
+    if (option) {
+      debugLog('Addy recipients option found', {
+        elapsedMs: Date.now() - start,
+        text: normalizeAddyText(option.textContent || ''),
+        role: option.getAttribute('role') || '',
+        className: option.className || '',
+      });
+      option.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      await humanPause(150, 350);
+      simulateClick(option);
+      await sleep(250);
+      return option;
+    }
+    await sleep(150);
+  }
+
+  debugLog('Addy recipients option missing', {
+    recipients: String(recipients || ''),
+    contextText: normalizeAddyText(container?.textContent || ''),
+    fields: collectFieldDebugInfo(),
+  });
+  throw new Error('Addy.io Recipients 已输入，但未找到下方可点击的匹配邮箱。');
+}
+
+async function fillAddyRecipients(confirmButton, recipients, requestId = null) {
+  const rawRecipients = String(recipients ?? '');
+  if (!rawRecipients) return;
+
+  throwIfAddyRequestInvalid(requestId);
+  const context = getAddyButtonContext(confirmButton);
+  const container = context.dialog || context.form || context.container;
+  const field = findAddyRecipientsInput(container);
+  if (!field) {
+    debugLog('Addy recipients field missing', {
+      recipients: rawRecipients,
+      contextText: normalizeAddyText(container?.textContent || ''),
+      fields: collectFieldDebugInfo(),
+    });
+    throw new Error('已配置 Addy.io Recipients，但未找到对应输入框。');
+  }
+
+  field.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  await humanPause(250, 600);
+  fillInput(field, rawRecipients);
+  await sleep(250);
+
+  const currentValue = normalizeAddyText(field.value || field.textContent || '');
+  if (!currentValue || !currentValue.includes(normalizeAddyText(rawRecipients))) {
+    debugLog('Addy recipients fill verification failed', {
+      recipients: rawRecipients,
+      currentValue,
+      contextText: normalizeAddyText(container?.textContent || ''),
+    });
+    throw new Error('Addy.io Recipients 填写后未通过校验。');
+  }
+
+  await clickAddyRecipientsOption(container, field, rawRecipients, requestId);
+
+  const containerText = normalizeAddyText(container?.textContent || '').toLowerCase();
+  const normalizedRecipients = normalizeAddyText(rawRecipients).toLowerCase();
+  if (!containerText.includes(normalizedRecipients)) {
+    debugLog('Addy recipients selection verification failed', {
+      recipients: rawRecipients,
+      contextText: normalizeAddyText(container?.textContent || ''),
+      fields: collectFieldDebugInfo(),
+    });
+    throw new Error('Addy.io Recipients 点击匹配项后未通过校验。');
+  }
+
+  log(`Addy.io：已填写并选中 Recipients：${rawRecipients}`);
+}
+
+function scoreAddyAliasDomainOption(el, field, aliasDomain) {
+  if (!el || el === field || el.contains?.(field) || field?.contains?.(el)) return -Infinity;
+  if (!(el instanceof HTMLElement) || !isAddyElementVisible(el)) return -Infinity;
+
+  const text = getAddyOptionCandidateText(el);
+  const normalizedText = text.toLowerCase();
+  const target = normalizeAddyText(aliasDomain).toLowerCase();
+  if (!target || !normalizedText.includes(target)) return -Infinity;
+
+  const role = String(el.getAttribute('role') || '').toLowerCase();
+  const tagName = String(el.tagName || '').toLowerCase();
+  let score = 0;
+  if (normalizedText === target) score += 5000;
+  if ((normalizeAddyText(el.textContent || '').toLowerCase()) === target) score += 2400;
+  if (role === 'option') score += 1400;
+  if (role === 'button' || role === 'menuitem') score += 900;
+  if (['button', 'li', 'a', 'option'].includes(tagName)) score += 650;
+  if (text.length <= target.length + 6) score += 400;
+
+  const fieldRect = field?.getBoundingClientRect?.();
+  const optionRect = el.getBoundingClientRect();
+  if (fieldRect && optionRect) {
+    if (optionRect.top >= fieldRect.bottom - 12) score += 900;
+    if (Math.abs(optionRect.left - fieldRect.left) <= 120) score += 300;
+    score -= Math.min(700, Math.abs(optionRect.top - fieldRect.bottom));
+  }
+
+  score -= Math.min(500, (el.querySelectorAll?.('*').length || 0) * 10);
+  return score;
+}
+
+function findAddyAliasDomainOption(field, aliasDomain, container = null) {
+  const scopes = [];
+  if (container?.querySelectorAll) scopes.push(container);
+  if (!scopes.includes(document)) scopes.push(document);
+
+  const candidates = [];
+  for (const scope of scopes) {
+    for (const el of Array.from(scope.querySelectorAll('*'))) {
+      const score = scoreAddyAliasDomainOption(el, field, aliasDomain);
+      if (Number.isFinite(score) && score > -Infinity) {
+        candidates.push({ el, score });
+      }
+    }
+  }
+
+  candidates.sort((left, right) => right.score - left.score);
+  return candidates[0]?.el || null;
+}
+
+async function clickAddyAliasDomainOption(field, aliasDomain, container = null, requestId = null, timeoutMs = 5000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    throwIfAddyRequestInvalid(requestId);
+    const option = findAddyAliasDomainOption(field, aliasDomain, container);
+    if (option) {
+      debugLog('Addy alias-domain option found', {
+        elapsedMs: Date.now() - start,
+        text: normalizeAddyText(option.textContent || ''),
+        role: option.getAttribute('role') || '',
+        className: option.className || '',
+      });
+      option.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      await humanPause(150, 350);
+      simulateClick(option);
+      await sleep(250);
+      return option;
+    }
+    await sleep(150);
+  }
+
+  debugLog('Addy alias-domain option missing', {
+    aliasDomain: String(aliasDomain || ''),
+    contextText: normalizeAddyText(container?.textContent || document.body?.textContent || ''),
+    fields: collectFieldDebugInfo(),
+  });
+  throw new Error('Addy.io Alias Domain 已输入，但未找到可点击的匹配域名。');
+}
+
+function collectAddyAliasDomainSelectionEvidence(field, container) {
+  const values = new Set();
+  const push = (candidate) => {
+    const normalized = normalizeAddyText(candidate).toLowerCase();
+    if (normalized) {
+      values.add(normalized);
+    }
+  };
+
+  push(field?.value);
+  push(field?.textContent);
+  push(field?.getAttribute?.('value'));
+  push(field?.getAttribute?.('aria-label'));
+  push(field?.getAttribute?.('title'));
+  push(field?.getAttribute?.('data-value'));
+
+  const activeDescendantId = String(field?.getAttribute?.('aria-activedescendant') || '').trim();
+  if (activeDescendantId) {
+    push(document.getElementById(activeDescendantId)?.textContent || '');
+  }
+
+  const controlledIds = String(field?.getAttribute?.('aria-controls') || '').trim().split(/\s+/).filter(Boolean);
+  for (const controlledId of controlledIds) {
+    const controlled = document.getElementById(controlledId);
+    if (!controlled) continue;
+    push(controlled.getAttribute?.('data-value') || '');
+    push(controlled.getAttribute?.('aria-label') || '');
+    push(controlled.textContent || '');
+    if (controlled.querySelectorAll) {
+      Array.from(controlled.querySelectorAll('[aria-selected="true"], [aria-checked="true"], [data-state="checked"], [data-selected="true"], option:checked')).forEach((el) => {
+        push(el.textContent || '');
+        push(el.getAttribute?.('aria-label') || '');
+        push(el.getAttribute?.('data-value') || '');
+        push(el.getAttribute?.('value') || '');
+      });
+    }
+  }
+
+  const fieldScope = field?.closest?.('label, [role="group"], [class*="field" i], [class*="input" i], [class*="select" i], [class*="combobox" i]') || container || null;
+  if (fieldScope?.querySelectorAll) {
+    Array.from(fieldScope.querySelectorAll('[aria-selected="true"], [aria-checked="true"], [data-state="checked"], [data-selected="true"], option:checked')).forEach((el) => {
+      push(el.textContent || '');
+      push(el.getAttribute?.('aria-label') || '');
+      push(el.getAttribute?.('data-value') || '');
+      push(el.getAttribute?.('value') || '');
+    });
+  }
+
+  return [...values];
+}
+
+function isSelectedAliasDomain(field, container, aliasDomain) {
+  const target = normalizeAddyText(aliasDomain).toLowerCase();
+  if (!target) return true;
+
+  if (field instanceof HTMLSelectElement) {
+    const selectedOption = field.options[field.selectedIndex];
+    const selectedText = normalizeAddyText(selectedOption?.text || selectedOption?.value || '').toLowerCase();
+    return selectedText === target || selectedText.includes(target);
+  }
+
+  return collectAddyAliasDomainSelectionEvidence(field, container).some((value) => (
+    value === target || value.includes(target)
+  ));
+}
+
+async function fillAddyAliasDomain(confirmButton, aliasDomain, requestId = null) {
+  const rawAliasDomain = String(aliasDomain ?? '');
+  if (!rawAliasDomain) return;
+
+  throwIfAddyRequestInvalid(requestId);
+  const context = getAddyButtonContext(confirmButton);
+  const container = context.dialog || context.form || context.container;
+  const field = findAddyAliasDomainField(container);
+  if (!field) {
+    debugLog('Addy alias-domain field missing', {
+      aliasDomain: rawAliasDomain,
+      contextText: normalizeAddyText(container?.textContent || ''),
+      fields: collectFieldDebugInfo(),
+    });
+    throw new Error('已配置 Addy.io Alias Domain，但未找到对应字段。');
+  }
+
+  field.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  await humanPause(250, 600);
+
+  if (field instanceof HTMLSelectElement) {
+    const matchedOption = Array.from(field.options).find((option) => {
+      const optionText = normalizeAddyText(option.text || option.value || '').toLowerCase();
+      const target = normalizeAddyText(rawAliasDomain).toLowerCase();
+      return optionText === target || optionText.includes(target);
+    });
+    if (!matchedOption) {
+      debugLog('Addy alias-domain select option missing', {
+        aliasDomain: rawAliasDomain,
+        options: Array.from(field.options).map((option) => normalizeAddyText(option.text || option.value || '')),
+      });
+      throw new Error('已配置 Addy.io Alias Domain，但下拉框中未找到匹配域名。');
+    }
+    fillSelect(field, matchedOption.value);
+    await sleep(250);
+  } else {
+    if (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) {
+      fillInput(field, rawAliasDomain);
+    } else {
+      simulateClick(field);
+    }
+    await sleep(250);
+    if (!(field instanceof HTMLSelectElement) && !isSelectedAliasDomain(field, container, rawAliasDomain)) {
+      await clickAddyAliasDomainOption(field, rawAliasDomain, container, requestId);
+    }
+  }
+
+  if (!isSelectedAliasDomain(field, container, rawAliasDomain)) {
+    debugLog('Addy alias-domain selection verification failed', {
+      aliasDomain: rawAliasDomain,
+      contextText: normalizeAddyText(container?.textContent || ''),
+      fields: collectFieldDebugInfo(),
+    });
+    throw new Error('Addy.io Alias Domain 选择后未通过校验。');
+  }
+
+  log(`Addy.io：已选中 Alias Domain：${rawAliasDomain}`);
+}
+
 async function clickAddyButton(button, debugLabel) {
   if (!button) {
     throw new Error(`缺少按钮：${debugLabel}`);
@@ -496,10 +895,15 @@ async function waitForAliasChange(previousEmail = '', timeoutMs = 30000, request
 }
 
 async function fetchAddyAlias(payload = {}, options = {}) {
-  const { generateNew = true } = payload;
+  const { generateNew = true, addyRecipients = '', addyAliasDomain = '' } = payload;
   const requestId = Number.isInteger(options.requestId) ? options.requestId : null;
   log(`Addy.io：正在${generateNew ? '生成' : '读取'}别名...`);
-  debugLog('Addy fetch start', { url: location.href, generateNew });
+  debugLog('Addy fetch start', {
+    url: location.href,
+    generateNew,
+    addyRecipients: String(addyRecipients || ''),
+    addyAliasDomain: String(addyAliasDomain || ''),
+  });
 
   const currentAlias = readCurrentAddyAlias();
   debugLog('Addy initial snapshot', snapshotAddyState());
@@ -517,6 +921,8 @@ async function fetchAddyAlias(payload = {}, options = {}) {
 
   const entryButton = await clickCreateNewAliasButton();
   const confirmButton = await waitForConfirmCreateAliasButton(entryButton, 15000, requestId);
+  await fillAddyAliasDomain(confirmButton, addyAliasDomain, requestId);
+  await fillAddyRecipients(confirmButton, addyRecipients, requestId);
   await clickAddyConfirmCreateAliasButton(confirmButton);
 
   const successState = await waitForAddySuccessCopyState(20000, requestId);

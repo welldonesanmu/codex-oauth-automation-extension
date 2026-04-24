@@ -2,7 +2,7 @@
 
 一个基于 Chromium Manifest V3 的侧边栏扩展，用于自动执行 Codex / ChatGPT OAuth 注册与授权流程。
 
-当前版本为 `v2.0.0`，基于侧边栏控制，支持单步执行、整套自动执行、停止当前流程、保存常用配置，以及通过 DuckDuckGo / QQ / 163 / Inbucket mailbox 协助获取验证码。
+当前版本为 `v2.0.1`，基于侧边栏控制，支持单步执行、整套自动执行、停止当前流程、保存常用配置，以及通过 DuckDuckGo / QQ / 163 / Inbucket mailbox 协助获取验证码。
 
 - 保持 **7 步**主流程
 - 支持 **单步执行 / Auto 多轮运行 / Stop 中断**

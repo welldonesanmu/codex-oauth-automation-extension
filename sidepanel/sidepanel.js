@@ -32,6 +32,10 @@ const btnClearLog = document.getElementById('btn-clear-log');
 const inputVpsUrl = document.getElementById('input-vps-url');
 const inputVpsPassword = document.getElementById('input-vps-password');
 const selectMailProvider = document.getElementById('select-mail-provider');
+const rowAddyRecipients = document.getElementById('row-addy-recipients');
+const inputAddyRecipients = document.getElementById('input-addy-recipients');
+const rowAddyAliasDomain = document.getElementById('row-addy-alias-domain');
+const inputAddyAliasDomain = document.getElementById('input-addy-alias-domain');
 const selectEmailGenerationService = document.getElementById('select-email-generation-service');
 const inputRunCount = document.getElementById('input-run-count');
 const inputAutoSkipFailures = document.getElementById('input-auto-skip-failures');
@@ -45,6 +49,7 @@ const btnAutoStartContinue = document.getElementById('btn-auto-start-continue');
 const stepDefinitions = (window.MultiPageStepDefinitions?.getSteps?.() || []).sort((left, right) => left.order - right.order);
 const STEP_IDS = stepDefinitions.map((step) => Number(step.id)).filter(Number.isFinite);
 const MAX_FLOW_STEP = STEP_IDS[STEP_IDS.length - 1] || 10;
+const FLOW_VERSION = 7;
 const STEP_DEFAULT_STATUSES = Object.fromEntries(STEP_IDS.map((stepId) => [stepId, 'pending']));
 const SKIPPABLE_STEPS = new Set(STEP_IDS);
 const STEP_INDEX_BY_ID = new Map(STEP_IDS.map((stepId, index) => [stepId, index]));
@@ -226,56 +231,33 @@ function isDoneStatus(status) {
 }
 
 function normalizeFlowStep(step) {
-  const numericStep = Number(step) || 0;
-  if (numericStep === 8) return 6;
-  if (numericStep === 9) return 7;
-  return numericStep;
+  return Number(step) || 0;
 }
 
 function isLegacyFlowState(state = {}) {
   const storedVersion = Number(state?.flowVersion || 0);
-  if (storedVersion >= FLOW_VERSION) {
-    return false;
-  }
-
-  const statuses = state?.stepStatuses || {};
-  return Boolean(
-    Number(state?.currentStep)
-    || statuses[6] !== undefined
-    || statuses[7] !== undefined
-    || statuses[8] !== undefined
-    || statuses[9] !== undefined
-    || state?.localhostUrl
-  );
+  return storedVersion > 0 && storedVersion < FLOW_VERSION;
 }
 
 function normalizeStepStatuses(statuses = {}, options = {}) {
-  const { legacy = false, localhostUrl = null } = options;
+  const { localhostUrl = null } = options;
   const normalized = { ...STEP_DEFAULT_STATUSES };
-  for (let step = 1; step <= 5; step++) {
+  for (const step of STEP_IDS) {
     if (statuses[step] !== undefined) {
       normalized[step] = statuses[step];
     }
   }
-  if (legacy) {
-    if (statuses[8] !== undefined) normalized[6] = statuses[8];
-    if (statuses[9] !== undefined) normalized[7] = statuses[9];
-  } else {
-    if (statuses[6] !== undefined) normalized[6] = statuses[6];
-    if (statuses[7] !== undefined) normalized[7] = statuses[7];
-  }
   if (localhostUrl) {
-    normalized[6] = isDoneStatus(normalized[6]) ? normalized[6] : 'completed';
+    normalized[9] = isDoneStatus(normalized[9]) ? normalized[9] : 'completed';
   }
-  if (isDoneStatus(normalized[7]) && !isDoneStatus(normalized[6])) {
-    normalized[6] = 'completed';
+  if (isDoneStatus(normalized[10]) && !isDoneStatus(normalized[9])) {
+    normalized[9] = 'completed';
   }
   return normalized;
 }
 
 function getStepStatuses(state = latestState) {
   return normalizeStepStatuses(state?.stepStatuses || {}, {
-    legacy: isLegacyFlowState(state),
     localhostUrl: state?.localhostUrl,
   });
 }
@@ -364,6 +346,8 @@ function collectSettingsPayload() {
     customPassword: inputPassword.value,
     mailProvider: selectMailProvider.value,
     emailGenerationService: selectEmailGenerationService.value,
+    addyRecipients: inputAddyRecipients?.value || '',
+    addyAliasDomain: inputAddyAliasDomain?.value || '',
     autoRunSkipFailures: inputAutoSkipFailures.checked,
   };
 }
@@ -536,6 +520,12 @@ async function restoreState() {
     if (state.emailGenerationService) {
       selectEmailGenerationService.value = state.emailGenerationService;
     }
+    if (inputAddyRecipients && state.addyRecipients !== undefined) {
+      inputAddyRecipients.value = state.addyRecipients || '';
+    }
+    if (inputAddyAliasDomain && state.addyAliasDomain !== undefined) {
+      inputAddyAliasDomain.value = state.addyAliasDomain || '';
+    }
     inputAutoSkipFailures.checked = Boolean(state.autoRunSkipFailures);
 
     if (state.stepStatuses) {
@@ -586,9 +576,20 @@ function updateAutoContinueHint() {
   hint.textContent = `先自动获取 ${getEmailGenerationServiceLabel()} 邮箱，或手动粘贴邮箱后再继续`;
 }
 
+function updateEmailGenerationServiceUI() {
+  const isAddy = getSelectedEmailGenerationService() === 'addy';
+  if (rowAddyRecipients) {
+    rowAddyRecipients.hidden = !isAddy;
+  }
+  if (rowAddyAliasDomain) {
+    rowAddyAliasDomain.hidden = !isAddy;
+  }
+}
+
 function updateMailProviderUI() {
   updateEmailInputPlaceholder();
   updateAutoContinueHint();
+  updateEmailGenerationServiceUI();
 }
 
 // ============================================================
@@ -774,12 +775,14 @@ async function fetchGeneratedEmail(options = {}) {
   btnFetchEmail.textContent = '...';
 
   try {
-    const response = await chrome.runtime.sendMessage({
+    const response = await sendRuntimeMessage({
       type: 'FETCH_GENERATED_EMAIL',
       source: 'sidepanel',
       payload: {
         generateNew: true,
         service: getSelectedEmailGenerationService(),
+        addyRecipients: inputAddyRecipients?.value || '',
+        addyAliasDomain: inputAddyAliasDomain?.value || '',
       },
     });
 
@@ -885,7 +888,7 @@ function bindStepButtonHandlers() {
         }
         if (step === 2 || step === 3) {
           if (inputPassword.value !== (latestState?.customPassword || '')) {
-            await chrome.runtime.sendMessage({
+            await sendRuntimeMessage({
               type: 'SAVE_SETTING',
               source: 'sidepanel',
               payload: { customPassword: inputPassword.value },
@@ -905,12 +908,12 @@ function bindStepButtonHandlers() {
               return;
             }
           }
-          const response = await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, email } });
+          const response = await sendRuntimeMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, email } });
           if (response?.error) {
             throw new Error(response.error);
           }
         } else {
-          const response = await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step } });
+          const response = await sendRuntimeMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step } });
           if (response?.error) {
             throw new Error(response.error);
           }
@@ -973,7 +976,7 @@ btnAutoRun.addEventListener('click', async () => {
       mode = choice;
     }
 
-    await saveSettings({ silent: true }).catch(() => { });
+    await saveSettings({ silent: true });
 
     btnAutoRun.disabled = true;
     inputRunCount.disabled = true;
@@ -985,6 +988,8 @@ btnAutoRun.addEventListener('click', async () => {
         totalRuns,
         autoRunSkipFailures: inputAutoSkipFailures.checked,
         emailGenerationService: getSelectedEmailGenerationService(),
+        addyRecipients: inputAddyRecipients?.value || '',
+        addyAliasDomain: inputAddyAliasDomain?.value || '',
         mode,
       },
     });
@@ -1076,6 +1081,22 @@ inputPassword.addEventListener('input', () => {
   scheduleSettingsAutoSave();
 });
 inputPassword.addEventListener('blur', () => {
+  saveSettings({ silent: true }).catch(() => { });
+});
+
+inputAddyRecipients?.addEventListener('input', () => {
+  markSettingsDirty(true);
+  scheduleSettingsAutoSave();
+});
+inputAddyRecipients?.addEventListener('blur', () => {
+  saveSettings({ silent: true }).catch(() => { });
+});
+
+inputAddyAliasDomain?.addEventListener('input', () => {
+  markSettingsDirty(true);
+  scheduleSettingsAutoSave();
+});
+inputAddyAliasDomain?.addEventListener('blur', () => {
   saveSettings({ silent: true }).catch(() => { });
 });
 

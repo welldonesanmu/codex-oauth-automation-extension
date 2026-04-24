@@ -231,14 +231,20 @@ function waitForElementByText(containerSelector, textPattern, timeout = 10000) {
  */
 function fillInput(el, value) {
   throwIfStopped();
-  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-    window.HTMLInputElement.prototype,
+  const normalizedValue = String(value ?? '');
+  const descriptor = Object.getOwnPropertyDescriptor(
+    el instanceof window.HTMLTextAreaElement ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype,
     'value'
-  ).set;
-  nativeInputValueSetter.call(el, value);
+  );
+  const nativeValueSetter = descriptor?.set;
+  if (nativeValueSetter) {
+    nativeValueSetter.call(el, normalizedValue);
+  } else {
+    el.value = normalizedValue;
+  }
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
-  console.log(LOG_PREFIX, `已填写输入框 ${el.name || el.id || el.type}: ${value}`);
+  console.log(LOG_PREFIX, `已填写输入框 ${el.name || el.id || el.type}: ${normalizedValue}`);
   log(`已填写输入框 [${el.name || el.id || el.type || '未知'}]`);
 }
 

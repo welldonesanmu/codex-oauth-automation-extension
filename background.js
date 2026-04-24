@@ -7,12 +7,20 @@ const LOG_PREFIX = '[MultiPage:bg]';
 const DUCK_AUTOFILL_URL = 'https://duckduckgo.com/email/settings/autofill';
 const SIMPLELOGIN_APP_URL = 'https://app.simplelogin.io/dashboard/';
 const ADDY_APP_URL = 'https://app.addy.io/aliases';
+const FLOW_VERSION = 7;
+const EMAIL_POOL_STORAGE_KEY = 'emailPoolsByProvider';
+const EMAIL_POOL_VERSION = 1;
+const EMAIL_POOL_STATUSES = ['pending', 'claimed', 'running', 'success', 'failed', 'abandoned'];
+const EMAIL_POOL_TERMINAL_STATUSES = new Set(['success', 'failed', 'abandoned']);
 const EMAIL_GENERATION_SERVICE_DEFAULT = 'duckmail';
 const EMAIL_GENERATION_SERVICES = ['duckmail', 'simplelogin', 'addy'];
 const STOP_ERROR_MESSAGE = '流程已被用户停止。';
 const HUMAN_STEP_DELAY_MIN = 700;
 const HUMAN_STEP_DELAY_MAX = 2200;
+const STEP8_LOGIN_CODE_MIN_HUMAN_DELAY_MIN = 1800;
+const STEP8_LOGIN_CODE_MIN_HUMAN_DELAY_MAX = 3600;
 const STEP8_RESTART_MAX_ROUNDS = 8;
+const AUTO_RUN_ATTEMPT_TIMEOUT_MS = 210000;
 const SHARED_STEP_DEFINITIONS = self.MultiPageStepDefinitions?.getSteps?.() || [];
 const STEP_IDS = SHARED_STEP_DEFINITIONS
   .map((definition) => Number(definition?.id))
@@ -52,6 +60,20 @@ const PERSISTED_SETTING_DEFAULTS = {
   autoRunSkipFailures: false,
   mailProvider: '163',
   emailGenerationService: EMAIL_GENERATION_SERVICE_DEFAULT,
+  addyRecipients: '',
+  addyAliasDomain: '',
+};
+const PERSISTED_SETTING_KEYS = Object.keys(PERSISTED_SETTING_DEFAULTS);
+
+const WINDOW_SCOPED_SETTING_DEFAULTS = {
+  vpsUrl: '',
+  vpsPassword: '',
+  customPassword: '',
+  autoRunSkipFailures: false,
+  mailProvider: '163',
+  emailGenerationService: EMAIL_GENERATION_SERVICE_DEFAULT,
+  addyRecipients: '',
+  addyAliasDomain: '',
 };
 
 const WINDOW_SCOPED_SETTING_KEYS = Object.keys(WINDOW_SCOPED_SETTING_DEFAULTS);
@@ -91,6 +113,7 @@ const stopRequestedByWindow = new Set();
 const autoRunRuntimeByWindow = new Map();
 const step8ListenersByWindow = new Map();
 const emailPoolLocksByProvider = new Map();
+const stateWriteQueuesByWindow = new Map();
 
 function getWindowStateKey(windowId) {
   return `${WINDOW_STATE_KEY_PREFIX}${windowId}`;
@@ -176,6 +199,8 @@ function getAutoRunRuntime(windowId) {
       sessionId: 0,
       attemptSessionId: 0,
       activeAttemptSessionId: null,
+      activeAttemptDeadlineAt: null,
+      enableAttemptTimeout: false,
     });
   }
   return autoRunRuntimeByWindow.get(windowId);
@@ -201,65 +226,38 @@ function pickWindowScopedSettings(state = {}) {
   if (picked.emailGenerationService !== undefined) {
     picked.emailGenerationService = normalizeEmailGenerationService(picked.emailGenerationService);
   }
+  if (picked.addyRecipients !== undefined) {
+    picked.addyRecipients = String(picked.addyRecipients || '');
+  }
+  if (picked.addyAliasDomain !== undefined) {
+    picked.addyAliasDomain = String(picked.addyAliasDomain || '');
+  }
   return picked;
 }
 
 function normalizeFlowStep(step) {
-  const numericStep = Number(step) || 0;
-  if (numericStep === 8) return 6;
-  if (numericStep === 9) return 7;
-  return numericStep;
+  return Number(step) || 0;
 }
 
 function isLegacyFlowState(rawState = {}) {
-  const storedVersion = Number(rawState.flowVersion || 0);
-  if (storedVersion >= FLOW_VERSION) {
-    return false;
-  }
-
-  const statuses = rawState.stepStatuses || {};
-  return Boolean(
-    Number(rawState.currentStep)
-    || statuses[6] !== undefined
-    || statuses[7] !== undefined
-    || statuses[8] !== undefined
-    || statuses[9] !== undefined
-    || rawState.localhostUrl
-    || rawState.lastLoginCode
-  );
+  return Number(rawState.flowVersion || 0) > 0 && Number(rawState.flowVersion || 0) < FLOW_VERSION;
 }
 
 function normalizeStepStatuses(statuses = {}, options = {}) {
-  const { legacy = false, localhostUrl = null } = options;
+  const { localhostUrl = null } = options;
   const normalized = { ...DEFAULT_STATE.stepStatuses };
 
-  for (let step = 1; step <= 5; step++) {
+  for (const step of STEP_IDS) {
     if (statuses[step] !== undefined) {
       normalized[step] = statuses[step];
     }
   }
 
-  if (legacy) {
-    if (statuses[8] !== undefined) {
-      normalized[6] = statuses[8];
-    }
-    if (statuses[9] !== undefined) {
-      normalized[7] = statuses[9];
-    }
-  } else {
-    if (statuses[6] !== undefined) {
-      normalized[6] = statuses[6];
-    }
-    if (statuses[7] !== undefined) {
-      normalized[7] = statuses[7];
-    }
-  }
-
   if (localhostUrl) {
-    normalized[6] = isStepDoneStatus(normalized[6]) ? normalized[6] : 'completed';
+    normalized[9] = isStepDoneStatus(normalized[9]) ? normalized[9] : 'completed';
   }
-  if (isStepDoneStatus(normalized[7]) && !isStepDoneStatus(normalized[6])) {
-    normalized[6] = 'completed';
+  if (isStepDoneStatus(normalized[10]) && !isStepDoneStatus(normalized[9])) {
+    normalized[9] = 'completed';
   }
   return normalized;
 }
@@ -269,10 +267,10 @@ function normalizeCurrentStep(currentStep, rawStepStatuses = {}, stepStatuses = 
   const numericStep = Number(currentStep) || 0;
   if (numericStep <= 0) return 0;
   if (numericStep > MAX_FLOW_STEP) {
-    return normalizeFlowStep(numericStep);
+    return Math.min(numericStep, MAX_FLOW_STEP);
   }
-  if (legacy && numericStep >= 6) {
-    return getFirstUnfinishedStep(stepStatuses) || 0;
+  if (legacy && numericStep >= 1 && numericStep <= MAX_FLOW_STEP) {
+    return getFirstUnfinishedStep(stepStatuses) || MAX_FLOW_STEP;
   }
   return numericStep;
 }
@@ -281,7 +279,6 @@ function normalizeState(rawState = {}) {
   const rawStepStatuses = rawState.stepStatuses || {};
   const legacy = isLegacyFlowState(rawState);
   const stepStatuses = normalizeStepStatuses(rawStepStatuses, {
-    legacy,
     localhostUrl: rawState.localhostUrl,
   });
   return {
@@ -315,9 +312,46 @@ async function initializeSessionStorageAccess() {
   }
 }
 
-async function setState(updates) {
-  console.log(LOG_PREFIX, 'storage.set:', JSON.stringify(updates).slice(0, 200));
-  await chrome.storage.session.set(updates);
+function getStateWriteQueue(windowId) {
+  if (!stateWriteQueuesByWindow.has(windowId)) {
+    stateWriteQueuesByWindow.set(windowId, Promise.resolve());
+  }
+  return stateWriteQueuesByWindow.get(windowId);
+}
+
+async function setState(windowId, updates) {
+  const previousQueue = getStateWriteQueue(windowId);
+  const nextQueue = previousQueue.then(async () => {
+    const prevState = await getWindowSessionState(windowId);
+    const nextState = {
+      ...DEFAULT_STATE,
+      ...pickWindowScopedSettings(prevState),
+      ...prevState,
+      ...updates,
+      flowVersion: FLOW_VERSION,
+    };
+    nextState.autoRunSkipFailures = Boolean(nextState.autoRunSkipFailures);
+    nextState.mailProvider = normalizeMailProvider(nextState.mailProvider);
+    nextState.emailGenerationService = normalizeEmailGenerationService(nextState.emailGenerationService);
+    nextState.addyRecipients = String(nextState.addyRecipients || '');
+    nextState.addyAliasDomain = String(nextState.addyAliasDomain || '');
+    if (nextState.stepStatuses) {
+      nextState.stepStatuses = normalizeStepStatuses(nextState.stepStatuses, {
+        localhostUrl: nextState.localhostUrl,
+      });
+    }
+    if (nextState.currentStep !== undefined) {
+      nextState.currentStep = normalizeCurrentStep(
+        nextState.currentStep,
+        nextState.stepStatuses || DEFAULT_STATE.stepStatuses,
+      );
+    }
+    console.log(LOG_PREFIX, `storage.set window=${windowId}:`, JSON.stringify(nextState).slice(0, 200));
+    await chrome.storage.session.set({ [getWindowStateKey(windowId)]: nextState });
+  });
+
+  stateWriteQueuesByWindow.set(windowId, nextQueue.catch(() => {}));
+  await nextQueue;
 }
 
 async function setPersistentSettings(updates) {
@@ -335,46 +369,594 @@ async function setPersistentSettings(updates) {
   }
 }
 
-function broadcastDataUpdate(payload) {
-  chrome.runtime.sendMessage({
-    type: 'DATA_UPDATED',
-    payload,
-  }).catch(() => { });
+async function getPersistedSettings() {
+  const stored = await chrome.storage.local.get(PERSISTED_SETTING_KEYS);
+  return {
+    ...PERSISTED_SETTING_DEFAULTS,
+    ...pickWindowScopedSettings(stored),
+  };
 }
 
-async function setEmailState(email) {
-  await setState({ email });
-  broadcastDataUpdate({ email });
-  if (email) {
-    await resumeAutoRunIfWaitingForEmail();
+function normalizeEmailAddress(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function createEmailPoolItemId() {
+  return `pool_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizePoolItemStatus(status) {
+  return EMAIL_POOL_STATUSES.includes(status) ? status : 'pending';
+}
+
+function buildEmptyEmailPool(provider) {
+  const normalizedProvider = normalizeMailProvider(provider);
+  return {
+    version: EMAIL_POOL_VERSION,
+    pool: `${normalizedProvider}-pool`,
+    mailProvider: normalizedProvider,
+    updatedAt: null,
+    items: [],
+  };
+}
+
+function getGenerationPoolKey(service) {
+  return `gen:${normalizeEmailGenerationService(service)}`;
+}
+
+function normalizeEmailPoolItem(provider, item = {}, defaults = {}) {
+  const normalizedProvider = normalizeMailProvider(item.mailProvider || provider || defaults.mailProvider);
+  const normalizedEmail = normalizeEmailAddress(item.email);
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  let status = normalizePoolItemStatus(item.status || defaults.status);
+  let claimedWindowId = Number.isInteger(item.claimedWindowId) ? item.claimedWindowId : null;
+  let claimedAt = item.claimedAt || null;
+  let startedAt = item.startedAt || null;
+  if (defaults.resetTransientState && !EMAIL_POOL_TERMINAL_STATUSES.has(status)) {
+    status = 'pending';
+    claimedWindowId = null;
+    claimedAt = null;
+    startedAt = null;
+  }
+
+  return {
+    id: String(item.id || defaults.id || createEmailPoolItemId()),
+    email: normalizedEmail,
+    mailProvider: normalizedProvider,
+    status,
+    batchId: item.batchId || defaults.batchId || null,
+    claimedWindowId,
+    claimedAt,
+    startedAt,
+    finishedAt: item.finishedAt || null,
+    attemptCount: Number.isFinite(Number(item.attemptCount)) ? Math.max(0, Number(item.attemptCount)) : Number(defaults.attemptCount || 0),
+    result: item.result || defaults.result || null,
+    lastError: item.lastError || defaults.lastError || null,
+    source: item.source || defaults.source || 'imported',
+  };
+}
+
+function normalizeEmailPool(provider, rawPool = {}) {
+  const base = buildEmptyEmailPool(provider);
+  const normalizedProvider = normalizeMailProvider(rawPool.mailProvider || provider || base.mailProvider);
+  const items = Array.isArray(rawPool.items)
+    ? rawPool.items.map((item) => normalizeEmailPoolItem(normalizedProvider, item)).filter(Boolean)
+    : [];
+
+  return {
+    version: Number(rawPool.version) || EMAIL_POOL_VERSION,
+    pool: rawPool.pool || base.pool,
+    mailProvider: normalizedProvider,
+    updatedAt: rawPool.updatedAt || null,
+    items,
+  };
+}
+
+function summarizeEmailPool(pool) {
+  const summary = {
+    provider: normalizeMailProvider(pool?.mailProvider),
+    total: 0,
+    pending: 0,
+    claimed: 0,
+    running: 0,
+    success: 0,
+    failed: 0,
+    abandoned: 0,
+    updatedAt: pool?.updatedAt || null,
+  };
+
+  for (const status of EMAIL_POOL_STATUSES) {
+    summary[status] = 0;
+  }
+
+  const items = Array.isArray(pool?.items) ? pool.items : [];
+  summary.total = items.length;
+  for (const item of items) {
+    const status = normalizePoolItemStatus(item?.status);
+    summary[status] += 1;
+  }
+
+  return summary;
+}
+
+async function getEmailPools() {
+  const stored = await chrome.storage.local.get(EMAIL_POOL_STORAGE_KEY);
+  const pools = stored[EMAIL_POOL_STORAGE_KEY] || {};
+  const normalizedPools = {};
+  for (const [provider, pool] of Object.entries(pools)) {
+    normalizedPools[normalizeMailProvider(provider)] = normalizeEmailPool(provider, pool);
+  }
+  return normalizedPools;
+}
+
+async function setEmailPools(pools) {
+  const normalizedPools = {};
+  for (const [provider, pool] of Object.entries(pools || {})) {
+    const normalizedProvider = normalizeMailProvider(provider);
+    normalizedPools[normalizedProvider] = normalizeEmailPool(normalizedProvider, pool);
+  }
+  await chrome.storage.local.set({ [EMAIL_POOL_STORAGE_KEY]: normalizedPools });
+  return normalizedPools;
+}
+
+async function getEmailPool(provider) {
+  const normalizedProvider = normalizeMailProvider(provider);
+  const pools = await getEmailPools();
+  return normalizeEmailPool(normalizedProvider, pools[normalizedProvider] || buildEmptyEmailPool(normalizedProvider));
+}
+
+async function setEmailPool(provider, pool) {
+  const normalizedProvider = normalizeMailProvider(provider);
+  const pools = await getEmailPools();
+  pools[normalizedProvider] = normalizeEmailPool(normalizedProvider, pool);
+  await setEmailPools(pools);
+  await broadcastPoolStateToAllWindows();
+  return pools[normalizedProvider];
+}
+
+async function getAllEmailPoolSummaries() {
+  const pools = await getEmailPools();
+  const summaries = {};
+  for (const provider of Object.keys(pools)) {
+    summaries[provider] = summarizeEmailPool(pools[provider]);
+  }
+  return summaries;
+}
+
+async function getEmailPoolSummary(provider) {
+  return summarizeEmailPool(await getEmailPool(provider));
+}
+
+async function broadcastPoolState(windowId, provider) {
+  const state = await getState(windowId);
+  const normalizedProvider = normalizeMailProvider(provider || getGenerationPoolKey(state.emailGenerationService));
+  const [summary, boundItem, allSummaries] = await Promise.all([
+    getEmailPoolSummary(normalizedProvider),
+    getBoundPoolItem(windowId),
+    getAllEmailPoolSummaries(),
+  ]);
+  await broadcastDataUpdate(windowId, {
+    emailPoolSummary: summary,
+    emailPoolSummaries: allSummaries,
+    boundPoolItem: boundItem,
+    poolBinding: boundItem ? { provider: boundItem.mailProvider, itemId: boundItem.id } : null,
+  });
+}
+
+async function broadcastPoolStateToAllWindows() {
+  const windows = await chrome.windows.getAll();
+  await Promise.all(windows.map(async (win) => {
+    try {
+      await broadcastPoolState(win.id);
+    } catch (err) {
+      console.warn(LOG_PREFIX, `广播邮箱池状态失败（window=${win.id}）：`, err);
+    }
+  }));
+}
+
+function clonePoolItem(item) {
+  return item ? JSON.parse(JSON.stringify(item)) : null;
+}
+
+function findPoolItem(pool, itemId) {
+  if (!itemId) return null;
+  return (pool.items || []).find((item) => item.id === itemId) || null;
+}
+
+async function setPoolBinding(windowId, provider, itemId) {
+  const binding = provider && itemId
+    ? { provider: normalizeMailProvider(provider), itemId: String(itemId) }
+    : null;
+  await setState(windowId, { poolBinding: binding });
+  await broadcastDataUpdate(windowId, { poolBinding: binding });
+  return binding;
+}
+
+async function clearPoolBinding(windowId, provider = null) {
+  await setPoolBinding(windowId, null, null);
+  await broadcastDataUpdate(windowId, { boundPoolItem: null });
+  if (provider) {
+    await broadcastPoolState(windowId, provider);
   }
 }
 
-async function setPasswordState(password) {
-  await setState({ password });
-  broadcastDataUpdate({ password });
+async function getBoundPoolItem(windowId) {
+  const state = await getState(windowId);
+  const binding = state.poolBinding;
+  if (!binding?.provider || !binding?.itemId) {
+    return null;
+  }
+
+  const pool = await getEmailPool(binding.provider);
+  const item = findPoolItem(pool, binding.itemId);
+  if (!item) {
+    await clearPoolBinding(windowId, binding.provider);
+    return null;
+  }
+  return clonePoolItem(item);
 }
 
-async function resetState() {
-  console.log(LOG_PREFIX, 'Resetting all state');
-  // Preserve settings and persistent data across resets
-  const [prev, persistedSettings] = await Promise.all([
-    chrome.storage.session.get([
-      'seenCodes',
-      'accounts',
-      'tabRegistry',
-      'sourceLastUrls',
-    ]),
+async function updateBoundPoolItem(windowId, updater) {
+  const state = await getState(windowId);
+  const binding = state.poolBinding;
+  if (!binding?.provider || !binding?.itemId) {
+    return null;
+  }
+
+  const pool = await getEmailPool(binding.provider);
+  const index = (pool.items || []).findIndex((item) => item.id === binding.itemId);
+  if (index < 0) {
+    await clearPoolBinding(windowId, binding.provider);
+    return null;
+  }
+
+  const current = pool.items[index];
+  const next = normalizeEmailPoolItem(binding.provider, updater(clonePoolItem(current)) || current, {
+    id: current.id,
+    source: current.source,
+  });
+  pool.items[index] = next;
+  pool.updatedAt = new Date().toISOString();
+  await setEmailPool(binding.provider, pool);
+  await broadcastDataUpdate(windowId, { boundPoolItem: next, poolBinding: { provider: binding.provider, itemId: next.id } });
+  await broadcastPoolState(windowId, binding.provider);
+  return clonePoolItem(next);
+}
+
+function createEmailPoolItem(email, provider, extra = {}) {
+  return normalizeEmailPoolItem(provider, {
+    id: extra.id || createEmailPoolItemId(),
+    email,
+    mailProvider: provider,
+    status: extra.status || 'pending',
+    batchId: extra.batchId || null,
+    claimedWindowId: extra.claimedWindowId,
+    claimedAt: extra.claimedAt,
+    startedAt: extra.startedAt,
+    finishedAt: extra.finishedAt,
+    attemptCount: extra.attemptCount,
+    result: extra.result,
+    lastError: extra.lastError,
+    source: extra.source,
+  });
+}
+
+async function appendEmailPoolItems(provider, items, options = {}) {
+  const normalizedProvider = normalizeMailProvider(provider);
+  const pool = await getEmailPool(normalizedProvider);
+  const existingKeys = new Set((pool.items || []).map((item) => `${item.mailProvider}::${normalizeEmailAddress(item.email)}`));
+  const batchId = options.batchId || `batch_${Date.now().toString(36)}`;
+  const appendedItems = [];
+  let skippedDuplicates = 0;
+
+  for (const rawItem of Array.isArray(items) ? items : []) {
+    const item = normalizeEmailPoolItem(normalizedProvider, rawItem, {
+      batchId,
+      source: options.source || rawItem?.source || 'imported',
+      resetTransientState: Boolean(options.resetTransientState),
+    });
+    if (!item) continue;
+    const dedupeKey = `${item.mailProvider}::${normalizeEmailAddress(item.email)}`;
+    if (existingKeys.has(dedupeKey)) {
+      skippedDuplicates += 1;
+      continue;
+    }
+    existingKeys.add(dedupeKey);
+    pool.items.push(item);
+    appendedItems.push(clonePoolItem(item));
+  }
+
+  pool.updatedAt = new Date().toISOString();
+  const nextPool = await setEmailPool(normalizedProvider, pool);
+  return {
+    pool: nextPool,
+    appendedItems,
+    appendedCount: appendedItems.length,
+    skippedDuplicates,
+    batchId,
+    summary: summarizeEmailPool(nextPool),
+  };
+}
+
+function collectImportedPoolItems(rawData, defaultProvider) {
+  const groups = new Map();
+  const pushItem = (provider, rawItem) => {
+    const normalizedProvider = normalizeMailProvider(provider || defaultProvider);
+    if (!groups.has(normalizedProvider)) {
+      groups.set(normalizedProvider, []);
+    }
+    groups.get(normalizedProvider).push(rawItem);
+  };
+
+  const handleEntry = (entry, inheritedProvider) => {
+    if (!entry) return;
+    if (typeof entry === 'string') {
+      pushItem(inheritedProvider, { email: entry });
+      return;
+    }
+    if (typeof entry === 'object') {
+      if (Array.isArray(entry.items)) {
+        for (const item of entry.items) {
+          handleEntry(item, entry.mailProvider || inheritedProvider);
+        }
+        return;
+      }
+      if (Array.isArray(entry.emails)) {
+        for (const item of entry.emails) {
+          handleEntry(item, entry.mailProvider || inheritedProvider);
+        }
+        return;
+      }
+      if (entry.email) {
+        pushItem(entry.mailProvider || inheritedProvider, entry);
+      }
+    }
+  };
+
+  if (Array.isArray(rawData)) {
+    for (const item of rawData) {
+      handleEntry(item, defaultProvider);
+    }
+  } else {
+    handleEntry(rawData, rawData?.mailProvider || defaultProvider);
+  }
+
+  return [...groups.entries()].map(([provider, items]) => ({ provider, items }));
+}
+
+async function importEmailPoolData(rawData, defaultProvider) {
+  const groups = collectImportedPoolItems(rawData, defaultProvider);
+  const results = [];
+  for (const group of groups) {
+    const result = await appendEmailPoolItems(group.provider, group.items, { source: 'imported', resetTransientState: true });
+    results.push({
+      provider: group.provider,
+      appendedCount: result.appendedCount,
+      skippedDuplicates: result.skippedDuplicates,
+      summary: result.summary,
+    });
+  }
+  return {
+    groups: results,
+    summaries: await getAllEmailPoolSummaries(),
+  };
+}
+
+async function generateEmailPoolItems(windowId, options = {}) {
+  const count = Math.max(1, Math.min(100, Number(options.count) || 1));
+  const state = await getState(windowId);
+  const service = normalizeEmailGenerationService(options.service || state.emailGenerationService);
+  const provider = normalizeMailProvider(options.provider || getGenerationPoolKey(service));
+  const previousEmail = state.email;
+  let lastGeneratedEmail = previousEmail || null;
+  let appendedCount = 0;
+  let skippedDuplicates = 0;
+  let summary = await getEmailPoolSummary(provider);
+  let batchId = null;
+
+  for (let index = 0; index < count; index++) {
+    const email = await fetchGeneratedEmail(windowId, { generateNew: true, suppressStateUpdate: true, service });
+    lastGeneratedEmail = email;
+
+    const result = await appendEmailPoolItems(provider, [createEmailPoolItem(email, provider, {
+      source: 'generated',
+      batchId,
+    })], {
+      source: 'generated',
+      batchId,
+    });
+
+    batchId = batchId || result.batchId;
+    appendedCount += result.appendedCount;
+    skippedDuplicates += result.skippedDuplicates;
+    summary = result.summary;
+
+    await addLog(windowId, `邮箱池：第 ${index + 1}/${count} 条 ${getEmailGenerationServiceLabel(service)} 邮箱已入池 ${email}`, 'info');
+  }
+
+  await setEmailState(windowId, previousEmail || null);
+  await broadcastPoolState(windowId, provider);
+  await addLog(windowId, `邮箱池：${getEmailGenerationServiceLabel(service)} 已追加 ${appendedCount} 条，去重跳过 ${skippedDuplicates} 条。`, 'ok');
+
+  return {
+    provider,
+    service,
+    count,
+    lastGeneratedEmail,
+    appendedCount,
+    skippedDuplicates,
+    summary,
+    batchId,
+  };
+}
+
+async function claimNextEmailPoolItem(windowId, provider) {
+  return withEmailPoolProviderLock(provider, async (normalizedProvider) => {
+    const existingBoundItem = await getBoundPoolItem(windowId);
+    if (existingBoundItem) {
+      if (normalizeMailProvider(existingBoundItem.mailProvider) !== normalizedProvider) {
+        throw new Error('当前窗口已绑定其他邮箱池条目，请先放弃当前条目。');
+      }
+      await setEmailState(windowId, existingBoundItem.email);
+      await broadcastPoolState(windowId, normalizedProvider);
+      return existingBoundItem;
+    }
+
+    const pool = await getEmailPool(normalizedProvider);
+    const nextItem = (pool.items || []).find((item) => normalizePoolItemStatus(item.status) === 'pending');
+    if (!nextItem) {
+      return null;
+    }
+
+    nextItem.status = 'claimed';
+    nextItem.claimedWindowId = windowId;
+    nextItem.claimedAt = new Date().toISOString();
+    nextItem.lastError = null;
+    pool.updatedAt = new Date().toISOString();
+    await setEmailPool(normalizedProvider, pool);
+    await setPoolBinding(windowId, normalizedProvider, nextItem.id);
+    await setEmailState(windowId, nextItem.email);
+    await broadcastDataUpdate(windowId, { boundPoolItem: nextItem });
+    await broadcastPoolState(windowId, normalizedProvider);
+    return clonePoolItem(nextItem);
+  });
+}
+
+async function markBoundPoolItemRunning(windowId) {
+  return updateBoundPoolItem(windowId, (item) => {
+    if (!item) return item;
+    item.status = 'running';
+    item.claimedWindowId = windowId;
+    item.startedAt = item.startedAt || new Date().toISOString();
+    item.attemptCount = (Number(item.attemptCount) || 0) + 1;
+    item.lastError = null;
+    return item;
+  });
+}
+
+async function markBoundPoolItemSuccess(windowId, result = null) {
+  const binding = (await getState(windowId)).poolBinding;
+  const item = await updateBoundPoolItem(windowId, (current) => {
+    if (!current) return current;
+    current.status = 'success';
+    current.finishedAt = new Date().toISOString();
+    current.result = result || current.result || null;
+    current.lastError = null;
+    return current;
+  });
+  await clearPoolBinding(windowId, binding?.provider || item?.mailProvider || null);
+  return item;
+}
+
+async function markBoundPoolItemFailed(windowId, error) {
+  const binding = (await getState(windowId)).poolBinding;
+  const item = await updateBoundPoolItem(windowId, (current) => {
+    if (!current) return current;
+    current.status = 'failed';
+    current.finishedAt = new Date().toISOString();
+    current.lastError = getErrorMessage(error);
+    return current;
+  });
+  await clearPoolBinding(windowId, binding?.provider || item?.mailProvider || null);
+  return item;
+}
+
+async function abandonBoundPoolItem(windowId, reason = '当前条目已放弃。') {
+  const binding = (await getState(windowId)).poolBinding;
+  const item = await updateBoundPoolItem(windowId, (current) => {
+    if (!current) return current;
+    current.status = 'abandoned';
+    current.finishedAt = new Date().toISOString();
+    current.lastError = reason;
+    return current;
+  });
+  await clearPoolBinding(windowId, binding?.provider || item?.mailProvider || null);
+  await setEmailState(windowId, null);
+  return item;
+}
+
+async function bindManualEmailToState(windowId, email, options = {}) {
+  const normalizedEmail = normalizeEmailAddress(email);
+  const boundItem = await getBoundPoolItem(windowId);
+  if (boundItem && (!options.keepBoundItem || normalizedEmail !== normalizeEmailAddress(boundItem.email))) {
+    await abandonBoundPoolItem(windowId, options.reason || '当前池条目已被手动替换。');
+  }
+  await setEmailState(windowId, normalizedEmail || null);
+  return normalizedEmail || null;
+}
+
+async function buildStateResponse(windowId) {
+  const [state, persistedSettings] = await Promise.all([
+    getState(windowId),
     getPersistedSettings(),
   ]);
-  await chrome.storage.session.clear();
-  await chrome.storage.session.set({
-    ...DEFAULT_STATE,
-    ...persistedSettings,
-    seenCodes: prev.seenCodes || [],
-    accounts: prev.accounts || [],
-    tabRegistry: prev.tabRegistry || {},
-    sourceLastUrls: prev.sourceLastUrls || {},
+  const provider = getGenerationPoolKey(state.emailGenerationService);
+  const [boundPoolItem, emailPoolSummary, emailPoolSummaries] = await Promise.all([
+    getBoundPoolItem(windowId),
+    getEmailPoolSummary(provider),
+    getAllEmailPoolSummaries(),
+  ]);
+  return {
+    ...state,
+    ...pickWindowScopedSettings(persistedSettings),
+    ...pickWindowScopedSettings(state),
+    flowVersion: FLOW_VERSION,
+    poolBinding: boundPoolItem ? { provider: boundPoolItem.mailProvider, itemId: boundPoolItem.id } : state.poolBinding || null,
+    emailPoolSummary,
+    emailPoolSummaries,
+    boundPoolItem,
+  };
+}
+
+async function broadcastDataUpdate(windowId, payload) {
+  await sendWindowMessage(windowId, 'DATA_UPDATED', payload);
+}
+
+async function setEmailState(windowId, email) {
+  const normalizedEmail = email ? normalizeEmailAddress(email) : null;
+  await setState(windowId, { email: normalizedEmail });
+  await broadcastDataUpdate(windowId, { email: normalizedEmail });
+  if (normalizedEmail) {
+    await resumeAutoRunIfWaitingForEmail(windowId);
+  }
+}
+
+async function setPasswordState(windowId, password) {
+  await setState(windowId, { password });
+  await broadcastDataUpdate(windowId, { password });
+}
+
+async function resetState(windowId) {
+  console.log(LOG_PREFIX, `Resetting state for window=${windowId}`);
+  const [prevState, persistedSettings, boundItem] = await Promise.all([
+    getWindowSessionState(windowId),
+    getPersistedSettings(),
+    getBoundPoolItem(windowId),
+  ]);
+  if (boundItem) {
+    await abandonBoundPoolItem(windowId, '流程已重置，当前池条目已放弃。');
+  }
+  await chrome.storage.session.remove(getWindowStateKey(windowId));
+  await setState(windowId, {
+    ...pickWindowScopedSettings(persistedSettings),
+    ...pickWindowScopedSettings(prevState),
+    oauthUrl: null,
+    oauthSourceTabId: null,
+    email: null,
+    poolBinding: null,
+    password: null,
+    lastEmailTimestamp: null,
+    lastSignupCode: null,
+    lastLoginCode: null,
+    localhostUrl: null,
+    authPageState: null,
+    flowStartTime: null,
+    logs: [],
+    currentStep: 0,
+    stepStatuses: { ...STEP_DEFAULT_STATUSES },
   });
 }
 
@@ -475,6 +1057,15 @@ function buildLocalhostCleanupPrefix(rawUrl) {
 
   const parsed = parseUrlSafely(rawUrl);
   return parsed ? `${parsed.origin}/auth` : '';
+}
+
+function normalizeMailProvider(provider) {
+  const value = String(provider || '').trim();
+  return value || WINDOW_SCOPED_SETTING_DEFAULTS.mailProvider;
+}
+
+function getEffectiveMailProvider(state) {
+  return normalizeMailProvider(state?.mailProvider);
 }
 
 function normalizeEmailGenerationService(service) {
@@ -675,7 +1266,7 @@ async function ensureContentScriptReadyOnTab(windowId, source, tabId, options = 
           LOG_PREFIX,
           `[ensureContentScriptReadyOnTab] ${source} tab=${tabId} still not ready after ${Date.now() - start}ms`
         );
-        await addLog(logMessage, 'warn');
+        await addLog(windowId, logMessage, 'warn');
         logged = true;
       }
 
@@ -763,6 +1354,10 @@ function getContentScriptResponseTimeoutMs(message) {
 
   if (message.type === 'EXECUTE_STEP' && Number(message.step) === 2) {
     return 45000;
+  }
+
+  if (message.type === 'EXECUTE_STEP' && Number(message.step) === 7) {
+    return 70000;
   }
 
   if (message.type === 'FETCH_GENERATED_EMAIL' || message.type === 'FETCH_DUCK_EMAIL') {
@@ -894,9 +1489,9 @@ function cancelPendingCommands(windowId, reason = STOP_ERROR_MESSAGE) {
 // Reuse or create tab
 // ============================================================
 
-async function reuseOrCreateTab(source, url, options = {}) {
+async function reuseOrCreateTab(windowId, source, url, options = {}) {
   const shouldActivate = options.activate !== false;
-  const alive = await isTabAlive(source);
+  const alive = await isTabAlive(windowId, source);
   if (alive) {
     const tabId = await getTabId(windowId, source);
     await closeConflictingTabsForSource(windowId, source, url, { excludeTabIds: [tabId] });
@@ -994,7 +1589,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
   }
 
   // Create new tab
-  await closeConflictingTabsForSource(source, url);
+  await closeConflictingTabsForSource(windowId, source, url);
   const tab = await chrome.tabs.create({ url, active: shouldActivate });
   console.log(LOG_PREFIX, `Created new tab ${source} (${tab.id})`);
 
@@ -1041,21 +1636,21 @@ async function sendToContentScript(windowId, source, message, options = {}) {
 
   if (!entry || !entry.ready) {
     console.log(LOG_PREFIX, `${source} not ready, queuing command`);
-    return queueCommand(source, messageWithSession, Math.max(15000, responseTimeoutMs));
+    return queueCommand(windowId, source, messageWithSession, Math.max(15000, responseTimeoutMs));
   }
 
   const alive = await isTabAlive(windowId, source);
   if (!alive) {
     // Tab was closed — queue the command, it will be sent when tab is reopened
     console.log(LOG_PREFIX, `${source} tab was closed, queuing command`);
-    return queueCommand(source, messageWithSession, Math.max(15000, responseTimeoutMs));
+    return queueCommand(windowId, source, messageWithSession, Math.max(15000, responseTimeoutMs));
   }
 
   console.log(LOG_PREFIX, `Sending to window=${windowId} ${source} (tab ${entry.tabId}):`, messageWithSession.type);
   return sendTabMessageWithTimeout(entry.tabId, source, messageWithSession, responseTimeoutMs);
 }
 
-async function sendToContentScriptResilient(source, message, options = {}) {
+async function sendToContentScriptResilient(windowId, source, message, options = {}) {
   const {
     timeoutMs = 30000,
     retryDelayMs = 600,
@@ -1084,6 +1679,7 @@ async function sendToContentScriptResilient(source, message, options = {}) {
         `[sendToContentScriptResilient] attempt ${attempt} -> ${debugLabel}, elapsed=${Date.now() - start}ms`
       );
       const result = await sendToContentScript(
+        windowId,
         source,
         message,
         Number.isFinite(responseTimeoutMs) ? { responseTimeoutMs } : {}
@@ -1111,7 +1707,7 @@ async function sendToContentScriptResilient(source, message, options = {}) {
 
       if (reinjectOnRetry?.url && Array.isArray(reinjectOnRetry.inject) && reinjectOnRetry.inject.length) {
         try {
-          await reuseOrCreateTab(source, reinjectOnRetry.url, {
+          await reuseOrCreateTab(windowId, source, reinjectOnRetry.url, {
             inject: reinjectOnRetry.inject,
             injectSource: reinjectOnRetry.injectSource,
             reloadIfSameUrl: true,
@@ -1210,6 +1806,35 @@ function isCurrentAutoRunAttemptSession(windowId, sessionId) {
     && sessionId === runtime.activeAttemptSessionId;
 }
 
+function markAutoRunAttemptDeadline(windowId, deadlineMs) {
+  const runtime = getAutoRunRuntime(windowId);
+  runtime.activeAttemptDeadlineAt = Number.isFinite(deadlineMs) ? Math.floor(deadlineMs) : null;
+}
+
+function clearAutoRunAttemptDeadline(windowId) {
+  const runtime = getAutoRunRuntime(windowId);
+  runtime.activeAttemptDeadlineAt = null;
+}
+
+function getAutoRunAttemptRemainingMs(windowId) {
+  const runtime = getAutoRunRuntime(windowId);
+  if (!runtime.enableAttemptTimeout) {
+    return Infinity;
+  }
+  const deadlineAt = Number(runtime.activeAttemptDeadlineAt);
+  if (!Number.isFinite(deadlineAt) || deadlineAt <= 0) {
+    return Infinity;
+  }
+  return Math.max(0, deadlineAt - Date.now());
+}
+
+function throwIfAutoRunAttemptTimedOut(windowId) {
+  const remainingMs = getAutoRunAttemptRemainingMs(windowId);
+  if (Number.isFinite(remainingMs) && remainingMs <= 0) {
+    throw new Error(`自动运行单轮超时（超过 ${Math.floor(AUTO_RUN_ATTEMPT_TIMEOUT_MS / 1000)} 秒），需要重新开始新一轮。`);
+  }
+}
+
 function shouldIgnoreAutoRunAttemptMessage(windowId, message) {
   return Number.isInteger(message?.autoRunAttemptId)
     && !isCurrentAutoRunAttemptSession(windowId, message.autoRunAttemptId);
@@ -1274,12 +1899,7 @@ function isRetryableContentScriptTransportError(error) {
 }
 
 function normalizeUserFacingStepText(text) {
-  return String(text || '')
-    .replace(/STEP9_OAUTH_TIMEOUT::/g, 'STEP7_OAUTH_TIMEOUT::')
-    .replace(/步骤\s*8/g, '步骤 6')
-    .replace(/步骤\s*9/g, '步骤 7')
-    .replace(/\b[Ss]tep\s*8\b/g, 'Step 6')
-    .replace(/\b[Ss]tep\s*9\b/g, 'Step 7');
+  return String(text || '');
 }
 
 function getErrorMessage(error) {
@@ -1298,7 +1918,7 @@ function isStep8ContinueStuckError(error) {
 
 function isRestartCurrentAttemptError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
-  return /当前邮箱已存在，需要重新开始新一轮|当前流程已进入手机号页面，需要重新开始新一轮|邮箱自动获取失败，需要重新开始新一轮|认证页进入了手机号页面|点击“继续”后页面跳到了手机号页面|当前页面已进入手机号页面，不是 OAuth 授权同意页/.test(message);
+  return /当前邮箱已存在，需要重新开始新一轮|当前流程已进入手机号页面，需要重新开始新一轮|邮箱自动获取失败，需要重新开始新一轮|认证页进入了手机号页面|点击“继续”后页面跳到了手机号页面|当前页面已进入手机号页面，不是 OAuth 授权同意页|自动运行单轮超时（超过 \d+ 秒），需要重新开始新一轮/.test(message);
 }
 
 function isStep10OAuthTimeoutError(error) {
@@ -1415,6 +2035,7 @@ function cleanupWindowRuntime(windowId) {
   resumeWaitersByWindow.delete(windowId);
   stopRequestedByWindow.delete(windowId);
   autoRunRuntimeByWindow.delete(windowId);
+  stateWriteQueuesByWindow.delete(windowId);
   clearStep8Listener(windowId);
 }
 
@@ -1507,6 +2128,7 @@ function throwIfStopped(windowId) {
   if (isStopRequested(windowId)) {
     throw new Error(STOP_ERROR_MESSAGE);
   }
+  throwIfAutoRunAttemptTimedOut(windowId);
 }
 
 async function sleepWithStop(windowId, ms) {
@@ -1517,8 +2139,14 @@ async function sleepWithStop(windowId, ms) {
   }
 }
 
+function getRandomDelayMs(min, max) {
+  const resolvedMin = Number.isFinite(min) ? Math.max(0, Math.floor(min)) : 0;
+  const resolvedMax = Number.isFinite(max) ? Math.max(resolvedMin, Math.floor(max)) : resolvedMin;
+  return Math.floor(Math.random() * (resolvedMax - resolvedMin + 1)) + resolvedMin;
+}
+
 async function humanStepDelay(windowId, min = HUMAN_STEP_DELAY_MIN, max = HUMAN_STEP_DELAY_MAX) {
-  const duration = Math.floor(Math.random() * (max - min + 1)) + min;
+  const duration = getRandomDelayMs(min, max);
   await sleepWithStop(windowId, duration);
 }
 
@@ -1641,6 +2269,7 @@ async function abandonCurrentAutoRunAttempt(windowId, { targetRun, totalRuns, at
 
   await clearTabRegistrySources(windowId, sourcesToClose);
   clearActiveAutoRunAttemptSession(windowId);
+  clearAutoRunAttemptDeadline(windowId);
   await broadcastAutoRunStatus(windowId, 'retrying', {
     currentRun: targetRun,
     totalRuns,
@@ -1694,8 +2323,8 @@ async function handleMessage(message, sender) {
     }
 
     case 'TRACE_EVENT': {
-      if (shouldIgnoreAutoRunAttemptMessage(message)) {
-        console.log(LOG_PREFIX, `Ignored stale TRACE_EVENT from ${message.source}`, message);
+      if (shouldIgnoreAutoRunAttemptMessage(windowId, message)) {
+        console.log(LOG_PREFIX, `Ignored stale TRACE_EVENT from window=${windowId} ${message.source}`, message);
         return { ok: true, ignored: true };
       }
       const { kind, url, title, note, step, entries, detail } = message.payload || {};
@@ -1708,7 +2337,7 @@ async function handleMessage(message, sender) {
         detail ? `detail=${String(detail).replace(/\s+/g, ' ').trim().slice(0, 180)}` : '',
         Array.isArray(entries) && entries.length ? `entries=${entries.join(' || ').slice(0, 700)}` : '',
       ].filter(Boolean);
-      await addLog(parts.join(' | '), kind === 'add_phone_detected' ? 'warn' : 'info');
+      await addLog(windowId, parts.join(' | '), kind === 'add_phone_detected' ? 'warn' : 'info');
       return { ok: true };
     }
 
@@ -1804,9 +2433,11 @@ async function handleMessage(message, sender) {
       const autoRunSkipFailures = Boolean(message.payload?.autoRunSkipFailures);
       const mode = message.payload?.mode === 'continue' ? 'continue' : 'restart';
       const emailGenerationService = normalizeEmailGenerationService(message.payload?.emailGenerationService);
-      await setPersistentSettings({ autoRunSkipFailures, emailGenerationService });
-      await setState({ autoRunSkipFailures, emailGenerationService });
-      autoRunLoop(totalRuns, { autoRunSkipFailures, mode });  // fire-and-forget
+      const addyRecipients = String(message.payload?.addyRecipients || '');
+      const addyAliasDomain = String(message.payload?.addyAliasDomain || '');
+      await setPersistentSettings({ autoRunSkipFailures, emailGenerationService, addyRecipients, addyAliasDomain });
+      await setState(windowId, { autoRunSkipFailures, emailGenerationService, addyRecipients, addyAliasDomain });
+      autoRunLoop(windowId, totalRuns, { autoRunSkipFailures, mode });
       return { ok: true };
     }
 
@@ -1838,8 +2469,10 @@ async function handleMessage(message, sender) {
       if (message.payload.autoRunSkipFailures !== undefined) updates.autoRunSkipFailures = Boolean(message.payload.autoRunSkipFailures);
       if (message.payload.mailProvider !== undefined) updates.mailProvider = message.payload.mailProvider;
       if (message.payload.emailGenerationService !== undefined) updates.emailGenerationService = normalizeEmailGenerationService(message.payload.emailGenerationService);
+      if (message.payload.addyRecipients !== undefined) updates.addyRecipients = String(message.payload.addyRecipients || '');
+      if (message.payload.addyAliasDomain !== undefined) updates.addyAliasDomain = String(message.payload.addyAliasDomain || '');
       await setPersistentSettings(updates);
-      await setState(updates);
+      await setState(windowId, updates);
       return { ok: true };
     }
 
@@ -1877,8 +2510,8 @@ async function handleMessage(message, sender) {
       if (isAutoRunLockedState(state)) {
         throw new Error('自动流程运行中，当前不能手动获取邮箱。');
       }
-      const email = await fetchGeneratedEmail(message.payload || {});
-      await resumeAutoRun();
+      const email = await fetchGeneratedEmail(windowId, message.payload || {});
+      await resumeAutoRun(windowId);
       return { ok: true, email };
     }
 
@@ -2000,9 +2633,9 @@ async function handleStepData(windowId, step, payload) {
       }
 
       if (Object.keys(updates).length) {
-        await setState(updates);
+        await setState(windowId, updates);
         if (updates.localhostUrl) {
-          broadcastDataUpdate({ localhostUrl: updates.localhostUrl });
+          await broadcastDataUpdate(windowId, { localhostUrl: updates.localhostUrl });
         }
       }
       break;
@@ -2012,8 +2645,8 @@ async function handleStepData(windowId, step, payload) {
         if (!isLocalhostOAuthCallbackUrl(payload.localhostUrl)) {
           throw new Error('步骤 9 返回了无效的 localhost OAuth 回调地址。');
         }
-        await setState({ localhostUrl: payload.localhostUrl, authPageState: 'callback' });
-        broadcastDataUpdate({ localhostUrl: payload.localhostUrl });
+        await setState(windowId, { localhostUrl: payload.localhostUrl, authPageState: 'callback' });
+        await broadcastDataUpdate(windowId, { localhostUrl: payload.localhostUrl });
       }
       break;
     case 10: {
@@ -2131,6 +2764,7 @@ async function requestStop(windowId, options = {}) {
 
   await markRunningStepsStopped(windowId);
   clearActiveAutoRunAttemptSession(windowId);
+  clearAutoRunAttemptDeadline(windowId);
   getAutoRunRuntime(windowId).active = false;
   await broadcastAutoRunStatus(windowId, 'stopped', {
     currentRun: getAutoRunRuntime(windowId).currentRun,
@@ -2157,22 +2791,22 @@ async function executeStep(windowId, step) {
 
   const state = await getState(windowId);
 
-  if (step === 1 && !state.flowStartTime) {
-    await setState({ flowStartTime: Date.now() });
+  if (normalizedStep === 1 && !state.flowStartTime) {
+    await setState(windowId, { flowStartTime: Date.now() });
   }
 
   try {
-    switch (step) {
-      case 1: await executeStep1(state); break;
-      case 2: await executeStep2(state); break;
-      case 3: await executeStep3(state); break;
-      case 4: await executeStep4(state); break;
-      case 5: await executeStep5(state); break;
-      case 6: await executeStep6(state); break;
-      case 7: await executeStep7(state); break;
-      case 8: await executeStep8(state); break;
-      case 9: await executeStep9(state); break;
-      case 10: await executeStep10(state); break;
+    switch (normalizedStep) {
+      case 1: await executeStep1(windowId, state); break;
+      case 2: await executeStep2(windowId, state); break;
+      case 3: await executeStep3(windowId, state); break;
+      case 4: await executeStep4(windowId, state); break;
+      case 5: await executeStep5(windowId, state); break;
+      case 6: await executeStep6(windowId, state); break;
+      case 7: await executeStep7(windowId, state); break;
+      case 8: await executeStep8(windowId, state); break;
+      case 9: await executeStep9(windowId, state); break;
+      case 10: await executeStep10(windowId, state); break;
       default:
         throw new Error(`未知步骤：${normalizedStep}`);
     }
@@ -2233,21 +2867,23 @@ async function executeStepAndWait(windowId, step, delayAfter = 2000) {
   }
 }
 
-async function fetchDuckEmail(options = {}) {
-  return fetchGeneratedEmail({ ...options, service: 'duckmail' });
+async function fetchDuckEmail(windowId, options = {}) {
+  return fetchGeneratedEmail(windowId, { ...options, service: 'duckmail' });
 }
 
-async function fetchGeneratedEmail(options = {}) {
-  throwIfStopped();
-  const state = await getState();
+async function fetchGeneratedEmail(windowId, options = {}) {
+  throwIfStopped(windowId);
+  const state = await getState(windowId);
   const service = normalizeEmailGenerationService(options.service || state.emailGenerationService);
   const { generateNew = true } = options;
+  const addyRecipients = String(options.addyRecipients ?? state.addyRecipients ?? '');
+  const addyAliasDomain = String(options.addyAliasDomain ?? state.addyAliasDomain ?? '');
 
   if (isDuckMailGenerationService(service)) {
-    await addLog(`Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
-    await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL);
+    await addLog(windowId, `Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
+    await reuseOrCreateTab(windowId, 'duck-mail', DUCK_AUTOFILL_URL);
 
-    const result = await sendToContentScript('duck-mail', {
+    const result = await sendToContentScript(windowId, 'duck-mail', {
       type: 'FETCH_DUCK_EMAIL',
       source: 'background',
       payload: { generateNew },
@@ -2262,33 +2898,33 @@ async function fetchGeneratedEmail(options = {}) {
       throw new Error('未返回 Duck 邮箱地址。');
     }
 
-    await setEmailState(result.email);
-    await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
+    await setEmailState(windowId, result.email);
+    await addLog(windowId, `Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
     return result.email;
   }
 
   const config = getEmailGenerationServiceConfig(service);
-  await addLog(`${config.logLabel}：正在打开页面（${generateNew ? '生成新地址' : '读取当前地址'}）...`);
-  await reuseOrCreateTab(config.source, config.url);
+  await addLog(windowId, `${config.logLabel}：正在打开页面（${generateNew ? '生成新地址' : '读取当前地址'}）...`);
+  await reuseOrCreateTab(windowId, config.source, config.url);
 
-  const result = await sendToContentScript(config.source, {
+  const result = await sendToContentScript(windowId, config.source, {
     type: 'FETCH_GENERATED_EMAIL',
     source: 'background',
-    payload: { generateNew, service },
+    payload: { generateNew, service, addyRecipients, addyAliasDomain },
   }, {
     responseTimeoutMs: getContentScriptResponseTimeoutMs({ type: 'FETCH_GENERATED_EMAIL', payload: { generateNew } }),
   });
 
   if (result?.error) {
-    await addLog(windowId, `[调试] Duck fetch error｜${JSON.stringify({ windowId, error: result.error })}`, 'warn');
+    await addLog(windowId, `[调试] ${config.logLabel} fetch error｜${JSON.stringify({ windowId, error: result.error })}`, 'warn');
     throw new Error(result.error);
   }
   if (!result?.email) {
     throw new Error(`未返回 ${config.label} 邮箱地址。`);
   }
 
-  await setEmailState(result.email);
-  await addLog(`${config.logLabel}：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
+  await setEmailState(windowId, result.email);
+  await addLog(windowId, `${config.logLabel}：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
   return result.email;
 }
 
@@ -2341,21 +2977,26 @@ async function ensureAutoEmailReady(windowId, targetRun, totalRuns, attemptRuns)
 
   const serviceLabel = getEmailGenerationServiceLabel(currentState.emailGenerationService);
   let lastGenerationError = null;
-  for (let generationAttempt = 1; generationAttempt <= DUCK_EMAIL_MAX_ATTEMPTS; generationAttempt++) {
+  for (let generationAttempt = 1; generationAttempt <= GENERATED_EMAIL_MAX_ATTEMPTS; generationAttempt++) {
     try {
       if (generationAttempt > 1) {
-        await addLog(`${serviceLabel}：正在进行第 ${generationAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS} 次自动获取重试...`, 'warn');
+        await addLog(windowId, `${serviceLabel}：正在进行第 ${generationAttempt}/${GENERATED_EMAIL_MAX_ATTEMPTS} 次自动获取重试...`, 'warn');
       }
-      const generatedEmail = await fetchGeneratedEmail({ generateNew: true, service: currentState.emailGenerationService });
-      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：${serviceLabel} 已就绪：${generatedEmail}（第 ${attemptRuns} 次尝试，获取第 ${generationAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS} 次）===`, 'ok');
+      const generatedEmail = await fetchGeneratedEmail(windowId, {
+        generateNew: true,
+        service: currentState.emailGenerationService,
+        addyRecipients: currentState.addyRecipients,
+        addyAliasDomain: currentState.addyAliasDomain,
+      });
+      await addLog(windowId, `=== 目标 ${targetRun}/${totalRuns} 轮：${serviceLabel} 已就绪：${generatedEmail}（第 ${attemptRuns} 次尝试，获取第 ${generationAttempt}/${GENERATED_EMAIL_MAX_ATTEMPTS} 次）===`, 'ok');
       return generatedEmail;
     } catch (err) {
       lastGenerationError = err;
-      await addLog(`${serviceLabel} 自动获取失败（${generationAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS}）：${err.message}`, 'warn');
+      await addLog(windowId, `${serviceLabel} 自动获取失败（${generationAttempt}/${GENERATED_EMAIL_MAX_ATTEMPTS}）：${err.message}`, 'warn');
     }
   }
 
-  await addLog(`${serviceLabel} 自动获取已连续失败 ${DUCK_EMAIL_MAX_ATTEMPTS} 次：${lastGenerationError?.message || '未知错误'}`, 'error');
+  await addLog(windowId, `${serviceLabel} 自动获取已连续失败 ${GENERATED_EMAIL_MAX_ATTEMPTS} 次：${lastGenerationError?.message || '未知错误'}`, 'error');
   throw new Error(GENERATED_EMAIL_RESTART_ERROR_MESSAGE);
 }
 
@@ -2367,27 +3008,27 @@ async function runAutoSequenceFromStep(windowId, startStep, context = {}) {
   if (continued) {
     await addLog(windowId, `=== 目标 ${targetRun}/${totalRuns} 轮：继续当前进度，从步骤 ${startStep} 开始（第 ${attemptRuns} 次尝试）===`, 'info');
   } else {
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：第 ${attemptRuns} 次尝试，阶段 1，打开 ChatGPT 官网并准备注册 ===`, 'info');
+    await addLog(windowId, `=== 目标 ${targetRun}/${totalRuns} 轮：第 ${attemptRuns} 次尝试，阶段 1，打开 ChatGPT 官网并准备注册 ===`, 'info');
   }
 
   if (startStep <= 1) {
-    await executeStepAndWait(1, AUTO_STEP_DELAYS[1]);
+    await executeStepAndWait(windowId, 1, AUTO_STEP_DELAYS[1]);
   }
 
   if (startStep <= 2) {
-    await ensureAutoEmailReady(targetRun, totalRuns, attemptRuns);
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，进入注册流程并填写账号信息（第 ${attemptRuns} 次尝试）===`, 'info');
-    await broadcastAutoRunStatus('running', {
+    await ensureAutoEmailReady(windowId, targetRun, totalRuns, attemptRuns);
+    await addLog(windowId, `=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，进入注册流程并填写账号信息（第 ${attemptRuns} 次尝试）===`, 'info');
+    await broadcastAutoRunStatus(windowId, 'running', {
       currentRun: targetRun,
       totalRuns,
       attemptRun: attemptRuns,
     });
-    await executeStepAndWait(2, AUTO_STEP_DELAYS[2]);
-    await executeStepAndWait(3, AUTO_STEP_DELAYS[3]);
+    await executeStepAndWait(windowId, 2, AUTO_STEP_DELAYS[2]);
+    await executeStepAndWait(windowId, 3, AUTO_STEP_DELAYS[3]);
   } else if (startStep === 3 && !continued) {
-    await ensureAutoEmailReady(targetRun, totalRuns, attemptRuns);
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，填写密码并继续注册（第 ${attemptRuns} 次尝试）===`, 'info');
-    await broadcastAutoRunStatus('running', {
+    await ensureAutoEmailReady(windowId, targetRun, totalRuns, attemptRuns);
+    await addLog(windowId, `=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，填写密码并继续注册（第 ${attemptRuns} 次尝试）===`, 'info');
+    await broadcastAutoRunStatus(windowId, 'running', {
       currentRun: targetRun,
       totalRuns,
       attemptRun: attemptRuns,
@@ -2411,10 +3052,11 @@ async function runAutoSequenceFromStep(windowId, startStep, context = {}) {
       if (step === 10 && isStep10OAuthTimeoutError(err) && step10RestartAttempts < maxStep10RestartAttempts) {
         step10RestartAttempts += 1;
         await addLog(
+          windowId,
           `步骤 10：检测到 OAuth callback 超时，正在回到步骤 ${FINAL_OAUTH_CHAIN_START_STEP} 重新开始授权流程（${step10RestartAttempts}/${maxStep10RestartAttempts}）...`,
           'warn'
         );
-        await invalidateDownstreamAfterStepRestart(FINAL_OAUTH_CHAIN_START_STEP, {
+        await invalidateDownstreamAfterStepRestart(windowId, FINAL_OAUTH_CHAIN_START_STEP, {
           logLabel: `步骤 10 超时后准备回到步骤 ${FINAL_OAUTH_CHAIN_START_STEP} 重试（${step10RestartAttempts}/${maxStep10RestartAttempts}）`,
         });
         step = FINAL_OAUTH_CHAIN_START_STEP;
@@ -2435,11 +3077,14 @@ async function autoRunLoop(windowId, totalRuns, options = {}) {
 
   const sessionId = bumpAutoRunSessionId(windowId);
   clearStopRequest(windowId);
+  const autoRunSkipFailures = Boolean(options.autoRunSkipFailures);
+  const enableAttemptTimeout = autoRunSkipFailures || totalRuns > 1;
   runtime.active = true;
   runtime.totalRuns = totalRuns;
   runtime.currentRun = 0;
   runtime.attemptRun = 0;
-  const autoRunSkipFailures = Boolean(options.autoRunSkipFailures);
+  runtime.enableAttemptTimeout = enableAttemptTimeout;
+  runtime.activeAttemptDeadlineAt = null;
   const initialMode = options.mode === 'continue' ? 'continue' : 'restart';
   const resumeCurrentRun = Number.isInteger(options.resumeCurrentRun) ? options.resumeCurrentRun : 0;
   const resumeSuccessfulRuns = Number.isInteger(options.resumeSuccessfulRuns) ? options.resumeSuccessfulRuns : 0;
@@ -2487,7 +3132,7 @@ async function autoRunLoop(windowId, totalRuns, options = {}) {
 
     if (!useExistingProgress) {
       // Reset everything at the start of each fresh attempt (keep user settings).
-      const prevState = await getState();
+      const prevState = await getState(windowId);
       const keepSettings = {
         vpsUrl: prevState.vpsUrl,
         vpsPassword: prevState.vpsPassword,
@@ -2495,9 +3140,13 @@ async function autoRunLoop(windowId, totalRuns, options = {}) {
         autoRunSkipFailures: prevState.autoRunSkipFailures,
         mailProvider: prevState.mailProvider,
         emailGenerationService: prevState.emailGenerationService,
-        ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
+        addyRecipients: prevState.addyRecipients,
+        addyAliasDomain: prevState.addyAliasDomain,
+        ...getAutoRunStatusPayload(windowId, 'running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
         ...(forceFreshTabsNextRun ? { tabRegistry: {} } : {}),
-      });
+      };
+      await resetState(windowId);
+      await setState(windowId, keepSettings);
       await sendWindowMessage(windowId, 'AUTO_RUN_RESET', {});
       await sleepWithStop(windowId, 500);
     } else {
@@ -2513,6 +3162,11 @@ async function autoRunLoop(windowId, totalRuns, options = {}) {
     }
 
     try {
+      if (enableAttemptTimeout) {
+        markAutoRunAttemptDeadline(windowId, Date.now() + AUTO_RUN_ATTEMPT_TIMEOUT_MS);
+      } else {
+        clearAutoRunAttemptDeadline(windowId);
+      }
       throwIfStopped(windowId);
       await broadcastAutoRunStatus(windowId, 'running', {
         currentRun: targetRun,
@@ -2527,6 +3181,7 @@ async function autoRunLoop(windowId, totalRuns, options = {}) {
         continued: useExistingProgress,
       });
 
+      clearAutoRunAttemptDeadline(windowId);
       successfulRuns += 1;
       runtime.currentRun = successfulRuns;
       clearActiveAutoRunAttemptSession(windowId);
@@ -2555,11 +3210,13 @@ async function autoRunLoop(windowId, totalRuns, options = {}) {
         const restartReason = errorMessage.includes('手机号页面')
           ? '目标流程进入手机号页面'
           : (errorMessage.includes('邮箱自动获取失败')
-            ? `${getEmailGenerationServiceLabel((await getState()).emailGenerationService)} 自动获取连续失败`
-            : '检测到当前邮箱已存在');
-        await addLog(`目标 ${targetRun}/${totalRuns} 轮${restartReason}，当前线程已放弃，将重新开始新一轮。`, 'warn');
-        const mailSource = getMailConfig(await getState()).source;
-        await abandonCurrentAutoRunAttempt({
+            ? `${getEmailGenerationServiceLabel((await getState(windowId)).emailGenerationService)} 自动获取连续失败`
+            : (errorMessage.includes('自动运行单轮超时')
+              ? `单轮执行超过 ${Math.floor(AUTO_RUN_ATTEMPT_TIMEOUT_MS / 1000)} 秒`
+              : '检测到当前邮箱已存在'));
+        await addLog(windowId, `目标 ${targetRun}/${totalRuns} 轮${restartReason}，当前线程已放弃，将重新开始新一轮。`, 'warn');
+        const mailSource = getMailConfig(await getState(windowId)).source;
+        await abandonCurrentAutoRunAttempt(windowId, {
           targetRun,
           totalRuns,
           attemptRun: attemptRuns,
@@ -2704,26 +3361,26 @@ async function resumeAutoRun(windowId) {
 // Step 1: Get OAuth Link (via vps-panel.js)
 // ============================================================
 
-async function requestFreshOAuthUrl(state, stepForLog = 7) {
+async function requestFreshOAuthUrl(windowId, state, stepForLog = 7) {
   if (!state.vpsUrl) {
     throw new Error('尚未配置 CPA 地址，请先在侧边栏填写。');
   }
 
-  await addLog(`步骤 ${stepForLog}：正在打开 CPA 面板并刷新 OAuth 链接...`);
+  await addLog(windowId, `步骤 ${stepForLog}：正在打开 CPA 面板并刷新 OAuth 链接...`);
   const injectFiles = ['content/utils.js', 'content/vps-panel.js'];
-  let tabId = await getTabId('vps-panel');
-  const alive = tabId && await isTabAlive('vps-panel');
+  let tabId = await getTabId(windowId, 'vps-panel');
+  const alive = tabId && await isTabAlive(windowId, 'vps-panel');
 
   if (!alive) {
-    tabId = await reuseOrCreateTab('vps-panel', state.vpsUrl, {
+    tabId = await reuseOrCreateTab(windowId, 'vps-panel', state.vpsUrl, {
       inject: injectFiles,
       injectSource: 'vps-panel',
       reloadIfSameUrl: true,
       activate: false,
     });
   } else {
-    await closeConflictingTabsForSource('vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
-    tabId = await reuseOrCreateTab('vps-panel', state.vpsUrl, {
+    await closeConflictingTabsForSource(windowId, 'vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
+    tabId = await reuseOrCreateTab(windowId, 'vps-panel', state.vpsUrl, {
       inject: injectFiles,
       injectSource: 'vps-panel',
       reloadIfSameUrl: true,
@@ -2736,7 +3393,7 @@ async function requestFreshOAuthUrl(state, stepForLog = 7) {
     retryDelayMs: 400,
   });
   if (!matchedTab) {
-    await addLog(`步骤 ${stepForLog}：CPA 页面尚未完全进入目标地址，继续尝试连接内容脚本...`, 'warn');
+    await addLog(windowId, `步骤 ${stepForLog}：CPA 页面尚未完全进入目标地址，继续尝试连接内容脚本...`, 'warn');
   }
 
   await ensureContentScriptReadyOnTab(windowId, 'vps-panel', tabId, {
@@ -2747,7 +3404,7 @@ async function requestFreshOAuthUrl(state, stepForLog = 7) {
     logMessage: `步骤 ${stepForLog}：CPA 面板仍在加载，正在重试连接内容脚本...`,
   });
 
-  const result = await sendToContentScriptResilient('vps-panel', {
+  const result = await sendToContentScriptResilient(windowId, 'vps-panel', {
     type: 'FETCH_OAUTH_URL',
     step: stepForLog,
     source: 'background',
@@ -2771,22 +3428,22 @@ async function requestFreshOAuthUrl(state, stepForLog = 7) {
     throw new Error('刷新 OAuth 链接后仍未拿到可用链接。');
   }
 
-  await setState({ oauthUrl, oauthSourceTabId: tabId, localhostUrl: null, authPageState: null });
-  broadcastDataUpdate({ oauthUrl });
+  await setState(windowId, { oauthUrl, oauthSourceTabId: tabId, localhostUrl: null, authPageState: null });
+  await broadcastDataUpdate(windowId, { oauthUrl });
   return oauthUrl;
 }
 
-async function executeStep1() {
+async function executeStep1(windowId) {
   const chatgptUrl = 'https://chatgpt.com/';
-  await addLog('步骤 1：正在打开 ChatGPT 官网...');
-  const tabId = await reuseOrCreateTab('signup-page', chatgptUrl);
-  await ensureContentScriptReadyOnTab('signup-page', tabId, {
+  await addLog(windowId, '步骤 1：正在打开 ChatGPT 官网...');
+  const tabId = await reuseOrCreateTab(windowId, 'signup-page', chatgptUrl);
+  await ensureContentScriptReadyOnTab(windowId, 'signup-page', tabId, {
     timeoutMs: 30000,
     retryDelayMs: 600,
     logMessage: '步骤 1：ChatGPT 页面仍在加载，正在等待内容脚本就绪...',
   });
 
-  const result = await sendToContentScriptResilient('signup-page', {
+  const result = await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'ENSURE_SIGNUP_ENTRY_READY',
     step: 1,
     source: 'background',
@@ -2801,26 +3458,26 @@ async function executeStep1() {
     throw new Error(result.error);
   }
 
-  await completeStepFromBackground(1, {});
+  await completeStepFromBackground(windowId, 1, {});
 }
 
 // ============================================================
 // Step 2: Open Signup Page (Background opens tab, signup-page.js clicks Register)
 // ============================================================
 
-async function executeStep2(state) {
+async function executeStep2(windowId, state) {
   if (!state.email) {
     throw new Error('缺少邮箱地址，请先在侧边栏填写或获取邮箱。');
   }
 
-  const signupTabId = await getTabId('signup-page');
+  const signupTabId = await getTabId(windowId, 'signup-page');
   if (!signupTabId) {
     throw new Error('缺少 ChatGPT 页面，请先完成步骤 1。');
   }
 
   await chrome.tabs.update(signupTabId, { active: true });
-  await addLog(`步骤 2：正在进入注册流程并填写邮箱 ${state.email}...`);
-  await sendToContentScriptResilient('signup-page', {
+  await addLog(windowId, `步骤 2：正在进入注册流程并填写邮箱 ${state.email}...`);
+  await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'EXECUTE_STEP',
     step: 2,
     source: 'background',
@@ -2849,9 +3506,10 @@ async function executeStep3(windowId, state) {
   await setState(windowId, { accounts });
 
   await addLog(
+    windowId,
     `步骤 3：正在为 ${state.email} 填写密码，密码为${state.customPassword ? '自定义' : '自动生成'}（${password.length} 位）`
   );
-  await sendToContentScriptResilient('signup-page', {
+  await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'EXECUTE_STEP',
     step: 3,
     source: 'background',
@@ -2953,16 +3611,17 @@ async function removeCookieDirectly(cookie) {
   }
 }
 
-async function runPreStep6CookieCleanup() {
+async function runPreStep6CookieCleanup(windowId) {
   await addLog(
+    windowId,
     `步骤 6：开始前等待 ${Math.round(STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS / 1000)} 秒，然后直接删除 ChatGPT / OpenAI cookies...`,
     'info'
   );
 
-  await sleepWithStop(STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS);
+  await sleepWithStop(windowId, STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS);
 
   if (!chrome.cookies?.getAll || !chrome.cookies?.remove) {
-    await addLog('步骤 6：当前浏览器不支持 cookies API，无法直接删除 cookies。', 'warn');
+    await addLog(windowId, '步骤 6：当前浏览器不支持 cookies API，无法直接删除 cookies。', 'warn');
     return;
   }
 
@@ -2970,7 +3629,7 @@ async function runPreStep6CookieCleanup() {
   let removedCount = 0;
 
   for (const cookie of cookies) {
-    throwIfStopped();
+    throwIfStopped(windowId);
     if (await removeCookieDirectly(cookie)) {
       removedCount += 1;
     }
@@ -2983,11 +3642,11 @@ async function runPreStep6CookieCleanup() {
         origins: PRE_LOGIN_COOKIE_CLEAR_ORIGINS,
       });
     } catch (err) {
-      await addLog(`步骤 6：browsingData 补扫 cookies 失败：${getErrorMessage(err)}`, 'warn');
+      await addLog(windowId, `步骤 6：browsingData 补扫 cookies 失败：${getErrorMessage(err)}`, 'warn');
     }
   }
 
-  await addLog(`步骤 6：已直接删除 ${removedCount} 个 ChatGPT / OpenAI cookies，准备继续获取链接并登录。`, 'ok');
+  await addLog(windowId, `步骤 6：已直接删除 ${removedCount} 个 ChatGPT / OpenAI cookies，准备继续获取链接并登录。`, 'ok');
 }
 
 function getVerificationCodeStateKey(step) {
@@ -3033,11 +3692,16 @@ async function requestVerificationCodeResend(windowId, step) {
   await chrome.tabs.update(signupTabId, { active: true });
   await addLog(windowId, `步骤 ${step}：正在请求新的${getVerificationCodeLabel(step)}验证码...`, 'warn');
 
-  const result = await sendToContentScript(windowId, 'signup-page', {
+  const result = await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'RESEND_VERIFICATION_CODE',
     step,
     source: 'background',
     payload: {},
+  }, {
+    timeoutMs: 90000,
+    retryDelayMs: 700,
+    responseTimeoutMs: 70000,
+    logMessage: `步骤 ${step}：认证页正在加载或重载，等待页面重新就绪后继续请求验证码...`,
   });
 
   if (result && result.error) {
@@ -3092,8 +3756,8 @@ async function pollFreshVerificationCode(windowId, step, state, mail, pollOverri
           }
         );
 
-        if (result?.reloadRequired && mail.source === 'qq-mail') {
-          await addLog(windowId, `步骤 ${step}：QQ 邮箱页内刷新无效，正在直接刷新页面后继续轮询...`, 'warn');
+        if (result?.reloadRequired && (mail.source === 'qq-mail' || mail.source === 'mail-163')) {
+          await addLog(windowId, `步骤 ${step}：${mail.label}页内刷新无效，正在直接刷新页面后继续轮询...`, 'warn');
           await reuseOrCreateTab(windowId, mail.source, mail.url, {
             inject: mail.inject,
             injectSource: mail.injectSource,
@@ -3130,7 +3794,7 @@ async function pollFreshVerificationCode(windowId, step, state, mail, pollOverri
   throw lastError || new Error(`步骤 ${step}：无法获取新的${getVerificationCodeLabel(step)}验证码。`);
 }
 
-async function submitVerificationCode(windowId, step, code) {
+async function submitVerificationCode(windowId, step, code, extraPayload = {}) {
   const signupTabId = await getTabId(windowId, 'signup-page');
   if (!signupTabId) {
     throw new Error('认证页面标签页已关闭，无法填写验证码。');
@@ -3141,7 +3805,10 @@ async function submitVerificationCode(windowId, step, code) {
     type: 'FILL_CODE',
     step,
     source: 'background',
-    payload: { code },
+    payload: {
+      code,
+      ...extraPayload,
+    },
   });
 
   if (result && result.error) {
@@ -3162,24 +3829,66 @@ async function resolveVerificationStep(windowId, step, state, mail, options = {}
   const requestFreshCodeFirst = Boolean(options.requestFreshCodeFirst);
   const reportCompletion = options.reportCompletion !== false;
   const maxSubmitAttempts = 3;
+  const firstVerificationCodeRequestedAt = Number.isFinite(options.firstVerificationCodeRequestedAt)
+    ? Math.floor(options.firstVerificationCodeRequestedAt)
+    : null;
+  const minHumanDelayMs = Number.isFinite(options.minHumanDelayMs)
+    ? Math.max(0, Math.floor(options.minHumanDelayMs))
+    : 0;
+
+  let effectiveFirstVerificationCodeRequestedAt = firstVerificationCodeRequestedAt;
+  let effectiveMinHumanDelayMs = minHumanDelayMs;
 
   if (requestFreshCodeFirst) {
     try {
-      await requestVerificationCodeResend(windowId, step);
+      const requestedAt = await requestVerificationCodeResend(windowId, step);
+      if (!Number.isFinite(effectiveFirstVerificationCodeRequestedAt)) {
+        effectiveFirstVerificationCodeRequestedAt = requestedAt;
+      }
       await addLog(windowId, `步骤 ${step}：已先请求一封新的${getVerificationCodeLabel(step)}验证码，再开始轮询邮箱。`, 'warn');
     } catch (err) {
+      if (step === 8 && !Number.isFinite(effectiveFirstVerificationCodeRequestedAt) && effectiveMinHumanDelayMs > 0) {
+        effectiveFirstVerificationCodeRequestedAt = Date.now();
+        await addLog(windowId, `步骤 8：首次重新获取验证码失败，改以当前时间作为最小人类等待起点。`, 'warn');
+      }
       await addLog(windowId, `步骤 ${step}：首次重新获取验证码失败：${err.message}，将继续使用当前时间窗口轮询。`, 'warn');
     }
   }
 
   for (let attempt = 1; attempt <= maxSubmitAttempts; attempt++) {
+    const effectiveFilterAfterTimestamp = step === 8 && Number.isFinite(effectiveFirstVerificationCodeRequestedAt)
+      ? effectiveFirstVerificationCodeRequestedAt
+      : nextFilterAfterTimestamp;
+
     const result = await pollFreshVerificationCode(windowId, step, state, mail, {
       excludeCodes: [...rejectedCodes],
-      filterAfterTimestamp: nextFilterAfterTimestamp ?? undefined,
+      filterAfterTimestamp: effectiveFilterAfterTimestamp ?? undefined,
     });
 
     await addLog(windowId, `步骤 ${step}：已获取${getVerificationCodeLabel(step)}验证码：${result.code}`);
-    const submitResult = await submitVerificationCode(windowId, step, result.code);
+
+    if (step === 8 && Number.isFinite(effectiveFirstVerificationCodeRequestedAt) && effectiveMinHumanDelayMs > 0) {
+      const elapsedMs = Date.now() - effectiveFirstVerificationCodeRequestedAt;
+      const remainingMs = effectiveMinHumanDelayMs - elapsedMs;
+      if (remainingMs > 0) {
+        await addLog(
+          windowId,
+          `步骤 8：从首次发送登录验证码到填写提交至少等待 ${effectiveMinHumanDelayMs}ms，当前还需补足 ${remainingMs}ms。`,
+          'warn'
+        );
+        await sleepWithStop(windowId, remainingMs);
+      }
+    }
+
+    const submitResult = await submitVerificationCode(windowId, step, result.code, {
+      firstVerificationCodeRequestedAt: effectiveFirstVerificationCodeRequestedAt,
+      minHumanDelayMs: effectiveMinHumanDelayMs,
+    });
+
+    if (step === 8) {
+      effectiveFirstVerificationCodeRequestedAt = null;
+      effectiveMinHumanDelayMs = 0;
+    }
 
     if (submitResult.addPhonePage) {
       await addLog(windowId, `步骤 ${step}：验证码通过后进入手机号页面，本轮线程作废，准备重新开始新一轮。`, 'warn');
@@ -3221,28 +3930,62 @@ async function executeStep4(windowId, state) {
   const mail = getMailConfig(state);
   if (mail.error) throw new Error(mail.error);
   const stepStartedAt = Date.now();
-  const signupTabId = await getTabId(windowId, 'signup-page');
+  let signupTabId = await getTabId(windowId, 'signup-page');
   if (!signupTabId) {
     throw new Error('认证页面标签页已关闭，无法继续步骤 4。');
   }
 
   await chrome.tabs.update(signupTabId, { active: true });
   await addLog(windowId, '步骤 4：正在确认注册验证码页面是否就绪，必要时自动恢复密码页超时报错...');
-  const prepareResult = await sendToContentScriptResilient(
-    windowId,
-    'signup-page',
-    {
-      type: 'PREPARE_SIGNUP_VERIFICATION',
-      step: 4,
-      source: 'background',
-      payload: { password: state.password || state.customPassword || '' },
-    },
-    {
-      timeoutMs: 30000,
-      retryDelayMs: 700,
-      logMessage: '步骤 4：认证页正在切换，等待页面重新就绪后继续检测...',
+
+  let prepareResult = null;
+  const prepareStartedAt = Date.now();
+  let loggedPrepareReload = false;
+  while (Date.now() - prepareStartedAt < 90000) {
+    try {
+      prepareResult = await sendToContentScriptResilient(
+        windowId,
+        'signup-page',
+        {
+          type: 'PREPARE_SIGNUP_VERIFICATION',
+          step: 4,
+          source: 'background',
+          payload: { password: state.password || state.customPassword || '' },
+        },
+        {
+          timeoutMs: 45000,
+          retryDelayMs: 700,
+          logMessage: '步骤 4：认证页正在切换，等待页面重新就绪后继续检测...',
+        }
+      );
+      break;
+    } catch (err) {
+      if (!isRetryableContentScriptTransportError(err)) {
+        throw err;
+      }
+
+      if (!loggedPrepareReload) {
+        loggedPrepareReload = true;
+        await addLog(windowId, '步骤 4：认证页恢复过程中发生重载，正在等待新页面重新接力...', 'warn');
+      }
+
+      signupTabId = await getTabId(windowId, 'signup-page');
+      if (!signupTabId) {
+        throw new Error('认证页面标签页已关闭，无法继续步骤 4。');
+      }
+
+      await ensureContentScriptReadyOnTab(windowId, 'signup-page', signupTabId, {
+        timeoutMs: 20000,
+        retryDelayMs: 500,
+        logMessage: '步骤 4：正在等待认证页重载完成并重新注入内容脚本...',
+      });
+      await sleepWithStop(windowId, 300);
     }
-  );
+  }
+
+  if (!prepareResult) {
+    throw new Error('步骤 4：等待认证页恢复并进入验证码阶段超时。');
+  }
 
   if (prepareResult && prepareResult.error) {
     throw new Error(prepareResult.error);
@@ -3292,14 +4035,14 @@ async function executeStep5(windowId, state) {
   if (signupTabId) {
     const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
     if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
-      await addLog('步骤 5：认证页已直接进入 localhost 回调地址，资料页按已跳过处理。', 'ok');
-      await completeStepFromBackground(5, { skippedDirectToCallback: true, localhostUrl: signupTab.url });
+      await addLog(windowId, '步骤 5：认证页已直接进入 localhost 回调地址，资料页按已跳过处理。', 'ok');
+      await completeStepFromBackground(windowId, 5, { skippedDirectToCallback: true, localhostUrl: signupTab.url });
       return;
     }
   }
 
   try {
-    await sendToContentScript('signup-page', {
+    await sendToContentScript(windowId, 'signup-page', {
       type: 'EXECUTE_STEP',
       step: 5,
       source: 'background',
@@ -3310,17 +4053,17 @@ async function executeStep5(windowId, state) {
       throw err;
     }
 
-    await addLog('步骤 5：资料提交后页面正在切换，准备检查是否已进入后续阶段...', 'warn');
-    await sleepWithStop(4000);
+    await addLog(windowId, '步骤 5：资料提交后页面正在切换，准备检查是否已进入后续阶段...', 'warn');
+    await sleepWithStop(windowId, 4000);
 
     const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
     if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
-      await addLog('步骤 5：资料提交后已直接进入 localhost 回调地址，资料页按已跳过处理。', 'ok');
-      await completeStepFromBackground(5, { skippedDirectToCallback: true, localhostUrl: signupTab.url });
+      await addLog(windowId, '步骤 5：资料提交后已直接进入 localhost 回调地址，资料页按已跳过处理。', 'ok');
+      await completeStepFromBackground(windowId, 5, { skippedDirectToCallback: true, localhostUrl: signupTab.url });
       return;
     }
 
-    const authState = await sendToContentScriptResilient('signup-page', {
+    const authState = await sendToContentScriptResilient(windowId, 'signup-page', {
       type: 'INSPECT_AUTH_PAGE_STATE',
       step: 5,
       source: 'background',
@@ -3332,26 +4075,26 @@ async function executeStep5(windowId, state) {
     });
 
     if (authState?.localhostUrl && isLocalhostOAuthCallbackUrl(authState.localhostUrl)) {
-      await addLog('步骤 5：资料提交后已直接进入 localhost 回调地址，资料页按已跳过处理。', 'ok');
-      await completeStepFromBackground(5, { skippedDirectToCallback: true, localhostUrl: authState.localhostUrl });
+      await addLog(windowId, '步骤 5：资料提交后已直接进入 localhost 回调地址，资料页按已跳过处理。', 'ok');
+      await completeStepFromBackground(windowId, 5, { skippedDirectToCallback: true, localhostUrl: authState.localhostUrl });
       return;
     }
 
     if (authState?.state === 'consent') {
-      await addLog('步骤 5：资料提交后已进入 OAuth 同意页，资料页按已完成处理。', 'ok');
-      await completeStepFromBackground(5, { skippedDirectToConsent: true });
+      await addLog(windowId, '步骤 5：资料提交后已进入 OAuth 同意页，资料页按已完成处理。', 'ok');
+      await completeStepFromBackground(windowId, 5, { skippedDirectToConsent: true });
       return;
     }
 
     if (authState?.state === 'logged_in_home') {
-      await addLog('步骤 5：资料提交后进入已登录首页，将刷新 OAuth 链接重新进入登录链路。', 'ok');
-      await completeStepFromBackground(5, { loggedInHome: true });
+      await addLog(windowId, '步骤 5：资料提交后进入已登录首页，将刷新 OAuth 链接重新进入登录链路。', 'ok');
+      await completeStepFromBackground(windowId, 5, { loggedInHome: true });
       return;
     }
 
     if (authState?.state === 'add_phone') {
-      await addLog('步骤 5：资料提交后进入手机号页面。', 'ok');
-      await completeStepFromBackground(5, { addPhonePage: true });
+      await addLog(windowId, '步骤 5：资料提交后进入手机号页面。', 'ok');
+      await completeStepFromBackground(windowId, 5, { addPhonePage: true });
       return;
     }
 
@@ -3363,52 +4106,52 @@ async function executeStep5(windowId, state) {
 // Step 6: Clear login cookies before OAuth login
 // ============================================================
 
-async function executeStep6() {
-  await runPreStep6CookieCleanup();
-  await completeStepFromBackground(6, {});
+async function executeStep6(windowId) {
+  await runPreStep6CookieCleanup(windowId);
+  await completeStepFromBackground(windowId, 6, {});
 }
 
 // ============================================================
 // Step 7: Login ChatGPT (Background opens tab, signup-page.js handles login)
 // ============================================================
 
-async function refreshOAuthUrlBeforeStep7(state) {
-  return requestFreshOAuthUrl(state, 7);
+async function refreshOAuthUrlBeforeStep7(windowId, state) {
+  return requestFreshOAuthUrl(windowId, state, 7);
 }
 
-async function executeStep7(state) {
+async function executeStep7(windowId, state) {
   if (!state.email) {
     throw new Error('缺少邮箱地址，请先完成步骤 3。');
   }
 
   if (state.localhostUrl && isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
-    await addLog('步骤 7：已记录 localhost 回调地址，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: state.localhostUrl });
+    await addLog(windowId, '步骤 7：已记录 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(windowId, 7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: state.localhostUrl });
     return;
   }
 
   if (state.authPageState === 'consent') {
-    await addLog('步骤 7：已记录认证页直达 OAuth 同意页，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(7, { needsOTP: false, skippedDirectToConsent: true });
+    await addLog(windowId, '步骤 7：已记录认证页直达 OAuth 同意页，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(windowId, 7, { needsOTP: false, skippedDirectToConsent: true });
     return;
   }
 
   if (state.authPageState === 'logged_in_home') {
-    await addLog('步骤 7：当前记录为已登录首页，不直接跳过，将刷新 OAuth 链接重新进入授权链路。', 'info');
-    await setState({ authPageState: null });
+    await addLog(windowId, '步骤 7：当前记录为已登录首页，不直接跳过，将刷新 OAuth 链接重新进入授权链路。', 'info');
+    await setState(windowId, { authPageState: null });
   }
 
-  const existingSignupTabAlive = await isTabAlive('signup-page');
-  const existingSignupTabId = existingSignupTabAlive ? await getTabId('signup-page') : null;
+  const existingSignupTabAlive = await isTabAlive(windowId, 'signup-page');
+  const existingSignupTabId = existingSignupTabAlive ? await getTabId(windowId, 'signup-page') : null;
   if (existingSignupTabId) {
     const existingSignupTab = await chrome.tabs.get(existingSignupTabId).catch(() => null);
     if (isLocalhostOAuthCallbackUrl(existingSignupTab?.url)) {
-      await addLog('步骤 7：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-      await completeStepFromBackground(7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: existingSignupTab.url });
+      await addLog(windowId, '步骤 7：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+      await completeStepFromBackground(windowId, 7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: existingSignupTab.url });
       return;
     }
 
-    const authState = await sendToContentScriptResilient('signup-page', {
+    const authState = await sendToContentScriptResilient(windowId, 'signup-page', {
       type: 'INSPECT_AUTH_PAGE_STATE',
       step: 7,
       source: 'background',
@@ -3420,34 +4163,34 @@ async function executeStep7(state) {
     });
 
     if (authState?.localhostUrl && isLocalhostOAuthCallbackUrl(authState.localhostUrl)) {
-      await addLog('步骤 7：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-      await completeStepFromBackground(7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: authState.localhostUrl });
+      await addLog(windowId, '步骤 7：认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+      await completeStepFromBackground(windowId, 7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: authState.localhostUrl });
       return;
     }
 
     if (authState?.state === 'consent') {
-      await addLog('步骤 7：认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
-      await completeStepFromBackground(7, { needsOTP: false, skippedDirectToConsent: true });
+      await addLog(windowId, '步骤 7：认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
+      await completeStepFromBackground(windowId, 7, { needsOTP: false, skippedDirectToConsent: true });
       return;
     }
 
     if (authState?.state === 'add_phone') {
-      await addLog('步骤 7：资料提交后进入手机号页面属于正常中间态，将刷新 OAuth 链接继续登录。', 'info');
+      await addLog(windowId, '步骤 7：资料提交后进入手机号页面属于正常中间态，将刷新 OAuth 链接继续登录。', 'info');
     }
   }
 
-  const oauthUrl = await refreshOAuthUrlBeforeStep7(state);
+  const oauthUrl = await refreshOAuthUrlBeforeStep7(windowId, state);
 
-  await addLog('步骤 7：正在打开最新 OAuth 链接并登录...');
-  const signupTabId = await reuseOrCreateTab('signup-page', oauthUrl);
+  await addLog(windowId, '步骤 7：正在打开最新 OAuth 链接并登录...');
+  const signupTabId = await reuseOrCreateTab(windowId, 'signup-page', oauthUrl);
   const signupTab = await chrome.tabs.get(signupTabId).catch(() => null);
   if (isLocalhostOAuthCallbackUrl(signupTab?.url)) {
-    await addLog('步骤 7：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: signupTab.url });
+    await addLog(windowId, '步骤 7：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(windowId, 7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: signupTab.url });
     return;
   }
 
-  const postOpenAuthState = await sendToContentScriptResilient('signup-page', {
+  const postOpenAuthState = await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'INSPECT_AUTH_PAGE_STATE',
     step: 7,
     source: 'background',
@@ -3459,19 +4202,19 @@ async function executeStep7(state) {
   });
 
   if (postOpenAuthState?.localhostUrl && isLocalhostOAuthCallbackUrl(postOpenAuthState.localhostUrl)) {
-    await addLog('步骤 7：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: postOpenAuthState.localhostUrl });
+    await addLog(windowId, '步骤 7：刷新后的认证页已直接进入 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(windowId, 7, { needsOTP: false, alreadyAtCallback: true, localhostUrl: postOpenAuthState.localhostUrl });
     return;
   }
 
   if (postOpenAuthState?.state === 'consent') {
-    await addLog('步骤 7：刷新后的认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(7, { needsOTP: false, skippedDirectToConsent: true });
+    await addLog(windowId, '步骤 7：刷新后的认证页已直接进入 OAuth 同意页，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(windowId, 7, { needsOTP: false, skippedDirectToConsent: true });
     return;
   }
 
   if (postOpenAuthState?.state === 'add_phone') {
-    await addLog('步骤 7：刷新后的认证页仍显示手机号页面，继续重新执行登录。', 'info');
+    await addLog(windowId, '步骤 7：刷新后的认证页仍显示手机号页面，继续重新执行登录。', 'info');
   }
 
   const loginPassword = state.password || state.customPassword;
@@ -3479,11 +4222,16 @@ async function executeStep7(state) {
     throw new Error('缺少登录密码，请先完成步骤 3 或在侧边栏填写自定义密码。');
   }
 
-  await sendToContentScript('signup-page', {
+  await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'EXECUTE_STEP',
     step: 7,
     source: 'background',
     payload: { email: state.email, password: loginPassword },
+  }, {
+    timeoutMs: 90000,
+    retryDelayMs: 700,
+    responseTimeoutMs: 70000,
+    logMessage: '步骤 7：登录页正在加载或重载，等待页面重新就绪后继续填写邮箱...',
   });
 }
 
@@ -3491,32 +4239,33 @@ async function executeStep7(state) {
 // Step 8: Get Login Verification Code (mail provider polls, then fills in signup-page.js)
 // ============================================================
 
-async function runStep8Attempt(state) {
+async function runStep8Attempt(windowId, state) {
   const mail = getMailConfig(state);
   if (mail.error) throw new Error(mail.error);
   const stepStartedAt = Date.now();
 
   if (state.localhostUrl && isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
-    await addLog('步骤 8：已记录 localhost 回调地址，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(8, { skippedDirectToCallback: true, localhostUrl: state.localhostUrl });
+    await addLog(windowId, '步骤 8：已记录 localhost 回调地址，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(windowId, 8, { skippedDirectToCallback: true, localhostUrl: state.localhostUrl });
     return;
   }
 
   if (state.authPageState === 'consent') {
-    await addLog('步骤 8：已记录认证页直达 OAuth 同意页，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(8, { skippedDirectToConsent: true });
+    await addLog(windowId, '步骤 8：已记录认证页直达 OAuth 同意页，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(windowId, 8, { skippedDirectToConsent: true });
     return;
   }
 
   if (state.authPageState === 'logged_in_home') {
-    await addLog('步骤 8：当前记录为已登录首页，不视为 OAuth 同意页，先回到步骤 7 刷新授权链路。', 'warn');
-    await setState({ authPageState: null });
-    await rerunStep7ForStep8Recovery();
-    await runStep8Attempt(await getState());
+    await addLog(windowId, '步骤 8：当前记录为已登录首页，不视为 OAuth 同意页，先回到步骤 7 刷新授权链路。', 'warn');
+    await setState(windowId, { authPageState: null });
+    await rerunStep7ForStep8Recovery(windowId);
+    await runStep8Attempt(windowId, await getState(windowId));
     return;
   }
 
-  let authTabId = await (await isTabAlive('signup-page') ? getTabId('signup-page') : null);
+  const signupAlive = await isTabAlive(windowId, 'signup-page');
+  let authTabId = signupAlive ? await getTabId(windowId, 'signup-page') : null;
 
   if (authTabId) {
     await chrome.tabs.update(authTabId, { active: true });
@@ -3524,17 +4273,17 @@ async function runStep8Attempt(state) {
     if (!state.oauthUrl) {
       throw new Error('缺少 OAuth 链接，请先完成步骤 7。');
     }
-    authTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
+    authTabId = await reuseOrCreateTab(windowId, 'signup-page', state.oauthUrl);
   }
 
   const currentAuthTab = authTabId ? await chrome.tabs.get(authTabId).catch(() => null) : null;
   if (isLocalhostOAuthCallbackUrl(currentAuthTab?.url)) {
-    await addLog('步骤 8：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(8, { skippedDirectToCallback: true, localhostUrl: currentAuthTab.url });
+    await addLog(windowId, '步骤 8：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(windowId, 8, { skippedDirectToCallback: true, localhostUrl: currentAuthTab.url });
     return;
   }
 
-  const currentAuthState = await sendToContentScriptResilient('signup-page', {
+  const currentAuthState = await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'INSPECT_AUTH_PAGE_STATE',
     step: 8,
     source: 'background',
@@ -3546,14 +4295,14 @@ async function runStep8Attempt(state) {
   });
 
   if (currentAuthState?.localhostUrl && isLocalhostOAuthCallbackUrl(currentAuthState.localhostUrl)) {
-    await addLog('步骤 8：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(8, { skippedDirectToCallback: true, localhostUrl: currentAuthState.localhostUrl });
+    await addLog(windowId, '步骤 8：认证页已直接进入 localhost 回调地址，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(windowId, 8, { skippedDirectToCallback: true, localhostUrl: currentAuthState.localhostUrl });
     return;
   }
 
   if (currentAuthState?.state === 'consent') {
-    await addLog('步骤 8：认证页已直接进入 OAuth 同意页，跳过登录验证码阶段。', 'ok');
-    await completeStepFromBackground(8, { skippedDirectToConsent: true });
+    await addLog(windowId, '步骤 8：认证页已直接进入 OAuth 同意页，跳过登录验证码阶段。', 'ok');
+    await completeStepFromBackground(windowId, 8, { skippedDirectToConsent: true });
     return;
   }
 
@@ -3561,8 +4310,8 @@ async function runStep8Attempt(state) {
     throw new Error('当前流程已进入手机号页面，需要重新开始新一轮。');
   }
 
-  await addLog('步骤 8：正在准备认证页，必要时切换到一次性验证码登录...');
-  const prepareResult = await sendToContentScript('signup-page', {
+  await addLog(windowId, '步骤 8：正在准备认证页，必要时切换到一次性验证码登录...');
+  const prepareResult = await sendToContentScript(windowId, 'signup-page', {
     type: 'PREPARE_LOGIN_CODE',
     step: 8,
     source: 'background',
@@ -3573,52 +4322,59 @@ async function runStep8Attempt(state) {
     throw new Error(prepareResult.error);
   }
 
-  await addLog(`步骤 8：正在打开${mail.label}...`);
+  await addLog(windowId, `步骤 8：正在打开${mail.label}...`);
 
-  const alive = await isTabAlive(mail.source);
+  const alive = await isTabAlive(windowId, mail.source);
   if (alive) {
     if (mail.navigateOnReuse) {
-      await reuseOrCreateTab(mail.source, mail.url, {
+      await reuseOrCreateTab(windowId, mail.source, mail.url, {
         inject: mail.inject,
         injectSource: mail.injectSource,
       });
     } else {
-      const tabId = await getTabId(mail.source);
+      const tabId = await getTabId(windowId, mail.source);
       await chrome.tabs.update(tabId, { active: true });
     }
   } else {
-    await reuseOrCreateTab(mail.source, mail.url, {
+    await reuseOrCreateTab(windowId, mail.source, mail.url, {
       inject: mail.inject,
       injectSource: mail.injectSource,
     });
   }
 
-  await resolveVerificationStep(8, state, mail, {
+  const step8MinHumanDelayMs = getRandomDelayMs(
+    STEP8_LOGIN_CODE_MIN_HUMAN_DELAY_MIN,
+    STEP8_LOGIN_CODE_MIN_HUMAN_DELAY_MAX,
+  );
+  await addLog(windowId, `步骤 8：本轮登录验证码从首次发送到填写提交至少等待 ${step8MinHumanDelayMs}ms。`, 'warn');
+
+  await resolveVerificationStep(windowId, 8, state, mail, {
     filterAfterTimestamp: stepStartedAt,
     requestFreshCodeFirst: true,
+    minHumanDelayMs: step8MinHumanDelayMs,
   });
 }
 
-async function rerunStep7ForStep8Recovery() {
-  const currentState = await getState();
-  const waitForStep7 = waitForStepComplete(7, 120000);
-  await addLog('步骤 8：正在回到步骤 7，重新发起登录验证码流程...', 'warn');
-  await executeStep7(currentState);
+async function rerunStep7ForStep8Recovery(windowId) {
+  const currentState = await getState(windowId);
+  const waitForStep7 = waitForStepComplete(windowId, 7, 120000);
+  await addLog(windowId, '步骤 8：正在回到步骤 7，重新发起登录验证码流程...', 'warn');
+  await executeStep7(windowId, currentState);
   await waitForStep7;
-  await sleepWithStop(3000);
+  await sleepWithStop(windowId, 3000);
 }
 
-async function executeStep8(state) {
+async function executeStep8(windowId, state) {
   let lastError = null;
 
   for (let round = 1; round <= STEP8_RESTART_MAX_ROUNDS; round++) {
-    const currentState = round === 1 ? state : await getState();
+    const currentState = round === 1 ? state : await getState(windowId);
 
     try {
       if (round > 1) {
-        await addLog(`步骤 8：正在进行第 ${round}/${STEP8_RESTART_MAX_ROUNDS} 轮登录验证码恢复尝试。`, 'warn');
+        await addLog(windowId, `步骤 8：正在进行第 ${round}/${STEP8_RESTART_MAX_ROUNDS} 轮登录验证码恢复尝试。`, 'warn');
       }
-      await runStep8Attempt(currentState);
+      await runStep8Attempt(windowId, currentState);
       return;
     } catch (err) {
       lastError = err;
@@ -3631,8 +4387,8 @@ async function executeStep8(state) {
         break;
       }
 
-      await addLog(`步骤 8：检测到邮箱轮询类失败，准备从步骤 7 重新开始（${round + 1}/${STEP8_RESTART_MAX_ROUNDS}）...`, 'warn');
-      await rerunStep7ForStep8Recovery();
+      await addLog(windowId, `步骤 8：检测到邮箱轮询类失败，准备从步骤 7 重新开始（${round + 1}/${STEP8_RESTART_MAX_ROUNDS}）...`, 'warn');
+      await rerunStep7ForStep8Recovery(windowId);
     }
   }
 
@@ -3792,20 +4548,20 @@ function getStep8EffectLabel(effect) {
   }
 }
 
-async function executeStep9(state) {
+async function executeStep9(windowId, state) {
   if (state.localhostUrl && isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
-    await addLog('步骤 9：已记录 localhost 回调地址，本步骤按已完成处理。', 'ok');
-    await completeStepFromBackground(9, { localhostUrl: state.localhostUrl });
+    await addLog(windowId, '步骤 9：已记录 localhost 回调地址，本步骤按已完成处理。', 'ok');
+    await completeStepFromBackground(windowId, 9, { localhostUrl: state.localhostUrl });
     return;
   }
 
-  const existingSignupTabAlive = await isTabAlive('signup-page');
-  const existingSignupTabId = existingSignupTabAlive ? await getTabId('signup-page') : null;
+  const existingSignupTabAlive = await isTabAlive(windowId, 'signup-page');
+  const existingSignupTabId = existingSignupTabAlive ? await getTabId(windowId, 'signup-page') : null;
   if (!existingSignupTabId && !state.oauthUrl) {
     throw new Error('缺少 OAuth 链接，且当前没有可复用的认证页，请先完成步骤 7。');
   }
 
-  await addLog('步骤 9：正在监听 localhost 回调地址...');
+  await addLog(windowId, '步骤 9：正在监听 localhost 回调地址...');
 
   async function completeIfCurrentTabAlreadyAtCallback(tabId, logMessage) {
     if (!tabId) return false;
@@ -3824,7 +4580,7 @@ async function executeStep9(state) {
     if (logMessage) {
       await addLog(windowId, logMessage, 'ok');
     }
-    await completeStepFromBackground(9, { localhostUrl: tab.url });
+    await completeStepFromBackground(windowId, 9, { localhostUrl: tab.url });
     return true;
   }
 
@@ -3856,8 +4612,8 @@ async function executeStep9(state) {
         console.log(LOG_PREFIX, `已捕获 window=${windowId} localhost OAuth 回调：${details.url}`);
         resolved = true;
         clearTimeout(timeout);
-        addLog(`步骤 9：已捕获 localhost 地址：${details.url}`, 'ok').then(() => {
-          return completeStepFromBackground(9, { localhostUrl: details.url });
+        addLog(windowId, `步骤 9：已捕获 localhost 地址：${details.url}`, 'ok').then(() => {
+          return completeStepFromBackground(windowId, 9, { localhostUrl: details.url });
         }).then(() => {
           resolve();
         }).catch((err) => {
@@ -3868,9 +4624,13 @@ async function executeStep9(state) {
 
     (async () => {
       try {
-        signupTabId = await (await isTabAlive('signup-page') ? getTabId('signup-page') : null);
-        if (signupTabId) {
-          if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 9：检测到认证页已停留在 localhost 回调地址，直接完成当前步骤。')) {
+        activeSignupTabId = existingSignupTabId;
+        if (!activeSignupTabId) {
+          const signupAlive = await isTabAlive(windowId, 'signup-page');
+          activeSignupTabId = signupAlive ? await getTabId(windowId, 'signup-page') : null;
+        }
+        if (activeSignupTabId) {
+          if (await completeIfCurrentTabAlreadyAtCallback(activeSignupTabId, '步骤 9：检测到认证页已停留在 localhost 回调地址，直接完成当前步骤。')) {
             resolved = true;
             clearTimeout(timeout);
             cleanupListener();
@@ -3878,14 +4638,14 @@ async function executeStep9(state) {
             return;
           }
 
-          await chrome.tabs.update(signupTabId, { active: true });
-          await addLog('步骤 9：已切回认证页，准备循环确认“继续”按钮直到页面真正跳转...');
+          await chrome.tabs.update(activeSignupTabId, { active: true });
+          await addLog(windowId, '步骤 9：已切回认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         } else {
-          signupTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
-          await addLog('步骤 9：已重新打开认证页，准备循环确认“继续”按钮直到页面真正跳转...');
+          activeSignupTabId = await reuseOrCreateTab(windowId, 'signup-page', state.oauthUrl);
+          await addLog(windowId, '步骤 9：已重新打开认证页，准备循环确认“继续”按钮直到页面真正跳转...');
         }
 
-        if (await completeIfCurrentTabAlreadyAtCallback(signupTabId, '步骤 9：检测到认证页已跳到 localhost 回调地址，直接完成当前步骤。')) {
+        if (await completeIfCurrentTabAlreadyAtCallback(activeSignupTabId, '步骤 9：检测到认证页已跳到 localhost 回调地址，直接完成当前步骤。')) {
           resolved = true;
           clearTimeout(timeout);
           cleanupListener();
@@ -3893,6 +4653,8 @@ async function executeStep9(state) {
           return;
         }
 
+        clearStep8Listener(windowId);
+        step8ListenersByWindow.set(windowId, listener);
         chrome.webNavigation.onBeforeNavigate.addListener(listener);
 
         let attempt = 0;
@@ -3908,7 +4670,7 @@ async function executeStep9(state) {
           const round = attempt + 1;
           attempt += 1;
 
-          await addLog(`步骤 9：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
+          await addLog(windowId, `步骤 9：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
 
           if (strategy.mode === 'debugger') {
             const clickTarget = await prepareStep8DebuggerClick(windowId);
@@ -3916,8 +4678,8 @@ async function executeStep9(state) {
               resolved = true;
               cleanupListener();
               clearTimeout(timeout);
-              await addLog(`步骤 9：内容脚本确认当前页面已是 localhost 回调地址：${clickTarget.url}`, 'ok');
-              await completeStepFromBackground(9, { localhostUrl: clickTarget.url });
+              await addLog(windowId, `步骤 9：内容脚本确认当前页面已是 localhost 回调地址：${clickTarget.url}`, 'ok');
+              await completeStepFromBackground(windowId, 9, { localhostUrl: clickTarget.url });
               resolve();
               return;
             }
@@ -3938,12 +4700,16 @@ async function executeStep9(state) {
           }
 
           if (effect.progressed) {
-            await addLog(`步骤 9：检测到本次点击已生效，${getStep8EffectLabel(effect)}，继续等待 localhost 回调...`, 'info');
+            await addLog(windowId, `步骤 9：检测到本次点击已生效，${getStep8EffectLabel(effect)}，继续等待 localhost 回调...`, 'info');
             break;
           }
 
-          await addLog(`步骤 9：${strategy.label} 本次未触发页面离开同意页，准备继续重试。`, 'warn');
-          await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
+          noEffectAttempts += 1;
+          await addLog(windowId, `步骤 9：${strategy.label} 本次未触发页面离开同意页，准备继续重试。`, 'warn');
+          if (noEffectAttempts >= STEP8_MAX_NO_EFFECT_ATTEMPTS) {
+            noEffectAttempts = 0;
+          }
+          await sleepWithStop(windowId, STEP8_CLICK_RETRY_DELAY_MS);
         }
       } catch (err) {
         failStep9(err);
@@ -3956,7 +4722,7 @@ async function executeStep9(state) {
 // Step 10: CPA 回调验证（通过 vps-panel.js）
 // ============================================================
 
-async function executeStep10(state) {
+async function executeStep10(windowId, state) {
   if (state.localhostUrl && !isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
     throw new Error('步骤 9 捕获到的 localhost OAuth 回调地址无效，请重新执行步骤 9。');
   }
@@ -3970,18 +4736,18 @@ async function executeStep10(state) {
     throw new Error('缺少步骤 7 生成的 OAuth 链接，请从步骤 7 重新开始。');
   }
 
-  await addLog('步骤 10：正在回到步骤 7 使用的 CPA 面板...');
+  await addLog(windowId, '步骤 10：正在回到步骤 7 使用的 CPA 面板...');
 
   const injectFiles = ['content/utils.js', 'content/vps-panel.js'];
-  let tabId = Number.isInteger(state.oauthSourceTabId) ? state.oauthSourceTabId : await getTabId('vps-panel');
-  const alive = tabId && await isTabAlive('vps-panel');
+  let tabId = Number.isInteger(state.oauthSourceTabId) ? state.oauthSourceTabId : await getTabId(windowId, 'vps-panel');
+  const alive = tabId && await isTabAlive(windowId, 'vps-panel');
 
   if (!alive) {
     throw new Error('步骤 10：步骤 7 发起 OAuth 的 CPA 标签页已不存在。为确保使用同一条授权链接，请从步骤 7 重新开始。');
   }
 
-  await closeConflictingTabsForSource('vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
-  await rememberSourceLastUrl('vps-panel', state.vpsUrl);
+  await closeConflictingTabsForSource(windowId, 'vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
+  await rememberSourceLastUrl(windowId, 'vps-panel', state.vpsUrl);
 
   const currentPanelTab = await chrome.tabs.get(tabId).catch(() => null);
   if (!currentPanelTab || !matchesSourceUrlFamily('vps-panel', currentPanelTab.url, state.vpsUrl)) {
@@ -4012,6 +4778,7 @@ async function executeStep10(state) {
     } : null,
   });
   await addLog(
+    windowId,
     `步骤 10 调试：currentTab=${currentTab ? `${currentTab.id}@${currentTab.windowId}${currentTab.active ? ':active' : ''}` : 'null'}，` +
     `cpaTab=${vpsPanelTab ? `${vpsPanelTab.id}@${vpsPanelTab.windowId}${vpsPanelTab.active ? ':active' : ''}` : 'null'}`,
     'info'
@@ -4023,7 +4790,7 @@ async function executeStep10(state) {
       fromWindowId: vpsPanelTab.windowId,
       toWindowId: currentTab.windowId,
     });
-    await addLog(`步骤 10 调试：检测到 CPA tab 在其他窗口，尝试移动到当前窗口 ${currentTab.windowId}。`, 'warn');
+    await addLog(windowId, `步骤 10 调试：检测到 CPA tab 在其他窗口，尝试移动到当前窗口 ${currentTab.windowId}。`, 'warn');
     const movedTab = await chrome.tabs.move(tabId, {
       windowId: currentTab.windowId,
       index: -1,
@@ -4032,7 +4799,7 @@ async function executeStep10(state) {
       return null;
     });
     const movedTabId = Array.isArray(movedTab) ? movedTab[0]?.id : movedTab?.id;
-    await addLog(`步骤 10 调试：move 结果=${movedTabId || 'null'}`, movedTabId ? 'info' : 'warn');
+    await addLog(windowId, `步骤 10 调试：move 结果=${movedTabId || 'null'}`, movedTabId ? 'info' : 'warn');
     if (Number.isInteger(movedTabId)) {
       tabId = movedTabId;
       vpsPanelTab = await chrome.tabs.get(tabId).catch(() => vpsPanelTab);
@@ -4043,7 +4810,7 @@ async function executeStep10(state) {
       tabId,
       windowId: vpsPanelTab.windowId,
     });
-    await addLog(`步骤 10 调试：准备激活 CPA tab ${tabId}@${vpsPanelTab.windowId}。`, 'info');
+    await addLog(windowId, `步骤 10 调试：准备激活 CPA tab ${tabId}@${vpsPanelTab.windowId}。`, 'info');
     await chrome.tabs.update(tabId, { active: true });
   }
   const finalCurrentTab = await chrome.tabs.get(tabId).catch(() => null);
@@ -4058,12 +4825,13 @@ async function executeStep10(state) {
     } : null,
   });
   await addLog(
+    windowId,
     `步骤 10 调试：切换后 CPA tab=${finalCurrentTab ? `${finalCurrentTab.id}@${finalCurrentTab.windowId}${finalCurrentTab.active ? ':active' : ':inactive'}` : 'null'}`,
     finalCurrentTab?.active ? 'ok' : 'warn'
   );
 
-  await addLog('步骤 10：正在填写回调地址...');
-  const result = await sendToContentScriptResilient('vps-panel', {
+  await addLog(windowId, '步骤 10：正在填写回调地址...');
+  const result = await sendToContentScriptResilient(windowId, 'vps-panel', {
     type: 'EXECUTE_STEP',
     step: 10,
     source: 'background',

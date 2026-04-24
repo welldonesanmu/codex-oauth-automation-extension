@@ -181,6 +181,55 @@ function getCurrentMailIds() {
   return ids;
 }
 
+function getMail163PollStateStorageKey(payload = {}) {
+  const step = Number(payload.step) || 0;
+  const filterAfterTimestamp = Number(payload.filterAfterTimestamp || 0) || 0;
+  return `mail163PollState:${step}:${filterAfterTimestamp}`;
+}
+
+async function loadPersistedPollState(payload = {}) {
+  const key = getMail163PollStateStorageKey(payload);
+  try {
+    const data = await chrome.storage.session.get(key);
+    const raw = data[key] || {};
+    const mailIds = Array.isArray(raw.mailIds) ? raw.mailIds.filter(Boolean) : [];
+    const nextAttempt = Math.max(1, Number(raw.nextAttempt) || 1);
+    return {
+      mailIds: new Set(mailIds),
+      nextAttempt,
+    };
+  } catch (err) {
+    console.warn(MAIL163_PREFIX, 'Failed to load persisted 163 poll state:', err?.message || err);
+    return {
+      mailIds: new Set(),
+      nextAttempt: 1,
+    };
+  }
+}
+
+async function persistPollState(payload = {}, state = {}) {
+  const key = getMail163PollStateStorageKey(payload);
+  try {
+    await chrome.storage.session.set({
+      [key]: {
+        mailIds: [...new Set(state.mailIds || [])],
+        nextAttempt: Math.max(1, Number(state.nextAttempt) || 1),
+      },
+    });
+  } catch (err) {
+    console.warn(MAIL163_PREFIX, 'Failed to persist 163 poll state:', err?.message || err);
+  }
+}
+
+async function clearPersistedPollState(payload = {}) {
+  const key = getMail163PollStateStorageKey(payload);
+  try {
+    await chrome.storage.session.remove(key);
+  } catch (err) {
+    console.warn(MAIL163_PREFIX, 'Failed to clear 163 poll state:', err?.message || err);
+  }
+}
+
 function normalizeMinuteTimestamp(timestamp) {
   if (!Number.isFinite(timestamp) || timestamp <= 0) return 0;
   const date = new Date(timestamp);
@@ -257,7 +306,16 @@ function scheduleEmailCleanup(item, step) {
 // ============================================================
 
 async function handlePollEmail(step, payload) {
-  const { senderFilters, subjectFilters, maxAttempts, intervalMs, excludeCodes = [], filterAfterTimestamp = 0 } = payload;
+  const {
+    senderFilters,
+    subjectFilters,
+    maxAttempts,
+    intervalMs,
+    excludeCodes = [],
+    filterAfterTimestamp = 0,
+    disableFallbackToOldMail = false,
+    firstAttemptDelayMs = 0,
+  } = payload;
   const excludedCodeSet = new Set(excludeCodes.filter(Boolean));
   const filterAfterMinute = normalizeMinuteTimestamp(Number(filterAfterTimestamp) || 0);
 
@@ -266,7 +324,6 @@ async function handlePollEmail(step, payload) {
     log(`步骤 ${step}：仅尝试 ${new Date(filterAfterMinute).toLocaleString('zh-CN', { hour12: false })} 及之后时间的邮件。`);
   }
 
-  // Click inbox in sidebar to ensure we're in inbox view
   log(`步骤 ${step}：正在等待侧边栏加载...`);
   try {
     const inboxLink = await waitForElement('.nui-tree-item-text[title="收件箱"]', 5000);
@@ -277,7 +334,6 @@ async function handlePollEmail(step, payload) {
     await maybeActivateMail163Page(step, '初次未找到收件箱入口');
   }
 
-  // Wait for mail list to appear
   log(`步骤 ${step}：正在等待邮件列表加载...`);
   let items = [];
   for (let i = 0; i < 20; i++) {
@@ -297,7 +353,14 @@ async function handlePollEmail(step, payload) {
   }
 
   if (items.length === 0) {
-    await refreshInbox();
+    const refreshed = await refreshInbox(step);
+    if (refreshed === 'reload-required') {
+      await persistPollState({ step, filterAfterTimestamp }, {
+        mailIds: getCurrentMailIds(),
+        nextAttempt: 1,
+      });
+      return { ok: false, reloadRequired: true };
+    }
     await sleep(2000);
     items = findMailItems();
   }
@@ -309,7 +372,14 @@ async function handlePollEmail(step, payload) {
       inboxLink.click();
       await sleep(800);
     }
-    await refreshInbox();
+    const refreshed = await refreshInbox(step);
+    if (refreshed === 'reload-required') {
+      await persistPollState({ step, filterAfterTimestamp }, {
+        mailIds: getCurrentMailIds(),
+        nextAttempt: 1,
+      });
+      return { ok: false, reloadRequired: true };
+    }
     await sleep(2000);
     items = findMailItems();
   }
@@ -320,19 +390,46 @@ async function handlePollEmail(step, payload) {
 
   log(`步骤 ${step}：邮件列表已加载，共 ${items.length} 封邮件`);
 
-  // Snapshot existing mail IDs
-  const existingMailIds = getCurrentMailIds();
-  log(`步骤 ${step}：已记录当前 ${existingMailIds.size} 封旧邮件快照`);
+  const persistedState = await loadPersistedPollState({ step, filterAfterTimestamp });
+  let existingMailIds = persistedState.mailIds;
+  if (existingMailIds.size > 0) {
+    log(`步骤 ${step}：已恢复 ${existingMailIds.size} 封旧邮件快照（跨刷新保持）。`);
+  } else {
+    existingMailIds = getCurrentMailIds();
+    await persistPollState({ step, filterAfterTimestamp }, {
+      mailIds: existingMailIds,
+      nextAttempt: 1,
+    });
+    log(`步骤 ${step}：已记录当前 ${existingMailIds.size} 封旧邮件快照`);
+  }
 
   const FALLBACK_AFTER = 3;
+  const startAttempt = Math.min(Math.max(1, persistedState.nextAttempt || 1), maxAttempts);
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  if (startAttempt === 1 && firstAttemptDelayMs > 0) {
+    log(`步骤 ${step}：等待 ${(firstAttemptDelayMs / 1000).toFixed(0)} 秒后再开始首次扫描，给新邮件到达一点时间。`);
+    await sleep(firstAttemptDelayMs);
+  }
+
+  for (let attempt = startAttempt; attempt <= maxAttempts; attempt++) {
     log(`步骤 ${step}：正在轮询 163 邮箱，第 ${attempt}/${maxAttempts} 次`);
 
     if (attempt > 1) {
-      await refreshInbox();
+      const refreshed = await refreshInbox(step);
+      if (refreshed === 'reload-required') {
+        await persistPollState({ step, filterAfterTimestamp }, {
+          mailIds: existingMailIds,
+          nextAttempt: attempt,
+        });
+        return { ok: false, reloadRequired: true };
+      }
       await sleep(1000);
     }
+
+    await persistPollState({ step, filterAfterTimestamp }, {
+      mailIds: existingMailIds,
+      nextAttempt: attempt,
+    });
 
     let allItems = findMailItems();
     if (allItems.length === 0) {
@@ -342,11 +439,19 @@ async function handlePollEmail(step, payload) {
         inboxLink.click();
         await sleep(500);
       }
-      await refreshInbox();
+      const refreshed = await refreshInbox(step);
+      if (refreshed === 'reload-required') {
+        await persistPollState({ step, filterAfterTimestamp }, {
+          mailIds: existingMailIds,
+          nextAttempt: attempt,
+        });
+        return { ok: false, reloadRequired: true };
+      }
       await sleep(1000);
       allItems = findMailItems();
     }
-    const useFallback = attempt > FALLBACK_AFTER;
+
+    const useFallback = !disableFallbackToOldMail && attempt > FALLBACK_AFTER;
 
     for (const item of allItems) {
       const id = item.getAttribute('id') || '';
@@ -382,10 +487,8 @@ async function handlePollEmail(step, payload) {
           const source = useFallback && existingMailIds.has(id) ? '回退匹配邮件' : '新邮件';
           const timeLabel = mailTimestamp ? `，时间：${new Date(mailTimestamp).toLocaleString('zh-CN', { hour12: false })}` : '';
           log(`步骤 ${step}：已找到验证码：${code}（来源：${source}${timeLabel}，主题：${subject.slice(0, 40)}）`, 'ok');
-
-          // Trigger cleanup only as a best-effort side effect.
+          await clearPersistedPollState({ step, filterAfterTimestamp });
           scheduleEmailCleanup(item, step);
-
           return { ok: true, code, emailTimestamp: Date.now(), mailId: id };
         } else if (code && seenCodes.has(code)) {
           log(`步骤 ${step}：跳过已处理过的验证码：${code}`, 'info');
@@ -393,7 +496,7 @@ async function handlePollEmail(step, payload) {
       }
     }
 
-    if (attempt === FALLBACK_AFTER + 1) {
+    if (!disableFallbackToOldMail && attempt === FALLBACK_AFTER + 1) {
       log(`步骤 ${step}：连续 ${FALLBACK_AFTER} 次未发现新邮件，开始回退到首封匹配邮件`, 'warn');
     }
 
@@ -402,6 +505,7 @@ async function handlePollEmail(step, payload) {
     }
   }
 
+  await clearPersistedPollState({ step, filterAfterTimestamp });
   throw new Error(
     `${(maxAttempts * intervalMs / 1000).toFixed(0)} 秒后仍未在 163 邮箱中找到新的匹配邮件。` +
     '请手动检查收件箱。'
@@ -468,30 +572,29 @@ async function deleteEmail(item, step) {
 // Inbox Refresh
 // ============================================================
 
-async function refreshInbox() {
-  // Try toolbar "刷 新" button
+async function refreshInbox(step = 0) {
   const toolbarBtns = document.querySelectorAll('.nui-btn .nui-btn-text');
   for (const btn of toolbarBtns) {
     if (btn.textContent.replace(/\s/g, '') === '刷新') {
       btn.closest('.nui-btn').click();
       console.log(MAIL163_PREFIX, 'Clicked "刷新" button');
       await sleep(800);
-      return;
+      return 'refreshed';
     }
   }
 
-  // Fallback: click sidebar "收 信"
   const shouXinBtns = document.querySelectorAll('.ra0');
   for (const btn of shouXinBtns) {
     if (btn.textContent.replace(/\s/g, '').includes('收信')) {
       btn.click();
       console.log(MAIL163_PREFIX, 'Clicked "收信" button');
       await sleep(800);
-      return;
+      return 'refreshed';
     }
   }
 
-  console.log(MAIL163_PREFIX, 'Could not find refresh button');
+  log(`步骤 ${step}：163 页内刷新入口不可用，改由后台直接刷新页面。`, 'warn');
+  return 'reload-required';
 }
 
 // ============================================================
