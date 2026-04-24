@@ -318,7 +318,7 @@ function syncAutoRunState(source = {}) {
 }
 
 function isAutoRunLockedPhase() {
-  return currentAutoRun.phase === 'running' || currentAutoRun.phase === 'retrying';
+  return currentAutoRun.phase === 'running' || currentAutoRun.phase === 'retrying' || Boolean(latestState?.manualLockPending);
 }
 
 function isAutoRunPausedPhase() {
@@ -692,6 +692,12 @@ function updateStatusDisplay(state) {
 
   if (currentAutoRun.phase === 'retrying') {
     displayStatus.textContent = `自动重试中${getAutoRunLabel()}`;
+    statusBar.classList.add('running');
+    return;
+  }
+
+  if (state.manualLockPending) {
+    displayStatus.textContent = '正在等待 OAuth 全局锁，获取后继续执行...';
     statusBar.classList.add('running');
     return;
   }

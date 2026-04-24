@@ -2,147 +2,180 @@
 
 一个基于 Chromium Manifest V3 的侧边栏扩展，用于自动执行 Codex / ChatGPT OAuth 注册与授权流程。
 
-当前版本为 `v2.0.1`，基于侧边栏控制，支持单步执行、整套自动执行、停止当前流程、保存常用配置，以及通过 DuckDuckGo / QQ / 163 / Inbucket mailbox 协助获取验证码。
-
-- 保持 **7 步**主流程
-- 支持 **单步执行 / Auto 多轮运行 / Stop 中断**
-- 支持 **按浏览器 window 隔离状态与任务空间**
-- Step 1 / Step 2 尽量后台执行，减少抢焦点
-- Step 3 会切回注册页前台填写邮箱和密码，以提升成功率
-- Step 6 自动处理授权页“继续”与 localhost 回调捕获
+当前版本为 `v2.0.2`。扩展以侧边栏为主控，支持 10 步单步执行、整套自动运行、停止当前流程、按浏览器窗口隔离运行状态，并集成 Duck Mail / SimpleLogin / Addy.io 邮箱生成，以及 QQ / 163 邮箱验证码读取。
 
 ## 当前能力
 
-- 自动打开 ChatGPT 官网并进入注册流程
-- 自动填写注册邮箱与密码并继续下一步
-- 在登录阶段自动刷新最新的 CPA OAuth 授权链接并登录
-- 支持自定义密码；留空时自动生成强密码
-- 自动显示当前使用中的密码，便于后续保存
-- 自动获取注册验证码与登录验证码
-- 支持 `QQ Mail`、`163 Mail`、`Inbucket mailbox`
-- 支持从 DuckDuckGo Email Protection 自动生成新的 `@duck.com` 地址
-- Step 5 同时兼容两种页面：
-  - 页面要求填写 `birthday`
-  - 页面要求填写 `age`
-- 支持 `Auto` 多轮运行
-- 支持中途 `Stop`
-- Step 9 会自动寻找 OAuth 同意页的“继续”按钮，并通过 Chrome debugger 输入事件发起点击，然后监听本地回调地址
-- Step 10 会校验 CPA 面板当前显示的授权链接必须与 Step 7 发起时一致，避免把 localhost 回调提交到错误链路
+- 支持 **10 步**主流程，既可单步执行，也可整套 `Auto` 运行
+- 支持 **按浏览器 window 隔离**状态、标签页注册和自动运行上下文
+- 支持 **Stop** 中断当前流程，支持 **Reset** 清空当前流程状态
+- 支持 `继续当前` / `重新开始` 两种自动运行入口
+- 支持 **跳过步骤**，便于手动接管异常流程
+- Step 1 / Step 7 会从 CPA 面板获取或刷新最新 OAuth 链接
+- Step 3 会把注册页切回前台填写密码并提交，降低超时概率
+- Step 4 / Step 8 会分别轮询注册验证码与登录验证码
+- Step 8 验证码填写与继续动作带有人类化停顿
+- Step 8 遇到 `405 Method Not Allowed / Try again` 异常页时，会先点击“重试”恢复；如果恢复成功，则直接等待验证码，不再额外点击“重新发送电子邮件”
+- Step 9 会自动处理 OAuth 同意页“继续”并监听本地回调
+- Step 10 会校验并提交 Step 9 捕获到的回调地址，确认 CPA 面板返回 `认证成功！`
 
 ## 邮箱相关
 
-当前版本把“生成注册邮箱”和“接收验证码邮箱”拆开：
+当前版本把“注册邮箱生成”和“验证码邮箱读取”拆成两个独立配置：
 
-- `emailGenerationService`：只决定 **Step 3 注册邮箱来源**
-- `mailProvider`：只决定 **Step 4 / Step 6 验证码邮箱来源**
+- `Email Generation Service`：决定 **Step 2 注册邮箱来源**
+- `Mail Provider`：决定 **Step 4 / Step 8 验证码邮箱来源**
 
-### Step 3 注册邮箱来源
+### Step 2 注册邮箱来源
 
 支持：
 
-- Duck Mail
-- SimpleLogin
-- Addy.io
+- `Duck Mail`
+- `SimpleLogin`
+- `Addy.io`
+
+其中：
+
+- `Duck Mail`：通过 DuckDuckGo Email Protection 页面自动生成 `@duck.com` 地址
+- `SimpleLogin`：通过 SimpleLogin aliases 页面获取或创建邮箱
+- `Addy.io`：通过 Addy aliases 页面获取或创建邮箱
+
+### Addy.io 专用配置
+
+仅当 `Email Generation Service = Addy.io` 时显示：
+
+- `Recipients`
+- `Alias Domain`
+
+这两个值都会按你在侧边栏里的输入 **原样透传** 到 Addy 的 `Create Alias` 弹窗中：
+
+- `Recipients`：用于 Addy 的收件人字段
+- `Alias Domain`：用于 Addy 的域名字段
+
+如果 `Alias Domain` 留空，则不会额外处理这个字段，直接按 Addy 默认行为创建 alias。
 
 ### 验证码邮箱来源
 
 支持：
 
-- 163 Mail
-- QQ Mail
+- `163 邮箱`
+- `QQ 邮箱`
 
-## 7 步流程
+## 10 步流程
 
-1. `Get OAuth Link`：打开 CPA OAuth 面板并获取授权链接
-2. `Open Signup`：打开 OpenAI 注册页并进入注册入口
-3. `Fill Email / Password`：获取或填写邮箱，填写密码并提交
-4. `Get Signup Code`：轮询验证码邮箱，读取并回填注册验证码
-5. `Fill Name / Birthday`：填写资料页信息
-6. `Auto OAuth Confirm`：处理剩余登录校验、点击“继续”、监听 localhost 回调
-7. `CPA Verify`：回到 CPA 面板提交 localhost 回调地址并确认成功
+1. `打开 ChatGPT 官网`
+2. `注册并输入邮箱`
+3. `填写密码并继续`
+4. `获取注册验证码`
+5. `填写姓名和生日`
+6. `清理登录 Cookies`
+7. `刷新 OAuth 并登录`
+8. `获取登录验证码`
+9. `自动确认 OAuth`
+10. `平台回调验证`
 
 ## 自动运行
 
-点击侧边栏右上角 `Auto` 后，扩展会按顺序执行整套 7 步流程。
+点击侧边栏右上角 `自动` 后，扩展会按顺序执行整套 10 步流程。
 
 支持：
 
-- 多轮自动运行
+- 多轮自动运行（`1 ~ 50` 轮）
 - 中途停止
-- 继续当前进度 / 重新开始
-- 当前轮失败后按策略重试
+- 检测到已有进度时选择 `继续当前` 或 `重新开始`
+- 当前轮失败后根据策略停止，或丢弃当前线程后新开一轮补足目标次数
 
-## 侧边栏主要配置
+### 自动获取邮箱
+
+自动运行在进入 Step 2 前会优先自动获取当前生成服务的邮箱。
+
+当前逻辑：
+
+- 每轮最多自动获取 **5 次**
+- 获取成功后直接继续后续步骤
+- 获取连续失败时，这一轮会按当前自动运行策略处理：
+  - 未勾选 `兜底`：停止本次自动运行
+  - 已勾选 `兜底`：放弃当前线程并新开一轮，直到补足目标运行次数或达到安全重试上限
+
+### 自动运行兜底
+
+勾选侧边栏中的 `兜底` 后：
+
+- 如果某一轮出现无法继续的错误，后台会直接放弃当前线程
+- 然后新开一轮继续补足目标次数
+- 不是在当前页面里硬继续，而是重置当前轮流程状态后重新开始
+
+### 单轮超时
+
+为避免某一步长期卡死，自动运行带有单轮总超时控制：
+
+- 单轮上限：**3 分 30 秒**
+- 仅在以下任一条件满足时启用：
+  - 勾选了 `兜底`
+  - 自动运行总轮次大于 `1`
+
+如果超时，会放弃当前线程并按自动运行策略处理。
+
+## 侧边栏配置
 
 ### CPA
 
-你的管理面板 OAuth 页面地址，例如：
+你的 CPA 管理面板 OAuth 页面地址，例如：
 
 ```txt
 http(s)://<your-host>/management.html#/oauth
 ```
 
-Step 7 和 Step 10 都依赖这个地址。
+Step 1 / Step 7 / Step 10 都依赖这个地址。
 
-### Mail Provider
+### 管理密钥
+
+CPA 面板登录所需的管理密钥。
+
+扩展会在打开 CPA 管理页后自动填写该值，并进入 OAuth 管理页面。
+
+### 收码邮箱
 
 验证码邮箱来源：
 
 - `163`
 - `QQ`
 
-### Email Generation Service
+### 生成服务
 
-Step 3 注册邮箱生成服务：
+Step 2 使用的注册邮箱生成服务：
 
 - `Duck Mail`
 - `SimpleLogin`
 - `Addy.io`
 
-### Email
+### Recipients / Alias Domain
+
+仅当 `生成服务 = Addy.io` 时显示。
+
+- `Recipients`：原样透传到 Addy.io `Create Alias` 弹窗中的 `Recipients`
+- `Alias Domain`：原样透传到 Addy.io `Create Alias` 弹窗中的 `Alias Domain`
+
+### 邮箱
 
 当前轮使用的注册邮箱。
-
-```txt
-tmp-mailbox
-```
-
-脚本会自动打开：
-
-```txt
-https://<your-inbucket-host>/m/<mailbox>/
-```
-
-并且只检索未读邮件：
-
-- 只匹配 `.message-list-entry.unseen`
-- 第 2 次轮询开始会自动点击 mailbox 页面上的刷新按钮
-- 识别到验证码后会尝试删除当前邮件，减少重复命中
-
-### `Inbucket`
-
-仅当 `Mail = Inbucket` 时显示。
-
-这里填写 Inbucket host，支持两种格式：
-
-- `your-inbucket-host`
-- `https://your-inbucket-host`
-
-脚本会自动规范化成 origin 后再拼接 mailbox URL。
-
-### `Email`
-
-Step 2 使用的注册邮箱。
 
 来源有两种：
 
 - 手动粘贴
-- 由所选 `Email Generation Service` 自动获取
+- 点击 `获取`，由当前 `生成服务` 自动获取
 
-### Password
+### 密码
 
 - 留空：自动生成强密码
 - 手动输入：使用自定义密码
+
+### 兜底
+
+当自动运行某一轮出现错误且无法继续时：
+
+- 不勾选：直接停止自动运行
+- 勾选：放弃当前线程并新开一轮，继续补足目标次数
 
 ## 安装
 
@@ -156,236 +189,152 @@ Step 2 使用的注册邮箱。
 
 ## 关键行为说明
 
-### Step 1
+### Step 1：打开 ChatGPT 官网 / 获取 OAuth 链路
 
-- CPA 面板会尽量后台打开
-- 如果复用的是同一个 CPA URL，会在后台 reload 一次，确保 OAuth 链接能刷新
+- 会先打开或复用 CPA 面板页
+- 如需要，会自动填写 `管理密钥` 并进入 OAuth 管理页
+- 会读取当前显示的授权链接，作为后续 OAuth 登录链路的来源
 
-- `重新开始`：重置当前流程进度，从 Step 1 打开 ChatGPT 官网开始新一轮
-- `继续当前`：把 `已完成 / 已跳过` 视为已处理，从第一个未处理步骤继续往后执行
-
-- 注册页会切到前台再填写邮箱/密码并提交
-- 这样能明显降低 `operation timed out` 的概率
-
-### Step 4 / Step 6
-
-侧边栏共有 10 个步骤按钮，可逐步执行：
-
-1. `打开 ChatGPT 官网`
-2. `注册并输入邮箱`
-3. `填写密码并继续`
-4. `获取注册验证码`
-5. `填写姓名和生日`
-6. `清理登录 Cookies`
-7. `刷新 OAuth 并登录`
-8. `获取登录验证码`
-9. `自动确认 OAuth`
-10. `平台回调验证`
-
-### Auto 模式
-
-点击右上角 `Auto` 后，后台会按顺序跑完整流程。
-
-当前 Auto 逻辑是：
-
-1. Step 1 打开 ChatGPT 官网
-2. Step 2 进入注册流程并填写邮箱
-3. 尝试自动获取 Duck 邮箱
-4. 如果 Duck 自动获取失败，暂停并等待你在侧边栏填写邮箱后点击 `Continue`
-5. 继续执行 Step 3 ~ Step 10，其中 Step 7 会刷新最新 OAuth 链接后再登录
-
-也就是说：
-
-- 如果 Duck 邮箱可自动获取，整套流程更接近全自动
-- 如果 Duck 自动获取失败，后台会先自动重试 5 次；仍失败时，Auto 才会在邮箱阶段暂停
-- Auto 的暂停状态会保存在会话状态中，重新打开侧边栏后仍可继续
-- 如果你在 Auto 暂停时改为手动点步骤或跳过步骤，面板会先确认并停止 Auto，再切回手动控制
-- 选择 `继续当前` 时，后台不会先做大而全的前置校验，而是从当前步骤状态直接继续；缺什么条件，就在运行到那一步时再报错或暂停
-
-## 详细步骤说明
-
-### Step 1: 打开 ChatGPT 官网
-
-通过 `content/signup-page.js`：
-
-- 打开 `chatgpt.com`
-- 等待首页可交互
-- 为后续注册流程准备页面上下文
-
-### Step 2: 注册并输入邮箱
-
-通过 `content/signup-page.js`：
+### Step 2：注册并输入邮箱
 
 - 在 ChatGPT 页面查找 `Sign up / Register / 创建账户` 按钮
-- 自动点击进入注册流程
-- 如果侧边栏邮箱为空，会先尝试自动获取 DuckDuckGo 邮箱；失败时再提示手动粘贴
+- 使用当前侧边栏邮箱，或先从当前 `生成服务` 自动获取邮箱
 - 自动填写注册邮箱并继续
 
-### Step 3: 填写密码并继续
+### Step 3：填写密码并继续
 
-- 如页面先要求邮箱，再进入密码页，会自动切页继续填写
-- 使用自定义密码或自动生成密码
-- 提交密码表单并继续注册
+- 使用自定义密码或自动生成强密码
+- 注册页会切到前台后再填写密码并提交
+- 如果认证页直接进入验证码阶段，后续交给 Step 4 处理
 
-实际使用的密码会写入会话状态，并同步到侧边栏显示。
+### Step 4：获取注册验证码
 
-### Step 4: Get Signup Code
+- 根据 `收码邮箱` 配置轮询验证码邮件
+- 当前支持：
+  - `content/mail-163.js`
+  - `content/qq-mail.js`
+- 如果密码页出现 `Operation timed out` / `重试` 之类异常，会优先尝试恢复后再继续等验证码
 
-根据 `Mail` 配置，轮询邮箱并提取 6 位验证码。
+### Step 5：填写姓名和生日
 
-进入邮箱轮询前，脚本会先确认认证页是否已经进入验证码页面；如果密码页出现 `糟糕，出错了 / Operation timed out` 并带有 `重试` 按钮，会先自动点击 `重试`、回到密码页重新提交，再继续等待验证码页面。
+- 自动生成姓名与生日资料
+- 同时兼容两类页面：
+  - `birthday`
+  - `age`
+- 某些情况下如果资料页被跳过、页面直接进入真实本地回调地址，也会按已完成处理
 
-支持：
+### Step 6：清理登录 Cookies
 
-- `content/qq-mail.js`
-- `content/mail-163.js`
-- `content/inbucket-mail.js`
+- 在重新进入 OAuth 登录链路前，会清理 ChatGPT / OpenAI 相关登录 cookies
+- 用于减少上一轮账号状态污染下一轮授权流程
 
-邮件匹配规则以以下关键词为主：
+### Step 7：刷新 OAuth 并登录
 
-- 发件人：`openai`、`noreply`、`verify`、`auth`、`duckduckgo`、`forward`
-- 标题：`verify`、`verification`、`code`、`验证`、`confirm`
+- 会重新回到 CPA 面板刷新最新 OAuth 链接
+- 使用当前轮注册好的账号重新进入 OAuth 登录链路
+- 如果页面已经直接到本地回调地址，会按本步骤已完成处理
 
-### Step 5: Fill Name / Birthday
+### Step 8：获取登录验证码
 
-随机生成人名与生日。
+- 与 Step 4 类似，但针对登录验证码场景
+- 如果页面已经直接进入本地回调地址，会跳过当前步骤
+- 验证码填写与继续动作之间加入了 1~2 秒的人类化延迟
 
-当前脚本支持两种页面结构：
+### Step 9：自动确认 OAuth
 
-- 页面要求 `birthday`
-- 页面要求 `age`
+- 会在 OAuth 同意页定位“继续”按钮
+- 必要时通过 Chrome debugger 输入事件点击
+- 同时监听当前认证标签页的主 frame 跳转
+- 捕获成功后把回调地址写入 `回调`
 
-如果页面是生日模式，会填写年月日；如果页面上存在 `input[name='age']`，则直接填写年龄。
+严格回调规则：
 
-### Step 6: 清理登录 Cookies
+- 只接受 `http(s)://localhost:<port>/auth/callback?code=...&state=...`
+- 也接受：
+  - `127.0.0.1`
+  - `192.168.2.1`
+- 必须是 `/auth/callback`
+- query 中必须同时包含 `code` 和 `state`
 
-在重新进入 OAuth 登录链路前，会先等待短暂冷却，然后直接删除 ChatGPT / OpenAI 相关 cookies，避免上一轮登录状态污染后续授权。
+### Step 10：平台回调验证
 
-### Step 7: 刷新 OAuth 并登录
-
-在登录前会先重新获取一遍最新的 CPA OAuth 链接，再使用刚注册的账号登录。
-
-支持：
-
-- 邮箱 + 密码登录
-- 提交后进入验证码验证流程
-
-### Step 8: Get Login Code
-
-与 Step 4 类似，但会使用稍微不同的关键词组合去找登录验证码邮件。
-
-### Step 9: 自动确认 OAuth
-
-严格回调捕获规则：
-
-- 步骤 8 现在只接受 `http(s)://localhost:<port>/auth/callback?code=...&state=...` 或 `http(s)://127.0.0.1:<port>/auth/callback?code=...&state=...`
-- 监听范围只限于当前 OAuth 认证标签页的主 frame 跳转
-- 普通 `localhost` 页面，包括本地部署的 CPA 面板，不会再被误判为回调地址
-
-当前这一步已经做了自动尝试：
-
-- 在授权页定位“继续”按钮
-- 等待按钮可点击
-- 获取按钮坐标
-- 通过 Chrome `debugger` 的输入事件点击该按钮
-- 同时监听 `chrome.webNavigation.onBeforeNavigate`
-- 一旦捕获本地回调地址，就把结果保存到 `Callback`
-
-注意：
-
-- 这一步仍然是最容易因页面变化而失效的一步
-- 如果 120 秒内没有捕获到 localhost 回调，会报错超时
-
-### Step 10: 平台回调验证
-
-校验规则：
-
-- 步骤 9 会拒绝任何不是真实 `/auth/callback`，或缺少 `code` / `state` 的本地回调地址
-- 成功后的清理只会针对 `/auth` 这一类真实回调标签页，不会再泛化清理任意 localhost 路径
-
-回到 CPA 面板：
-
-- 自动填写 localhost 回调地址
+- 会回到 CPA 面板
+- 自动填写 Step 9 捕获到的本地回调地址
 - 自动点击“提交回调 URL”
-- 必须等到 CPA 面板出现精确的 `认证成功！` 状态徽标后，才判定成功
-- 成功后会自动关闭匹配 `http://localhost:1455/auth` 这一类前缀的 localhost 残留页面
+- 只有当 CPA 面板出现精确的 `认证成功！` 状态时，才判定这一轮成功
 
-## Duck 邮箱自动获取
+如果 Step 10 遇到 OAuth callback 超时，后台会最多回到最终 OAuth 链路起点重新跑若干次，再决定本轮是否失败。
 
-通过 `content/duck-mail.js`：
+### OAuth 全局锁
 
-- 打开 DuckDuckGo Email Protection Autofill 设置页
-- 查找当前私有地址
-- 如需要，点击 `Generate Private Duck Address`
-- 读取新的 `@duck.com` 地址
+如果你会在多个浏览器实例 / 多个指纹浏览器 profile 中并发跑 Step 7 ~ Step 10，建议先启动本地 OAuth 锁服务，避免多个实例同时进入最终 OAuth 链路：
 
-这个功能会被：
+```bash
+node tools/oauth-lock-server.js
+```
 
-- 侧边栏 `Email` 旁边的 `Auto` 按钮使用
-- `Auto Run` 流程优先尝试使用
+默认监听：
 
-## 停止机制
+```txt
+http://127.0.0.1:17666
+```
 
-扩展内置了停止当前流程的能力：
+当前版本中：
 
-- 侧边栏点击 `Stop`
-- Background 会广播 `STOP_FLOW`
-- 各 content script 会在等待、轮询、sleep、元素查找中尽量中断
-
-适合以下场景：
-
-- 卡在某一步
-- 邮件迟迟不来
-- 页面结构变化导致等待超时
-- Auto 暂停后，明确放弃 Auto、改为手动接管
+- Auto 进入 Step 7 ~ Step 10 前会申请这把锁
+- 手动执行 Step 7 ~ Step 10 也会申请这把锁
+- 如果当前锁被其他实例占用，侧边栏会显示等待状态，当前窗口会排队等待
+- Step 10 完成、Stop、Reset 或窗口关闭后会释放锁
 
 ## 状态与数据
 
-运行时状态主要使用 `chrome.storage.session` 保存：
+### `chrome.storage.session`
+
+运行时状态按 **浏览器窗口** 隔离保存在 `chrome.storage.session` 中，主要包括：
 
 - 当前步骤
 - 每一步状态
 - OAuth 链接
 - 当前邮箱
 - 当前密码
-- localhost 回调地址
-- 账号记录
-- tab 注册信息
-- 各来源最近一次打开的地址（用于打开新地址前清理旧标签）
-- Auto 当前阶段、当前轮次、暂停信息
+- 本地回调地址
+- 当前窗口的 tab 注册信息
+- 自动运行阶段、目标轮次、尝试次数
 
-配置项另外使用 `chrome.storage.local` 持久化保存：
+### `chrome.storage.local`
+
+持久化配置保存在 `chrome.storage.local` 中，主要包括：
 
 - CPA 地址
 - CPA 管理密钥
 - 自定义密码
-- 邮箱服务
-- Inbucket 主机
-- Inbucket 邮箱名
+- 收码邮箱
+- 邮箱生成服务
+- Addy `Recipients`
+- Addy `Alias Domain`
 - 兜底开关
 
 特点：
 
-- 运行时步骤状态是浏览器会话级存储
-- 配置项会持久化保存，关闭浏览器后重新打开仍会恢复
-- 扩展运行期间可在多个步骤之间共享
-- 代码里已启用 `storage.session` 对 content script 的访问
-- 同一来源打开新地址前，会先按来源/站点范围关闭旧标签，避免旧页面残留
+- 运行时流程状态是当前浏览器会话级，并且按 window 隔离
+- 配置项会持久化保存，关闭浏览器后重新打开仍可恢复
+- 同一窗口内的自动运行与步骤状态彼此共享
 
 ## 项目结构
 
 ```txt
-background.js              后台主控，编排 1~10 步、Tab 复用、状态管理
+background.js              后台主控，编排 10 步流程、状态管理、自动运行与标签页复用
 manifest.json              扩展清单
-data/names.js              随机姓名、生日数据
 content/utils.js           通用工具：等待元素、点击、日志、停止控制
-content/vps-panel.js       CPA 面板步骤：Step 7 / Step 10
-content/signup-page.js     ChatGPT 注册/登录页步骤：Step 1 / 2 / 3 / 5 / 7 / 9
-content/duck-mail.js       Duck 邮箱自动获取
+content/signup-page.js     ChatGPT / OpenAI 注册与授权页步骤
+content/vps-panel.js       CPA 面板步骤：获取 OAuth / 提交回调验证
+content/duck-mail.js       Duck Mail 自动获取
+content/simplelogin-mail.js SimpleLogin 自动获取
+content/addy-mail.js       Addy.io 自动获取
 content/qq-mail.js         QQ 邮箱验证码轮询
 content/mail-163.js        163 邮箱验证码轮询
-content/utils.js           通用工具
 sidepanel/                 侧边栏 UI
+data/step-definitions.js   当前 10 步流程定义
 data/names.js              随机资料数据
 ```
 
@@ -393,64 +342,55 @@ data/names.js              随机资料数据
 
 ### 1. 先单步验证，再开 Auto
 
-推荐先手动跑通一次：
+推荐先手动跑通至少前几步：
 
-1. Step 1 打开 ChatGPT 官网
-2. Step 2 注册并输入邮箱
-3. Step 3 填写密码并继续
-4. Step 4 获取注册验证码
+1. 打开 ChatGPT 官网
+2. 注册并输入邮箱
+3. 填写密码并继续
+4. 获取注册验证码
 
-确认邮箱和验证码链路稳定后，再使用 `Auto`。
+确认邮箱生成链路、验证码链路都稳定后，再使用 `自动`。
 
-### 2. Inbucket 建议使用专用 mailbox
+### 2. Addy.io 建议先单独验证弹窗字段
 
-当前 Inbucket 逻辑只看未读邮件，但还是建议：
+如果你使用 `Addy.io` 生成邮箱，建议先手动点一次 `获取`，确认：
 
-- 给脚本准备一个相对独立的 mailbox
-- 避免收件箱里混入过多无关邮件
+- `Recipients` 能被正确应用
+- `Alias Domain` 能被正确应用
+- Addy 当前页面结构没有变化
 
-### 3. Duck 自动获取失败时直接手填
+### 3. 自动获取失败时可手动粘贴邮箱
 
-如果 Duck 页面打不开、未登录或按钮变化：
+如果当前生成服务页面打不开、未登录、DOM 变化，或者自动获取失败：
 
-- 直接在 `Email` 输入框中粘贴邮箱
-- 手动点 `Step 2` 时，如果邮箱为空，脚本会先自动尝试获取 Duck 邮箱；失败后再改为手填
-- Auto 暂停时，仍可手动粘贴邮箱后点击 `Continue`
+- 直接在侧边栏 `邮箱` 输入框里手动粘贴邮箱
+- 再手动执行 Step 2 / Step 3，或重新开始自动运行
 
 ### 4. 跳过步骤
 
-- 每个步骤右侧都会在满足顺序条件时出现一个小按钮，用来直接跳过该步骤
-- 点击后会先弹窗确认；它不会真正执行脚本，只会把该步骤状态改为“已跳过”，从而放行后续步骤
-- 跳过按钮的规则很简单：只要上一步已完成、当前步骤没在运行，就可以使用；Step 1 没有前置步骤，也可直接跳过
-- 如果 Auto 处于暂停状态，点击该按钮会先确认是否接管 Auto
+- 每个步骤右侧都有跳过按钮
+- 只会把当前步骤状态标记为“已跳过”，不会真正执行脚本
+- 适合在页面已手动处理完成时放行后续步骤
+- 如果自动运行处于暂停态，接管后也可以切回手动控制
 
-### 5. Step 9 失败时重点检查
-
-补充检查项：
-
-- 确认回调路径仍然是 `/auth/callback`
-- 确认回调 query 里仍然同时包含 `code` 和 `state`
-- 如果 CPA 部署在 `localhost`，确认当前看到的页面是真实 OAuth 回调，而不是 CPA 面板自身页面
+### 5. Step 9 / Step 10 失败时重点检查
 
 - OAuth 同意页 DOM 是否变化
-- “继续”按钮是否变成了别的文案
-- localhost 回调是否真的触发
+- “继续”按钮文案是否变化
 - 浏览器是否允许 debugger 附加
+- 回调路径是否仍然是 `/auth/callback`
+- query 中是否仍然同时包含 `code` 和 `state`
+- CPA 面板是否仍然返回精确的 `认证成功！`
 
 ## 已知限制
 
-- Step 9 对页面结构较敏感
-- Duck 自动获取依赖 Duck 页面真实 DOM
-- CPA 面板 DOM 也需要和当前脚本选择器匹配
+- Step 9 对 OAuth 同意页 DOM 仍然比较敏感
+- Addy / Duck / SimpleLogin 依赖目标页面真实 DOM，页面改版会直接影响自动获取
+- QQ / 163 邮箱页面 DOM 变化会影响验证码轮询
+- CPA 管理面板 DOM 变化会影响 Step 1 / Step 7 / Step 10
 
 ## 调试建议
 
 - 先单步跑通，再开 Auto
 - 重点关注侧边栏日志和 Service Worker 控制台
-- 如果某一步频繁失败，优先检查目标页面 DOM / 按钮文案是否变化
-
-## 已知限制
-
-- Step 6 对 OAuth 同意页结构较敏感
-- 邮箱页面 DOM 变化会影响验证码轮询
-- CPA 管理面板 DOM 变化会影响 Step 1 / Step 7
+- 如果某一步频繁失败，优先检查目标页面 DOM、按钮文案、登录态和网络状态是否变化

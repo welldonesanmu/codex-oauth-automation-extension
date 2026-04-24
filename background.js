@@ -28,6 +28,11 @@ const STEP_IDS = SHARED_STEP_DEFINITIONS
   .sort((left, right) => left - right);
 const MAX_FLOW_STEP = STEP_IDS[STEP_IDS.length - 1] || 10;
 const FINAL_OAUTH_CHAIN_START_STEP = 7;
+const GLOBAL_OAUTH_LOCK_SERVER = 'http://127.0.0.1:17666';
+const GLOBAL_OAUTH_LOCK_TTL_MS = 10 * 60 * 1000;
+const GLOBAL_OAUTH_LOCK_RETRY_MS = 3000;
+const globalOauthLockByWindow = new Map();
+const globalOauthHeartbeatByWindow = new Map();
 const STEP_DEFAULT_STATUSES = Object.fromEntries(STEP_IDS.map((stepId) => [stepId, 'pending']));
 const PRE_LOGIN_COOKIE_CLEAR_DOMAINS = [
   'chatgpt.com',
@@ -48,6 +53,188 @@ const PRE_LOGIN_COOKIE_CLEAR_ORIGINS = [
 const STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS = 6000;
 
 initializeSessionStorageAccess();
+
+// ============================================================
+// 全局 OAuth 串行锁：用于多个指纹浏览器/多个扩展实例之间协调步骤 7-10
+// 注意：chrome.storage / background 内存只能在同一个浏览器 profile 内共享；
+// AdsPower 等指纹浏览器多 profile 场景需要外部 localhost lock server。
+// ============================================================
+
+async function getGlobalExtensionInstanceId() {
+  const key = 'globalExtensionInstanceId';
+  const stored = await chrome.storage.local.get(key);
+  if (stored[key]) return stored[key];
+
+  const value =
+    'ext-' +
+    (crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+  await chrome.storage.local.set({ [key]: value });
+  return value;
+}
+
+async function postGlobalOAuthLock(path, body, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch(`${GLOBAL_OAUTH_LOCK_SERVER}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+      signal: controller.signal,
+    });
+
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data?.error || `HTTP ${resp.status}`);
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function stopGlobalOAuthHeartbeat(windowId) {
+  const timer = globalOauthHeartbeatByWindow.get(windowId);
+  if (timer) {
+    clearInterval(timer);
+    globalOauthHeartbeatByWindow.delete(windowId);
+  }
+}
+
+function startGlobalOAuthHeartbeat(windowId, ownerId) {
+  stopGlobalOAuthHeartbeat(windowId);
+
+  const timer = setInterval(() => {
+    postGlobalOAuthLock('/renew', {
+      ownerId,
+      ttlMs: GLOBAL_OAUTH_LOCK_TTL_MS,
+    }).catch((err) => {
+      console.warn(LOG_PREFIX, 'OAuth 全局锁续期失败：', err);
+    });
+  }, 60000);
+
+  globalOauthHeartbeatByWindow.set(windowId, timer);
+}
+
+async function acquireGlobalOAuthLock(windowId, meta = {}) {
+  const existing = globalOauthLockByWindow.get(windowId);
+  if (existing?.ownerId) return existing.ownerId;
+
+  const instanceId = await getGlobalExtensionInstanceId();
+  const ownerId = `${instanceId}:window-${windowId}:${Date.now()}:${Math.random()
+    .toString(16)
+    .slice(2)}`;
+
+  await addLog(windowId, 'OAuth 全局队列：正在等待进入步骤 7-10...', 'info');
+
+  while (true) {
+    throwIfStopped(windowId);
+
+    let result;
+    try {
+      result = await postGlobalOAuthLock('/acquire', {
+        ownerId,
+        ttlMs: GLOBAL_OAUTH_LOCK_TTL_MS,
+        meta: {
+          instanceId,
+          windowId,
+          vpsUrl: meta.vpsUrl || '',
+          email: meta.email || '',
+          targetRun: meta.targetRun || '',
+          totalRuns: meta.totalRuns || '',
+          attemptRuns: meta.attemptRuns || '',
+          trigger: meta.trigger || '',
+          step: meta.step || '',
+          startedAt: new Date().toISOString(),
+        },
+      });
+    } catch (err) {
+      throw new Error(`OAuth 全局锁服务不可用，请先启动 tools/oauth-lock-server.js：${err.message}`);
+    }
+
+    if (result?.granted) {
+      globalOauthLockByWindow.set(windowId, { ownerId, acquiredAt: Date.now() });
+      startGlobalOAuthHeartbeat(windowId, ownerId);
+      await addLog(windowId, 'OAuth 全局队列：已获得执行权，开始独占执行步骤 7-10。', 'ok');
+      return ownerId;
+    }
+
+    const positionText = result?.position ? `，当前排队第 ${result.position} 位` : '';
+    await addLog(
+      windowId,
+      `OAuth 全局队列：其他浏览器正在认证${positionText}，等待 ${Math.ceil(
+        (result?.retryAfterMs || GLOBAL_OAUTH_LOCK_RETRY_MS) / 1000
+      )} 秒后重试...`,
+      'info'
+    );
+
+    await sleepWithStop(windowId, result?.retryAfterMs || GLOBAL_OAUTH_LOCK_RETRY_MS);
+  }
+}
+
+async function releaseGlobalOAuthLock(windowId, reason = 'finished') {
+  const lock = globalOauthLockByWindow.get(windowId);
+  if (!lock?.ownerId) return;
+
+  stopGlobalOAuthHeartbeat(windowId);
+  globalOauthLockByWindow.delete(windowId);
+
+  try {
+    await postGlobalOAuthLock('/release', {
+      ownerId: lock.ownerId,
+      reason,
+    });
+    await addLog(windowId, 'OAuth 全局队列：已释放执行权，下一个浏览器可以继续。', 'info');
+  } catch (err) {
+    await addLog(
+      windowId,
+      `OAuth 全局队列：释放锁失败，但锁会在超时后自动释放：${err.message}`,
+      'warn'
+    );
+  }
+}
+
+function hasManualGlobalOAuthLock(windowId) {
+  return manualGlobalOAuthLockByWindow.get(windowId)?.held === true;
+}
+
+async function ensureManualGlobalOAuthLock(windowId, step) {
+  if (step < FINAL_OAUTH_CHAIN_START_STEP || hasManualGlobalOAuthLock(windowId)) {
+    return;
+  }
+
+  const latestState = await getState(windowId);
+  await setState(windowId, { manualLockPending: true });
+  await broadcastDataUpdate(windowId, { manualLockPending: true });
+  try {
+    await acquireGlobalOAuthLock(windowId, {
+      vpsUrl: latestState.vpsUrl,
+      email: latestState.email,
+      trigger: 'manual',
+      step,
+    });
+    manualGlobalOAuthLockByWindow.set(windowId, {
+      held: true,
+      acquiredAtStep: step,
+      acquiredAt: Date.now(),
+    });
+  } finally {
+    await setState(windowId, { manualLockPending: false });
+    await broadcastDataUpdate(windowId, { manualLockPending: false });
+  }
+}
+
+async function releaseManualGlobalOAuthLock(windowId, reason = 'manual flow ended') {
+  await setState(windowId, { manualLockPending: false });
+  await broadcastDataUpdate(windowId, { manualLockPending: false });
+  if (!hasManualGlobalOAuthLock(windowId)) return;
+  manualGlobalOAuthLockByWindow.delete(windowId);
+  await releaseGlobalOAuthLock(windowId, reason);
+}
 
 // ============================================================
 // 状态管理（chrome.storage.session + chrome.storage.local）
@@ -101,6 +288,7 @@ const DEFAULT_STATE = {
   autoRunning: false, // 当前是否处于自动运行中。
   autoRunPhase: 'idle', // 当前自动运行阶段。
   autoRunCurrentRun: 0, // 自动运行当前执行到第几轮。
+  manualLockPending: false, // 当前窗口是否正在等待手动步骤的全局 OAuth 锁。
   autoRunTotalRuns: 1, // 自动运行计划总轮数。
   autoRunAttemptRun: 0, // 当前轮次的重试序号。
 };
@@ -114,6 +302,7 @@ const autoRunRuntimeByWindow = new Map();
 const step8ListenersByWindow = new Map();
 const emailPoolLocksByProvider = new Map();
 const stateWriteQueuesByWindow = new Map();
+const manualGlobalOAuthLockByWindow = new Map();
 
 function getWindowStateKey(windowId) {
   return `${WINDOW_STATE_KEY_PREFIX}${windowId}`;
@@ -2037,6 +2226,7 @@ function cleanupWindowRuntime(windowId) {
   autoRunRuntimeByWindow.delete(windowId);
   stateWriteQueuesByWindow.delete(windowId);
   clearStep8Listener(windowId);
+  stopGlobalOAuthHeartbeat(windowId);
 }
 
 function getAutoRunStatusPayload(windowId, phase, payload = {}) {
@@ -2296,6 +2486,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {
+  releaseManualGlobalOAuthLock(windowId, 'window closed').catch(() => { });
+  releaseGlobalOAuthLock(windowId, 'window closed').catch(() => { });
   cleanupWindowRuntime(windowId);
 });
 
@@ -2400,6 +2592,7 @@ async function handleMessage(message, sender) {
     case 'RESET': {
       clearStopRequest(windowId);
       clearStep8Listener(windowId);
+      await releaseManualGlobalOAuthLock(windowId, 'manual reset');
       await resetState(windowId);
       await addLog(windowId, '流程已重置', 'info');
       return { ok: true };
@@ -2422,6 +2615,9 @@ async function handleMessage(message, sender) {
       }
       if (step === 3) {
         await setState(windowId, { emailGenerationService: normalizeEmailGenerationService((await getState(windowId)).emailGenerationService) });
+      }
+      if (message.source === 'sidepanel') {
+        await ensureManualGlobalOAuthLock(windowId, step);
       }
       await executeStep(windowId, step);
       return { ok: true };
@@ -2725,6 +2921,9 @@ async function completeStepFromBackground(windowId, step, payload = {}) {
       await setEmailState(windowId, null);
     }
   }
+  if (normalizedStep >= MAX_FLOW_STEP) {
+    await releaseManualGlobalOAuthLock(windowId, 'manual oauth chain finished');
+  }
   notifyStepComplete(windowId, normalizedStep, payload);
 }
 
@@ -2766,6 +2965,8 @@ async function requestStop(windowId, options = {}) {
   clearActiveAutoRunAttemptSession(windowId);
   clearAutoRunAttemptDeadline(windowId);
   getAutoRunRuntime(windowId).active = false;
+  await releaseManualGlobalOAuthLock(windowId, 'manual stop');
+  await releaseGlobalOAuthLock(windowId, 'stopped');
   await broadcastAutoRunStatus(windowId, 'stopped', {
     currentRun: getAutoRunRuntime(windowId).currentRun,
     totalRuns: getAutoRunRuntime(windowId).totalRuns,
@@ -3044,25 +3245,47 @@ async function runAutoSequenceFromStep(windowId, startStep, context = {}) {
   }
 
   let step = Math.max(startStep, 4);
-  while (step <= MAX_FLOW_STEP) {
-    try {
-      await executeStepAndWait(windowId, step, AUTO_STEP_DELAYS[step]);
-      step += 1;
-    } catch (err) {
-      if (step === 10 && isStep10OAuthTimeoutError(err) && step10RestartAttempts < maxStep10RestartAttempts) {
-        step10RestartAttempts += 1;
-        await addLog(
-          windowId,
-          `步骤 10：检测到 OAuth callback 超时，正在回到步骤 ${FINAL_OAUTH_CHAIN_START_STEP} 重新开始授权流程（${step10RestartAttempts}/${maxStep10RestartAttempts}）...`,
-          'warn'
-        );
-        await invalidateDownstreamAfterStepRestart(windowId, FINAL_OAUTH_CHAIN_START_STEP, {
-          logLabel: `步骤 10 超时后准备回到步骤 ${FINAL_OAUTH_CHAIN_START_STEP} 重试（${step10RestartAttempts}/${maxStep10RestartAttempts}）`,
+  let globalOAuthLockHeld = false;
+
+  try {
+    while (step <= MAX_FLOW_STEP) {
+      if (step >= FINAL_OAUTH_CHAIN_START_STEP && !globalOAuthLockHeld) {
+        const latestState = await getState(windowId);
+        await acquireGlobalOAuthLock(windowId, {
+          vpsUrl: latestState.vpsUrl,
+          email: latestState.email,
+          targetRun,
+          totalRuns,
+          attemptRuns,
+          trigger: 'auto',
+          step,
         });
-        step = FINAL_OAUTH_CHAIN_START_STEP;
-        continue;
+        globalOAuthLockHeld = true;
       }
-      throw err;
+
+      try {
+        await executeStepAndWait(windowId, step, AUTO_STEP_DELAYS[step]);
+        step += 1;
+      } catch (err) {
+        if (step === 10 && isStep10OAuthTimeoutError(err) && step10RestartAttempts < maxStep10RestartAttempts) {
+          step10RestartAttempts += 1;
+          await addLog(
+            windowId,
+            `步骤 10：检测到 OAuth callback 超时，正在回到步骤 ${FINAL_OAUTH_CHAIN_START_STEP} 重新开始授权流程（${step10RestartAttempts}/${maxStep10RestartAttempts}）...`,
+            'warn'
+          );
+          await invalidateDownstreamAfterStepRestart(windowId, FINAL_OAUTH_CHAIN_START_STEP, {
+            logLabel: `步骤 10 超时后准备回到步骤 ${FINAL_OAUTH_CHAIN_START_STEP} 重试（${step10RestartAttempts}/${maxStep10RestartAttempts}）`,
+          });
+          step = FINAL_OAUTH_CHAIN_START_STEP;
+          continue;
+        }
+        throw err;
+      }
+    }
+  } finally {
+    if (globalOAuthLockHeld) {
+      await releaseGlobalOAuthLock(windowId, 'step 7-10 finished or interrupted');
     }
   }
 }
@@ -3692,11 +3915,14 @@ async function requestVerificationCodeResend(windowId, step) {
   await chrome.tabs.update(signupTabId, { active: true });
   await addLog(windowId, `步骤 ${step}：正在请求新的${getVerificationCodeLabel(step)}验证码...`, 'warn');
 
+  const waitAfterRetryMs = getRandomDelayMs(2600, 4200);
+  const delayBeforeResendMs = step === 8 ? getRandomDelayMs(2400, 4200) : 0;
+  const skipResendAfterRetryRecovery = step === 8;
   const result = await sendToContentScriptResilient(windowId, 'signup-page', {
     type: 'RESEND_VERIFICATION_CODE',
     step,
     source: 'background',
-    payload: {},
+    payload: { waitAfterRetryMs, delayBeforeResendMs, skipResendAfterRetryRecovery },
   }, {
     timeoutMs: 90000,
     retryDelayMs: 700,
@@ -3706,6 +3932,17 @@ async function requestVerificationCodeResend(windowId, step) {
 
   if (result && result.error) {
     throw new Error(result.error);
+  }
+
+  if (result?.recoveredRetryPage) {
+    if (result?.skippedResendAfterRetryRecovery) {
+      await addLog(windowId, `步骤 ${step}：检测到 405/重试异常页，已点击“重试”并等待 ${waitAfterRetryMs}ms；恢复后不再点“重新发送电子邮件”，直接等待验证码。`, 'warn');
+      return Date.now();
+    }
+    await addLog(windowId, `步骤 ${step}：检测到 405/重试异常页，已先点击“重试”并等待 ${waitAfterRetryMs}ms，再继续原有验证码重发逻辑。`, 'warn');
+  }
+  if (step === 8 && delayBeforeResendMs > 0 && !result?.skippedResendAfterRetryRecovery) {
+    await addLog(windowId, `步骤 8：重发邮件前额外等待 ${delayBeforeResendMs}ms，避免过快触发异常页。`, 'warn');
   }
 
   return Date.now();

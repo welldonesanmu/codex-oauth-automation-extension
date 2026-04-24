@@ -58,7 +58,7 @@ async function handleCommand(message) {
     case 'PREPARE_SIGNUP_VERIFICATION':
       return await prepareSignupVerificationFlow(message.payload);
     case 'RESEND_VERIFICATION_CODE':
-      return await resendVerificationCode(message.step);
+      return await resendVerificationCode(message.step, message.payload);
     case 'INSPECT_AUTH_PAGE_STATE':
       return inspectAuthPageState();
     case 'STEP8_FIND_AND_CLICK':
@@ -221,6 +221,9 @@ async function prepareLoginCodeFlow(timeout = 15000) {
   let lastSwitchAttemptAt = 0;
   let loggedPasswordPage = false;
   let loggedVerificationPage = false;
+  let retryRecoverCount = 0;
+  let lastRetryRecoverAt = 0;
+  const maxRetryRecoverAttempts = 4;
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
@@ -229,6 +232,29 @@ async function prepareLoginCodeFlow(timeout = 15000) {
     if (target) {
       log('步骤 8：验证码页面已就绪。');
       return { ready: true, mode: target.type };
+    }
+
+    if (isVerificationRetryPage()) {
+      if (retryRecoverCount >= maxRetryRecoverAttempts) {
+        throw new Error(`步骤 8：检测到 405/重试异常页，连续恢复 ${retryRecoverCount} 次后仍未回到验证码流程。URL: ${location.href}`);
+      }
+
+      if (retryRecoverCount > 0) {
+        const elapsed = Date.now() - lastRetryRecoverAt;
+        if (elapsed < 2200) {
+          await sleep(2200 - elapsed);
+          continue;
+        }
+      }
+
+      retryRecoverCount += 1;
+      lastRetryRecoverAt = Date.now();
+      loggedVerificationPage = false;
+      loggedPasswordPage = false;
+      log(`步骤 8：检测到 405/重试异常页，先点击“重试”并缓几秒后再继续恢复（${retryRecoverCount}/${maxRetryRecoverAttempts}）...`, 'warn');
+      await recoverVerificationRetryPage(8, { waitAfterRetryMs: 2600 });
+      await humanPause(2200, 3800);
+      continue;
     }
 
     if (isEmailVerificationPage() && isVerificationPageStillVisible()) {
@@ -265,7 +291,15 @@ async function prepareLoginCodeFlow(timeout = 15000) {
   throw new Error('无法切换到一次性验证码验证页面。URL: ' + location.href);
 }
 
-async function resendVerificationCode(step, timeout = 45000) {
+async function resendVerificationCode(step, payload = {}, timeout = 45000) {
+  const waitAfterRetryMs = Number.isFinite(payload?.waitAfterRetryMs)
+    ? Math.max(0, Math.floor(payload.waitAfterRetryMs))
+    : 0;
+  const delayBeforeResendMs = Number.isFinite(payload?.delayBeforeResendMs)
+    ? Math.max(0, Math.floor(payload.delayBeforeResendMs))
+    : 0;
+  const skipResendAfterRetryRecovery = step === 8 && Boolean(payload?.skipResendAfterRetryRecovery);
+
   if (step === 8) {
     await prepareLoginCodeFlow();
   }
@@ -273,19 +307,45 @@ async function resendVerificationCode(step, timeout = 45000) {
   const start = Date.now();
   let action = null;
   let loggedWaiting = false;
+  let recoveredRetryPage = false;
+  let delayedBeforeResend = false;
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
+
+    if (!recoveredRetryPage && isVerificationRetryPage()) {
+      await recoverVerificationRetryPage(step, { waitAfterRetryMs });
+      recoveredRetryPage = true;
+      loggedWaiting = false;
+      if (skipResendAfterRetryRecovery) {
+        log('步骤 8：405 异常页已恢复，接下来不再点击“重新发送电子邮件”，直接等待验证码到达。', 'warn');
+        return {
+          resent: false,
+          recoveredRetryPage: true,
+          skippedResendAfterRetryRecovery: true,
+        };
+      }
+      continue;
+    }
+
     action = findResendVerificationCodeTrigger({ allowDisabled: true });
 
     if (action && isActionEnabled(action)) {
       log(`步骤 ${step}：重新发送验证码按钮已可用。`);
+      if (step === 8 && delayBeforeResendMs > 0 && !delayedBeforeResend) {
+        delayedBeforeResend = true;
+        log(`步骤 8：重发邮件前先等待 ${delayBeforeResendMs}ms，避免再次触发 405 异常页...`, 'warn');
+        await humanPause(delayBeforeResendMs, delayBeforeResendMs + 600);
+        continue;
+      }
       await humanPause(350, 900);
       simulateClick(action);
       await sleep(1200);
       return {
         resent: true,
         buttonText: getActionText(action),
+        recoveredRetryPage,
+        skippedResendAfterRetryRecovery: false,
       };
     }
 
@@ -1027,6 +1087,7 @@ const STEP5_SUBMIT_ERROR_PATTERN = /无法根据该信息创建帐户|请重试|
 const SIGNUP_PASSWORD_ERROR_TITLE_PATTERN = /糟糕，出错了|something\s+went\s+wrong|oops/i;
 const SIGNUP_PASSWORD_ERROR_DETAIL_PATTERN = /operation\s+timed\s+out|timed\s+out|请求超时|操作超时/i;
 const SIGNUP_EMAIL_EXISTS_PATTERN = /与此电子邮件地址相关联的帐户已存在|account\s+associated\s+with\s+this\s+email\s+address\s+already\s+exists|email\s+address.*already\s+exists/i;
+const VERIFICATION_RETRY_PAGE_PATTERN = /405|method\s+not\s+allowed|route\s+error|oops|something\s+went\s+wrong|请重试|try\s+again/i;
 const ADD_PHONE_TRACE_MAX_RESOURCE_ENTRIES = 8;
 let addPhoneTraceBootstrapped = false;
 let addPhoneTraceLastUrl = '';
@@ -1402,18 +1463,48 @@ function getSignupPasswordSubmitButton({ allowDisabled = false } = {}) {
   }) || null;
 }
 
-function getSignupRetryButton() {
+function getSignupRetryButton({ allowDisabled = false } = {}) {
   const direct = document.querySelector('button[data-dd-action-name="Try again"]');
-  if (direct && isVisibleElement(direct) && isActionEnabled(direct)) {
+  if (direct && isVisibleElement(direct) && (allowDisabled || isActionEnabled(direct))) {
     return direct;
   }
 
   const candidates = document.querySelectorAll('button, [role="button"]');
   return Array.from(candidates).find((el) => {
-    if (!isVisibleElement(el) || !isActionEnabled(el)) return false;
+    if (!isVisibleElement(el) || (!allowDisabled && !isActionEnabled(el))) return false;
     const text = getActionText(el);
     return /重试|try\s+again/i.test(text);
   }) || null;
+}
+
+function isVerificationRetryPage() {
+  const retryButton = getSignupRetryButton({ allowDisabled: true });
+  if (!retryButton) return false;
+  return VERIFICATION_RETRY_PAGE_PATTERN.test(getPageTextSnapshot()) || VERIFICATION_RETRY_PAGE_PATTERN.test(document.title || '');
+}
+
+async function recoverVerificationRetryPage(step, options = {}) {
+  if (!isVerificationRetryPage()) {
+    return { recovered: false };
+  }
+
+  const { waitAfterRetryMs = 0 } = options;
+  const retryButton = getSignupRetryButton();
+  if (!retryButton) {
+    throw new Error(`步骤 ${step}：检测到 405/重试异常页，但“重试”按钮当前不可用。URL: ${location.href}`);
+  }
+
+  log(`步骤 ${step}：检测到 405/重试异常页，正在点击“重试”恢复验证码流程...`, 'warn');
+  await humanPause(350, 900);
+  simulateClick(retryButton);
+  await sleep(1200);
+
+  if (waitAfterRetryMs > 0) {
+    log(`步骤 ${step}：已点击“重试”，等待 ${waitAfterRetryMs}ms 后再继续原有验证码逻辑...`, 'warn');
+    await sleep(waitAfterRetryMs);
+  }
+
+  return { recovered: true };
 }
 
 function isSignupPasswordErrorPage() {

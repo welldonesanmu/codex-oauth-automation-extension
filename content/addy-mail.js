@@ -460,6 +460,29 @@ function getAddyOptionCandidateText(el) {
   ].join(' '));
 }
 
+function normalizeAddyAliasDomainValue(value) {
+  return normalizeAddyText(value).toLowerCase();
+}
+
+function collectAddyAliasDomainCandidates(value) {
+  const normalized = normalizeAddyAliasDomainValue(value);
+  const candidates = new Set();
+  if (normalized) {
+    candidates.add(normalized);
+  }
+  const domainMatches = normalized.match(/\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b/g) || [];
+  for (const match of domainMatches) {
+    candidates.add(match);
+  }
+  return [...candidates];
+}
+
+function hasExactAddyAliasDomainMatch(value, aliasDomain) {
+  const target = normalizeAddyAliasDomainValue(aliasDomain);
+  if (!target) return true;
+  return collectAddyAliasDomainCandidates(value).includes(target);
+}
+
 function getAddyRecipientCandidateText(el) {
   return getAddyOptionCandidateText(el);
 }
@@ -588,15 +611,18 @@ function scoreAddyAliasDomainOption(el, field, aliasDomain) {
   if (!(el instanceof HTMLElement) || !isAddyElementVisible(el)) return -Infinity;
 
   const text = getAddyOptionCandidateText(el);
-  const normalizedText = text.toLowerCase();
-  const target = normalizeAddyText(aliasDomain).toLowerCase();
-  if (!target || !normalizedText.includes(target)) return -Infinity;
+  const normalizedText = normalizeAddyAliasDomainValue(text);
+  const normalizedVisibleText = normalizeAddyAliasDomainValue(el.textContent || '');
+  const target = normalizeAddyAliasDomainValue(aliasDomain);
+  if (!target || !hasExactAddyAliasDomainMatch(text, aliasDomain)) return -Infinity;
 
   const role = String(el.getAttribute('role') || '').toLowerCase();
   const tagName = String(el.tagName || '').toLowerCase();
   let score = 0;
   if (normalizedText === target) score += 5000;
-  if ((normalizeAddyText(el.textContent || '').toLowerCase()) === target) score += 2400;
+  else score += 2600;
+  if (normalizedVisibleText === target) score += 2400;
+  if (hasExactAddyAliasDomainMatch(el.textContent || '', aliasDomain)) score += 1200;
   if (role === 'option') score += 1400;
   if (role === 'button' || role === 'menuitem') score += 900;
   if (['button', 'li', 'a', 'option'].includes(tagName)) score += 650;
@@ -665,31 +691,33 @@ async function clickAddyAliasDomainOption(field, aliasDomain, container = null, 
 function collectAddyAliasDomainSelectionEvidence(field, container) {
   const values = new Set();
   const push = (candidate) => {
-    const normalized = normalizeAddyText(candidate).toLowerCase();
+    const normalized = normalizeAddyText(candidate);
     if (normalized) {
       values.add(normalized);
     }
   };
 
-  push(field?.value);
-  push(field?.textContent);
-  push(field?.getAttribute?.('value'));
-  push(field?.getAttribute?.('aria-label'));
-  push(field?.getAttribute?.('title'));
+  const isTextEntryField = field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement;
+  if (!isTextEntryField) {
+    push(field?.textContent);
+  }
   push(field?.getAttribute?.('data-value'));
+  push(field?.getAttribute?.('aria-valuetext'));
+  push(field?.getAttribute?.('data-selected-value'));
 
   const activeDescendantId = String(field?.getAttribute?.('aria-activedescendant') || '').trim();
   if (activeDescendantId) {
-    push(document.getElementById(activeDescendantId)?.textContent || '');
+    const activeDescendant = document.getElementById(activeDescendantId);
+    push(activeDescendant?.textContent || '');
+    push(activeDescendant?.getAttribute?.('aria-label') || '');
+    push(activeDescendant?.getAttribute?.('data-value') || '');
+    push(activeDescendant?.getAttribute?.('value') || '');
   }
 
   const controlledIds = String(field?.getAttribute?.('aria-controls') || '').trim().split(/\s+/).filter(Boolean);
   for (const controlledId of controlledIds) {
     const controlled = document.getElementById(controlledId);
     if (!controlled) continue;
-    push(controlled.getAttribute?.('data-value') || '');
-    push(controlled.getAttribute?.('aria-label') || '');
-    push(controlled.textContent || '');
     if (controlled.querySelectorAll) {
       Array.from(controlled.querySelectorAll('[aria-selected="true"], [aria-checked="true"], [data-state="checked"], [data-selected="true"], option:checked')).forEach((el) => {
         push(el.textContent || '');
@@ -714,17 +742,16 @@ function collectAddyAliasDomainSelectionEvidence(field, container) {
 }
 
 function isSelectedAliasDomain(field, container, aliasDomain) {
-  const target = normalizeAddyText(aliasDomain).toLowerCase();
+  const target = normalizeAddyAliasDomainValue(aliasDomain);
   if (!target) return true;
 
   if (field instanceof HTMLSelectElement) {
     const selectedOption = field.options[field.selectedIndex];
-    const selectedText = normalizeAddyText(selectedOption?.text || selectedOption?.value || '').toLowerCase();
-    return selectedText === target || selectedText.includes(target);
+    return hasExactAddyAliasDomainMatch(`${selectedOption?.text || ''} ${selectedOption?.value || ''}`, aliasDomain);
   }
 
   return collectAddyAliasDomainSelectionEvidence(field, container).some((value) => (
-    value === target || value.includes(target)
+    hasExactAddyAliasDomainMatch(value, aliasDomain)
   ));
 }
 
@@ -749,11 +776,9 @@ async function fillAddyAliasDomain(confirmButton, aliasDomain, requestId = null)
   await humanPause(250, 600);
 
   if (field instanceof HTMLSelectElement) {
-    const matchedOption = Array.from(field.options).find((option) => {
-      const optionText = normalizeAddyText(option.text || option.value || '').toLowerCase();
-      const target = normalizeAddyText(rawAliasDomain).toLowerCase();
-      return optionText === target || optionText.includes(target);
-    });
+    const matchedOption = Array.from(field.options).find((option) => (
+      hasExactAddyAliasDomainMatch(`${option.text || ''} ${option.value || ''}`, rawAliasDomain)
+    ));
     if (!matchedOption) {
       debugLog('Addy alias-domain select option missing', {
         aliasDomain: rawAliasDomain,
